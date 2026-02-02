@@ -2,7 +2,7 @@
 
 > Implementation of a chat assistant with session memory via summarization and intelligent query understanding.
 
-## Features
+## 1. Features
 
 ### Feature 1: Session Memory via Summarization 
 - **Automatic context management** - Summarizes conversation when exceeding 1,200 tokens
@@ -22,7 +22,7 @@
 <img width="1904" height="899" alt="image" src="https://github.com/user-attachments/assets/2246c068-83cc-442a-80ef-de529121a757" />
 
 
-## Quick Start
+## 2. Quick Start
 
 ### Prerequisites
 - Python 3.10+
@@ -52,16 +52,8 @@ streamlit run app.py
 
 Open http://localhost:8501 in your browser.
 
-## Documentation
 
-Comprehensive documentation available in `docs/`:
-
-- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - High-level system design, components, data flow
-- **[CORE_LOGIC_AND_FLOW.md](docs/CORE_LOGIC_AND_FLOW.md)** - User journey with real session examples
-- **[TRADEOFFS_AND_LIMITATIONS.md](docs/TRADEOFFS_AND_LIMITATIONS.md)** - Design decisions, trade-offs, rationale
-- **[TEST_DATA_AND_EVIDENCE.md](docs/TEST_DATA_AND_EVIDENCE.md)** - Test sessions, verification, performance data
-
-## How to Test Features
+## 3. How to Test Features
 
 ### Testing Session Memory
 1. Start a conversation in the main chat
@@ -83,7 +75,7 @@ Comprehensive documentation available in `docs/`:
    - Clarifying questions
 4. System intelligently handles vague queries
 
-## Architecture
+## 4. Architecture
 
 ```
 Streamlit UI (app.py)
@@ -105,7 +97,7 @@ SQLite Database (database.py)
 - **Token Counting:** tiktoken (cl100k_base)
 - **Validation:** Pydantic v2
 
-## 📊 How It Works
+## 5. How It Works
 
 ### Session Memory
 
@@ -142,7 +134,7 @@ Analysis:
     - Do you need help with code or pet care?
 ```
 
-## 🔧 Configuration
+## 6. Configuration
 
 Edit `.env` file:
 
@@ -161,7 +153,7 @@ MODEL_NAME=gemini-2.5-flash  # LLM model
 - **5,000** - Balanced for moderate conversations
 - **10,000** - Rich context, production-ready
 
-## Project Structure
+## 7. Project Structure
 
 ```
 Agent-Memory/
@@ -186,7 +178,7 @@ Agent-Memory/
 └── README.md
 ```
 
-## Testing
+## 8. Testing
 
 ### Manual Testing
 
@@ -221,7 +213,7 @@ SELECT role, token_count, is_summarized FROM messages LIMIT 10;
 SELECT * FROM session_summaries;
 ```
 
-## Key Metrics
+## 7. Key Metrics
 
 ### Performance
 - **Normal query:** ~2-3s (LLM latency)
@@ -240,7 +232,7 @@ SELECT * FROM session_summaries;
 
 
 
-## Conversation Storage & History
+## 8. Conversation Storage & History
 
 ### Where are conversations saved?
 
@@ -278,7 +270,6 @@ stats = db.get_session_stats("session_20260130_143000")
 # Get latest summary
 summary = db.get_latest_summary("session_20260130_143000")
 ```
-
 ### Database Schema
 {
   "session_su
@@ -288,6 +279,16 @@ summary = db.get_latest_summary("session_20260130_143000")
   "clarifying_questions": ["question 1", "question 2"],
   "final_augmented_context": "combined context"
 }
-```
+
+
+
+## 9. Documentation Reference
+
+Comprehensive documentation available in `docs/`:
+
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** - High-level system design, components, data flow
+- **[CORE_LOGIC_AND_FLOW.md](docs/CORE_LOGIC_AND_FLOW.md)** - User journey with real session examples
+- **[TRADEOFFS_AND_LIMITATIONS.md](docs/TRADEOFFS_AND_LIMITATIONS.md)** - Design decisions, trade-offs, rationale
+- **[TEST_DATA_AND_EVIDENCE.md](docs/TEST_DATA_AND_EVIDENCE.md)** - Test sessions, verification, performance data
 
 
