@@ -7,7 +7,7 @@ This document provides comprehensive evidence of system correctness through anal
 **Configuration**:
 ```bash
 # .env
-GOOGLE_API_KEY=AIzaSyBJ34GECQMZNSa3b5TXrSMkI2Umwmv7gRU
+GOOGLE_API_KEY=<your-api-key-here>
 MODEL_NAME=gemini-2.5-flash
 TOKEN_THRESHOLD=1200
 ```
@@ -237,7 +237,7 @@ context_tokens = 0
 summary_tokens = 78
 total_tokens = 78  # Below threshold ✅
 
-should_summarize = False  # Continue normal flow
+needs_summarization = False  # Continue normal flow
 ```
 
 #### Messages 10-19 (Between First and Second Summarization)
@@ -302,7 +302,7 @@ summary_tokens = 78  # From first summary
 
 total_tokens = 1,348 + 78 = 1,426  # Exceeds 1,200
 
-should_summarize = True  # ⚠️ TRIGGER
+needs_summarization = True  # ⚠️ TRIGGER
 ```
 
 **Summarizer Agent Execution**:
@@ -346,18 +346,14 @@ should_summarize = True  # ⚠️ TRIGGER
 }
 ```
 
-3. **Index Calculation** (CRITICAL: Uses absolute positioning):
+3. **Index Calculation** (absolute positioning):
 ```python
 all_messages = get_messages(session_id, exclude_summarized=False)
-# Result: 19 messages total (IDs 1-19, indices 0-18)
-
 total_in_db = len(all_messages)  # 19
 unsummarized_count = len(messages)  # 10
 
 from_index = total_in_db - unsummarized_count  # 19 - 10 = 9 ✅
 to_index = total_in_db - 1  # 19 - 1 = 18 ✅
-
-# Will mark messages at DB indices 9-18 (the 10 unsummarized messages)
 ```
 
 4. **Database Operations**:
@@ -398,7 +394,7 @@ context_tokens = 0
 summary_tokens = 78 + 92 = 170
 total_tokens = 170  # Below threshold ✅
 
-should_summarize = False
+needs_summarization = False
 ```
 
 #### Message 20 (Final)
@@ -617,7 +613,7 @@ Total:      1,125 tokens  ✅ BELOW THRESHOLD (no summarization)
 ```python
 TOKEN_THRESHOLD = 1200
 context_tokens = 1125
-should_summarize = context_tokens > 1200  # False ✅
+needs_summarization = context_tokens > 1200  # False ✅
 ```
 
 **Expected Behavior**:
@@ -852,68 +848,6 @@ UPDATE messages SET is_summarized = 1 WHERE session_id = ? AND id IN (...);
 
 ---
 
-## Cost Analysis
-
-### Per-Session Costs (Gemini 2.5 Flash)
-
-**Pricing**:
-```
-Input:  $0.075 per 1M tokens
-Output: $0.30 per 1M tokens
-```
-
-**Session 232650** (20 messages, 2 summaries):
-```
-Normal queries (18 queries):
-- Input: ~18,000 tokens = $0.00135
-- Output: ~4,500 tokens = $0.00135
-
-Summaries (2 summaries):
-- Input: ~2,400 tokens = $0.00018
-- Output: ~160 tokens = $0.000048
-
-Total cost: ~$0.0027 per session
-```
-
-**Session 234403** (12 messages, 2 summaries):
-```
-Normal queries (10 queries):
-- Input: ~10,000 tokens = $0.00075
-- Output: ~2,500 tokens = $0.00075
-
-Summaries (2 summaries):
-- Input: ~2,400 tokens = $0.00018
-- Output: ~160 tokens = $0.000048
-
-Total cost: ~$0.0018 per session
-```
-
-**Average**: $0.002-0.003 per session (20-message conversation)
-
-### ROI of Summarization
-
-**Without summarization** (if we allowed 20K tokens context):
-```
-Query 20 with 20K context:
-- Input: 20,000 tokens = $0.0015
-- Output: 250 tokens = $0.000075
-- Total: $0.001575 per query
-```
-
-**With summarization** (after 2 summaries, 170 tokens context):
-```
-Query 20 with 170 tokens context:
-- Input: 170 tokens = $0.0000128
-- Output: 250 tokens = $0.000075
-- Total: $0.0000878 per query
-```
-
-**Savings**: $0.001487 per query (94% cost reduction for subsequent queries)
-
-**Break-even**: After ~2-3 queries post-summarization, the summarization cost is recovered
-
----
-
 ## Export File Format
 
 ### JSONL Structure
@@ -999,12 +933,12 @@ Each export file contains:
 
 The test data provides **comprehensive evidence** of system correctness:
 
-1. **Threshold=1,200 works perfectly**: Triggers every 8-12 messages, demonstrable in testing
-2. **Index calculation fix is critical**: Without it, second summarization fails
-3. **90-94% compression**: Enables unlimited conversation length
-4. **Ambiguity detection is accurate**: 100% correct classification across test sessions
-5. **Performance is excellent**: ~4-6s per query, database not a bottleneck
-6. **Cost is minimal**: $0.002-0.003 per 20-message session
-7. **No data loss**: Summary context preserves critical information
+1. ✅ **3 Real Sessions**: Customer churn (20 msgs), web scraping (12 msgs), AWS deployment (6 msgs)
+2. ✅ **Threshold Detection**: Triggers correctly at 1,200 tokens, no false positives
+3. ✅ **Token Compression**: 90-94% reduction (1,200+ → ~80-170 tokens)
+4. ✅ **Ambiguity Detection**: 100% accuracy across all test queries
+5. ✅ **Database Integrity**: Correct is_summarized flags, accurate index ranges
+6. ✅ **Performance**: ~4-6s per query, database < 50ms overhead
+7. ✅ **Export Functionality**: Complete JSONL with metadata and summaries
 
-All critical bugs identified during testing were fixed and verified through multiple test sessions. The system is production-ready with the only caveat being the choice of TOKEN_THRESHOLD (easily configurable via `.env`).
+System is production-ready with TOKEN_THRESHOLD easily configurable via `.env`.

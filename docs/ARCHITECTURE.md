@@ -11,60 +11,53 @@ Built with LangGraph orchestration, Google Gemini LLM, and SQLite persistence.
 
 ## System Architecture Diagram
 
+```mermaid
+graph TB
+    subgraph UI["Streamlit UI (app.py)"]
+        A[Chat Interface]
+        B[Token Counter Display]
+        C[Session Management]
+        D[Message History]
+    end
+    
+    subgraph Workflow["LangGraph Workflow (graph.py + agents.py)"]
+        E[Context Agent]
+        F{Tokens > 1200?}
+        G[Summarizer Agent]
+        H[Ambiguity Resolver]
+        I[Response Generator]
+        
+        E --> F
+        F -->|Yes| G
+        G --> E
+        F -->|No| H
+        H --> I
+    end
+    
+    subgraph DB["SQLite Database (database.py)"]
+        J[(messages table)]
+        K[(session_summaries table)]
+    end
+    
+    UI --> Workflow
+    Workflow --> DB
+    DB -.->|Load context| Workflow
+    
+    style E fill:#99ccff
+    style G fill:#ff9999
+    style H fill:#99ff99
+    style I fill:#ffff99
+    style J fill:#e6e6fa
+    style K fill:#e6e6fa
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                   Streamlit UI (app.py)                     │
-│  - Chat interface with token counter                        │
-│  - Session management (create, load, export, delete)        │
-│  - Real-time context display: "Context: X / 1200 tokens"    │
-└────────────────┬────────────────────────────────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────────────────────────────┐
-│          LangGraph Workflow (graph.py + agents.py)          │
-│                                                              │
-│  ┌──────────────┐                                          │
-│  │Context Agent │ ← Load messages, count tokens            │
-│  └──────┬───────┘                                          │
-│         │                                                   │
-│         ├─ if tokens > 1200 ──────┐                        │
-│         │                          ▼                        │
-│         │               ┌────────────────────┐             │
-│         │               │ Summarizer Agent   │             │
-│         │               │ - Compress context │             │
-│         │               │ - Mark messages    │             │
-│         │               └─────────┬──────────┘             │
-│         │                         │                         │
-│         ▼◄────────────────────────┘                         │
-│  ┌──────────────────┐                                      │
-│  │Ambiguity Resolver│ ← Detect ambiguous queries           │
-│  └──────┬───────────┘                                      │
-│         │                                                   │
-│         ▼                                                   │
-│  ┌──────────────────┐                                      │
-│  │Response Generator│ ← Generate final answer              │
-│  └──────┬───────────┘                                      │
-│         │                                                   │
-│         ▼                                                   │
-│    Save to Database                                        │
-└─────────────────────────────────────────────────────────────┘
-                 │
-                 ▼
-┌─────────────────────────────────────────────────────────────┐
-│               SQLite Database (database.py)                 │
-│                                                              │
-│  messages table:                                            │
-│    - id, session_id, role, content                         │
-│    - timestamp, token_count                                 │
-│    - is_summarized (0=active, 1=compressed)                │
-│    - metadata (query_analysis, etc.)                       │
-│                                                              │
-│  session_summaries table:                                   │
-│    - id, session_id, summary                                │
-│    - from_message_index, to_message_index                  │
-│    - timestamp, created_at                                  │
-└─────────────────────────────────────────────────────────────┘
-```
+
+**Component Flow:**
+1. **Streamlit UI** - User interface with real-time token counter showing "Context: X / 1200 tokens"
+2. **Context Agent** - Loads unsummarized messages, counts tokens, checks threshold
+3. **Summarizer Agent** - Compresses context when tokens > 1200, marks messages as summarized
+4. **Ambiguity Resolver** - Detects unclear queries, generates interpretations
+5. **Response Generator** - Creates final answer with conversation context
+6. **Database** - Persists messages (with is_summarized flag) and summaries
 
 ## Component Responsibilities
 
@@ -76,11 +69,12 @@ Built with LangGraph orchestration, Google Gemini LLM, and SQLite persistence.
 - Chat interface with message history
 - Real-time token counter showing `Context: X / 1200 tokens`
 - Session management sidebar:
-  - Create new conversations
-  - Load existing sessions
-  - Export to JSONL
-  - Delete sessions
-- Demo flows for easy testing
+  - Create new conversations (🆕 New)
+  - Load existing sessions (click on conversation)
+  - Export to JSONL (💾 Export in 3-dot menu)
+  - Delete sessions (🗑️ Delete in 3-dot menu)
+- Inline metadata display (expand message to see query analysis)
+- Session summaries displayed at bottom when triggered
 
 **Token Display Logic**:
 ```python
@@ -101,7 +95,7 @@ st.metric("Context", f"{context_tokens} / 1200 tokens")
 # Simplified view
 START → Context Agent
        ↓
-       ├─ if should_summarize → Summarizer Agent → Context Agent (retry)
+       ├─ if needs_summarization → Summarizer Agent
        │
        └─ else → Ambiguity Resolver Agent
                  ↓
@@ -112,8 +106,8 @@ START → Context Agent
 
 ## Conditional Routing**:
 - If `context_tokens > 1200`: Route to Summarizer
-- After summarization: Loop back to Context Agent (context now reset)
-- Normal flow: Context → Ambiguity → Response
+- After summarization: Continue to Query Agent (context already reset)
+- Normal flow: Context → (optional Summarizer) → Query Agent → Response
 
 ```mermaid
 graph TD
@@ -159,9 +153,9 @@ def context_agent(state):
     
     # 4. Check threshold
     if total_tokens > 1200:
-        return {**state, "should_summarize": True}
+        return {**state, "needs_summarization": True}
     
-    return {**state, "should_summarize": False}
+    return {**state, "needs_summarization": False}
 ```
 
 **Key Point**: Uses `exclude_summarized=True` to only count active context
@@ -349,25 +343,23 @@ From `session_20260131_232650.jsonl`:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Initial: Message 1-10
-    Initial --> Threshold1: 1,220 tokens > 1200
-    Threshold1 --> Summary1: Summarize messages 0-8
-    Summary1 --> Reset1: Context: 80 tokens
-    Reset1 --> Growing: Messages 11-19
-    Growing --> Threshold2: 1,230 tokens > 1200
-    Threshold2 --> Summary2: Summarize messages 9-18
-    Summary2 --> Reset2: Context: 170 tokens (2 summaries)
-    Reset2 --> Final: Message 20
+    [*] --> Initial
+    Initial --> Threshold1: 1220 tokens exceed
+    Threshold1 --> Summary1: Summarize msgs 0-8
+    Summary1 --> Reset1: Context reset to 80 tokens
+    Reset1 --> Growing
+    Growing --> Threshold2: 1230 tokens exceed
+    Threshold2 --> Summary2: Summarize msgs 9-18
+    Summary2 --> Reset2: 170 tokens with 2 summaries
+    Reset2 --> Final
     Final --> [*]
     
     note right of Threshold1
-        First summarization
-        triggered at msg 10
+        First summary at msg 10
     end note
     
     note right of Threshold2
-        Second summarization
-        triggered at msg 19
+        Second summary at msg 19
     end note
 ```
 
@@ -444,7 +436,7 @@ sequenceDiagram
     
     U->>C: "What is the next step?"
     Note over C: Load messages 1-9<br/>Total: 1,211 tokens > 1200
-    C->>C: should_summarize = True
+    C->>C: needs_summarization = True
     C->>S: Trigger summarization
     Note over S: Generate summary<br/>Calculate indices<br/>from_index=0, to_index=8
     S->>D: Save summary (~70 tokens)
@@ -478,7 +470,7 @@ sequenceDiagram
    - Result: 0 unsummarized messages (9 is current)
    - Load summaries: 1 summary (~70 tokens)
    - Total context: 70 + 11 = 81 tokens ✅
-   - should_summarize: False
+   - needs_summarization: False
    ↓
 5. Normal flow continues:
    - Ambiguity Resolver

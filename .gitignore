@@ -2,8 +2,7 @@
 .env
 *.env
 
-# Assignment document
-Vulcan Labs - AI Engineer Intern - Take-Home Test.md
+
 
 # Python
 __pycache__/
@@ -30,10 +29,7 @@ wheels/
 .installed.cfg
 *.egg
 
-# Database
-*.db
-*.sqlite
-*.sqlite3
+
 
 # IDE
 .vscode/

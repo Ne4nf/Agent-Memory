@@ -55,23 +55,27 @@ Comprehensive documentation available in `docs/`:
 - **[TRADEOFFS_AND_LIMITATIONS.md](docs/TRADEOFFS_AND_LIMITATIONS.md)** - Design decisions, trade-offs, rationale
 - **[TEST_DATA_AND_EVIDENCE.md](docs/TEST_DATA_AND_EVIDENCE.md)** - Test sessions, verification, performance data
 
-## 🎬 Demo Flows
+## 🎬 How to Test Features
 
-### Demo Flow 1: Session Memory
-1. Click **"Demo Flow 1"** in sidebar
-2. Watch token counter increase as messages are added
-3. Summarization triggers automatically at threshold
-4. Context resets from ~1,200 → ~80 tokens
-5. Conversation continues with compressed context
+### Testing Session Memory
+1. Start a conversation in the main chat
+2. Monitor the **token counter** in sidebar (Context: X / 1200 tokens)
+3. Continue chatting - watch the progress bar fill up
+4. When threshold exceeded, summary triggers automatically
+5. Context resets from ~1,200 → ~80 tokens
+6. Check **"📋 Session Summaries"** section at bottom to see structured summary
 
-### Demo Flow 2: Ambiguous Query
-1. Click **"Demo Flow 2"** in sidebar
-2. System detects ambiguous query ("Python")
-3. Presents interpretations:
-   - Python programming language
-   - Python (the snake)
-4. Asks clarifying questions
-5. Responds appropriately based on clarification
+### Testing Query Understanding
+1. Ask ambiguous questions like:
+   - "I need help"
+   - "What about it?"
+   - "Can you explain that?"
+2. Expand the **"Metadata"** section in the response
+3. See query analysis with:
+   - Ambiguity detection (true/false)
+   - Possible interpretations
+   - Clarifying questions
+4. System intelligently handles vague queries
 
 ## 🏗️ Architecture
 
@@ -164,14 +168,14 @@ Agent-Memory/
 │   └── utils.py          # Token counter
 ├── docs/                  # Documentation
 │   ├── ARCHITECTURE.md
-│   ├── TOKEN_COUNTING_LOGIC.md
-│   ├── SUMMARIZATION_FLOW.md
+│   ├── CORE_LOGIC_AND_FLOW.md
 │   ├── TRADEOFFS_AND_LIMITATIONS.md
-│   └── USER_GUIDE.md
+│   └── TEST_DATA_AND_EVIDENCE.md
 ├── data/
-│   ├── conversation.db   # SQLite database
-│   └── exports/          # Exported conversations
-├── .env                   # Configuration
+│   ├── conversation.db   # SQLite database (created on first run)
+│   └── exports/          # Exported sessions (JSONL format)
+├── .env                   # Configuration (create from .env.example)
+├── .env.example           # Configuration template
 ├── requirements.txt
 └── README.md
 ```
@@ -181,17 +185,19 @@ Agent-Memory/
 ### Manual Testing
 
 1. **Session Memory:**
-   - Run Demo Flow 1
-   - Verify token counter resets after summarization
-   - Check `data/exports/` for JSONL export
+   - Have a long conversation (15+ messages)
+   - Watch token counter in sidebar
+   - When it exceeds 1200 tokens, summarization triggers automatically
+   - Check "📋 Session Summaries" section at bottom
+   - Export session to see complete JSONL
 
 2. **Query Understanding:**
-   - Run Demo Flow 2
-   - Try ambiguous queries:
+   - Ask ambiguous queries:
      - "I need help"
      - "What's the best?"
-     - "Python"
-   - Verify clarifying questions appear
+     - "Check if it's good"
+   - Expand "Metadata" in message
+   - Verify ambiguity detection and interpretations
 
 ### Database Inspection
 
@@ -264,12 +270,12 @@ streamlit run app.py
 - ✅ Fully functional and tested
 
 ### Additional Features (Bonus)
-- ✅ Clean Streamlit UI with token counter
-- ✅ Session management (create, load, delete)
-- ✅ Export to JSONL format
-- ✅ Demo flows for easy evaluation
-- ✅ Comprehensive documentation
-- ✅ Graceful error handling
+- ✅ Clean Streamlit UI with real-time token counter
+- ✅ Session management (create, load, export, delete)
+- ✅ Export to JSONL format with complete metadata
+- ✅ Inline query analysis display in message metadata
+- ✅ Comprehensive documentation with real examples
+- ✅ Graceful error handling and validation
 
 ## 🎓 Learning Outcomes
 
@@ -348,22 +354,26 @@ The application will open in your browser at `http://localhost:8501`
    - Context used from memory
 5. **Session summaries** appear at the bottom when triggered
 
-### Demo Flow 1: Session Memory Trigger
+### Testing Session Memory
 
-1. Have a long conversation (20+ exchanges)
-2. Watch the progress bar fill up toward 10k tokens
-3. When threshold is exceeded, summarization triggers automatically
-4. View the structured summary in "Session Summaries" section
+1. Have a long conversation (15-20 messages)
+2. Watch the progress bar fill up toward 1200 tokens (not 10k - check your .env)
+3. When threshold exceeded, summarization triggers automatically
+4. View structured summary in "📋 Session Summaries" section
+5. Export session to see complete JSONL with inline metadata
 
-### Demo Flow 2: Ambiguous Query Handling
+### Testing Query Understanding
 
-1. Ask an ambiguous question like:
+1. Ask ambiguous questions:
    - "Can you help with that?"
    - "What about it?"
-   - "The second one"
-2. Expand the "Metadata" section in the response
-3. See ambiguity detection and query rewriting
-4. Note how the system makes smart assumptions when you delegate ("you choose", "your decision")
+   - "Check if it's good"
+2. Expand "Metadata" section in the response
+3. See query analysis:
+   - is_ambiguous: true/false
+   - possible_interpretations
+   - clarifying_questions
+4. System enriches context using conversation history
 
 ---
 
@@ -378,12 +388,14 @@ Agent-Memory/
 │   ├── utils.py            # Token counting utilities
 │   ├── agents.py           # LangGraph agent implementations
 │   └── graph.py            # LangGraph orchestration
-├── test_data/
-│   ├── long_conversation.jsonl
-│   ├── ambiguous_queries.jsonl
-│   ├── mixed_scenario.jsonl
-│   data/                   # Created at runtime
-│   └── conversation.db     # SQLite database (all conversations stored here)
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── CORE_LOGIC_AND_FLOW.md
+│   ├── TRADEOFFS_AND_LIMITATIONS.md
+│   └── TEST_DATA_AND_EVIDENCE.md
+├── data/                   # Created at runtime
+│   ├── conversation.db     # SQLite database (all conversations)
+│   └── exports/            # JSONL exports of sessions
 ├── app.py                  # Streamlit UI
 ├── requirements.txt
 ├── .env.example
@@ -447,15 +459,15 @@ summary = db.get_latest_summary("session_20260130_143000")
 
 ## 🧪 Testing
 
-### Using Test Data
+### Real Test Sessions
 
-The included test data demonstrates both core features:
+The system has been tested with real conversations. Check `data/exports/` folder for actual session examples:
 
-1. **long_conversation.jsonl**: 46 messages, designed to exceed token threshold
-2. **ambiguous_queries.jsonl**: 14 messages with intentionally vague queries
-3. **mixed_scenario.jsonl**: 16 messages combining both features
+1. **session_20260131_232650.jsonl**: Customer churn prediction (20 messages, 2 summaries)
+2. **session_20260131_234403.jsonl**: Web scraping project (12 messages, 2 summaries)
+3. **session_20260131_235440.jsonl**: AWS deployment (6 messages, 0 summaries)
 
-Load any test file through the Streamlit UI sidebar.
+These demonstrate both features working correctly in production.
 
 ### Manual Testing
 
@@ -521,7 +533,7 @@ Load any test file through the Streamlit UI sidebar.
 | **Core features work** (6pts) | ✅ Both flows fully functional | `src/agents.py`, `src/graph.py` |
 | **Structured outputs** (1pt) | ✅ Pydantic schemas + validation | `src/schemas.py` |
 | **Code structure** (2pts) | ✅ Clear separation, documented | All `src/` files |
-| **Documentation** (1pt) | ✅ Complete README + test data | This file + `test_data/` |
+| **Documentation** (1pt) | ✅ Complete README + docs | This file + `docs/` |
 
 ---
 
@@ -564,9 +576,10 @@ Load any test file through the Streamlit UI sidebar.
 - Make sure you're running commands from the project root
 - Ensure `src/__init__.py` exists
 
-### "Test data not found"
-- Run `python generate_test_data.py` to create test files
-- Check that `test_data/` directory exists
+### "Session not loading"
+- Check `data/conversation.db` exists
+- Try creating a new conversation
+- Export working session to verify data integrity
 
 ### Database locked errors
 - Close any other connections to the database
@@ -587,8 +600,8 @@ Load any test file through the Streamlit UI sidebar.
 
 ### Design Decisions
 
-1.Test data is optional - you can test by chatting normally
-- System will still work perfectly without test filets always match schemas
+1. All data validated with Pydantic schemas
+2. Messages always match required format
 3. **Tiktoken**: Accurate token counting (meets "plus" requirement)
 4. **SQLite**: Simple, serverless persistence (meets file system/DB requirement)
 5. **Streamlit**: Interactive demo showing pipeline internals
@@ -610,9 +623,10 @@ Created for Vulcan Labs AI Engineer Internship Take-Home Test
 ## 📞 Support
 
 For questions about the implementation:
-1. Check the inline code comments
-2. Review test data in `test_data/`
-3. Examine the console output when running Streamlit
+1. Check the inline code comments in `src/`
+2. Review comprehensive docs in `docs/`
+3. Check exported sessions in `data/exports/`
+4. Examine Streamlit console output for debugging
 
 ---
 

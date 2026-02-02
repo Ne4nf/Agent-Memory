@@ -553,122 +553,6 @@ Total per session: ~$0.12 (40x more!)
 
 ---
 
-## 10. Critical Bug: Index Calculation
-
-### The Bug (Discovered During Testing)
-
-```mermaid
-sequenceDiagram
-    participant DB as Database (19 msgs)
-    participant CA as Context Agent
-    participant SA as Summarizer (BROKEN)
-    participant SB as Summarizer (FIXED)
-    
-    Note over DB: Messages 0-8: summarized<br/>Messages 9-18: unsummarized
-    
-    CA->>SA: messages = [9,10,11,12,13,14,15,16,17,18]
-    Note over SA: ❌ from_index = 0<br/>❌ to_index = 9<br/>(relative to list!)
-    SA->>DB: Mark messages 0-9
-    Note over DB: ❌ Messages 0-8 already marked<br/>❌ Only 9 gets marked<br/>❌ 10-18 never marked!
-    
-    rect rgb(255, 200, 200)
-    Note over DB,SA: BUG: Context never resets<br/>Infinite loop!
-    end
-    
-    CA->>SB: messages = [9,10,11,12,13,14,15,16,17,18]
-    Note over SB: ✅ all_messages = 19<br/>✅ from_index = 19-10 = 9<br/>✅ to_index = 19-1 = 18<br/>(absolute position!)
-    SB->>DB: Mark messages 9-18
-    Note over DB: ✅ All 10 messages marked<br/>✅ Context resets correctly
-    
-    rect rgb(200, 255, 200)
-    Note over DB,SB: FIXED: Proper indices<br/>Context resets work!
-    end
-```
-
-**Original code** (broken):
-```python
-def summarizer_agent(state):
-    messages = state["messages"]  # Unsummarized messages only
-    
-    # Generate summary...
-    
-    # ❌ WRONG: Using relative indices
-    from_index = 0
-    to_index = len(messages) - 1
-    
-    db.mark_messages_as_summarized(session_id, from_index, to_index)
-```
-
-**Problem**:
-- `messages` list contains only unsummarized messages (e.g., messages 9-18 from DB)
-- `from_index=0` points to **first item in list**, not first message in DB
-- If list contains messages 9-18, index 0 in list is message 9 in DB
-- But code marks messages 0 to 9 (WRONG RANGE!)
-
-**Impact**:
-```
-First summarization:
-- messages = [0, 1, 2, 3, 4, 5, 6, 7, 8] (9 items)
-- from_index = 0, to_index = 8
-- Marks DB messages 0-8 ✅ (correct by accident!)
-
-Second summarization:
-- messages = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18] (10 items)
-- from_index = 0, to_index = 9 ❌
-- Marks DB messages 0-9 (WRONG!)
-- Messages 0-8 already marked, but 9 gets marked
-- Messages 10-18 never marked ❌❌❌
-- Next cycle loads 10-18 again → infinite loop
-```
-
-### The Fix
-
-**Corrected code**:
-```python
-def summarizer_agent(state):
-    messages = state["messages"]  # Unsummarized messages
-    
-    # Generate summary...
-    
-    # ✅ CORRECT: Calculate absolute position in database
-    all_messages = db.get_messages(session_id, exclude_summarized=False)
-    total_in_db = len(all_messages)
-    unsummarized_count = len(messages)
-    
-    from_index = total_in_db - unsummarized_count
-    to_index = total_in_db - 1
-    
-    db.mark_messages_as_summarized(session_id, from_index, to_index)
-```
-
-**Example calculation**:
-```
-Second summarization:
-- all_messages = 19 total (0-18 in DB)
-- messages = 10 unsummarized (list items)
-- from_index = 19 - 10 = 9 ✅
-- to_index = 19 - 1 = 18 ✅
-- Marks DB messages 9-18 (CORRECT!)
-```
-
-**Verification** (from test sessions):
-```
-Session 232650 (2 summaries):
-- Summary 1: Marked messages 0-8 ✅
-- Summary 2: Marked messages 9-18 ✅
-- All 19 messages correctly marked
-- Context reset works perfectly
-
-Session 234403 (2 summaries):
-- Summary 1: Marked messages 0-7 ✅
-- Summary 2: Marked messages 8-11 ✅
-- All 12 messages correctly marked
-```
-
-**Critical Lesson**: When working with lists derived from filtered queries, **always calculate absolute indices** from source of truth (database), not from list position.
-
----
-
 ## Summary of Key Trade-offs
 
 | Decision | Chosen Approach | Trade-off | Rationale |
@@ -748,10 +632,8 @@ Session 234403 (2 summaries):
 The implemented system makes **pragmatic trade-offs** appropriate for a take-home assignment:
 
 ✅ **Demonstrates core features**: Session memory + query understanding  
-✅ **Production-quality architecture**: Clean separation, error handling, testing  
-✅ **Easy to run**: `streamlit run app.py` just works  
+✅ **Production-quality architecture**: Clean separation, error handling, validation  
+✅ **Easy to evaluate**: `streamlit run app.py` just works  
 ✅ **Scalable foundation**: Clear upgrade path for each limitation  
 
-The TOKEN_THRESHOLD=1,200 choice is particularly important: it allows reviewers to see the system work without excessive testing, while still being production-ready (just change one line in `.env` to 10000+).
-
-All critical bugs were identified and fixed through rigorous testing, resulting in a robust system that correctly handles multiple summarizations and maintains context integrity.
+The TOKEN_THRESHOLD=1,200 choice allows reviewers to see the system work without excessive testing, while being production-ready (change `.env` to 10000+ for production).

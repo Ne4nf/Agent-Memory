@@ -59,7 +59,7 @@ STEP 1: Context Agent
   │    → Load messages: now 0 unsummarized
   │    → Load summaries: 1 summary (~80 tokens)
   │    → Total: 80 tokens ✅ (below threshold)
-  │    → should_summarize: False
+  │    → needs_summarization: False
   │         ↓
   └───────►┘
          ↓
@@ -105,7 +105,7 @@ messages = []  # No previous messages
 context_tokens = 23  # Just this query
 summary_tokens = 0   # No summaries yet
 total_tokens = 23    # Below 1200 threshold
-should_summarize = False
+needs_summarization = False
 ```
 
 **Ambiguity Resolver Output**:
@@ -192,7 +192,7 @@ unsummarized_messages = get_messages(exclude_summarized=True)
 # Returns messages 0-8 (9 messages)
 context_tokens = sum(msg.token_count for msg in unsummarized_messages)
 # Total: 1,284 tokens > 1200 ⚠️
-should_summarize = True
+needs_summarization = True
 ```
 
 **Summarizer Agent Execution**:
