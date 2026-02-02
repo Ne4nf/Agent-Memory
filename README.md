@@ -1,23 +1,22 @@
 # Chat Assistant with Session Memory
 
-> **Vulcan Labs - AI Engineer Intern - Take-Home Test**  
 > Implementation of a chat assistant with session memory via summarization and intelligent query understanding.
 
-## 🎯 Features
+## Features
 
-### ✅ Feature 1: Session Memory via Summarization (6/10 points)
+### Feature 1: Session Memory via Summarization (6/10 points)
 - **Automatic context management** - Summarizes conversation when exceeding 1,200 tokens
 - **90-94% compression ratio** - Reduces ~1,200 tokens → ~80 tokens
 - **Context preservation** - Maintains key facts, decisions, and open questions
 - **Incremental summarization** - Supports unlimited conversation length
 
-### ✅ Feature 2: Query Understanding & Disambiguation (4/10 points)
+### Feature 2: Query Understanding & Disambiguation (4/10 points)
 - **Ambiguity detection** - Identifies unclear or vague queries
 - **Multiple interpretations** - Presents possible meanings
 - **Clarifying questions** - Asks for context when needed
 - **Context augmentation** - Enriches queries with conversation history
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 - Python 3.10+
