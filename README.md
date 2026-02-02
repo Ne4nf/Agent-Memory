@@ -270,15 +270,7 @@ stats = db.get_session_stats("session_20260130_143000")
 # Get latest summary
 summary = db.get_latest_summary("session_20260130_143000")
 ```
-### Database Schema
-{
-  "session_su
-  },
-  "tewritten_query": "clarified version or null",
-  "needed_context_from_memory": ["memory fields used"],
-  "clarifying_questions": ["question 1", "question 2"],
-  "final_augmented_context": "combined context"
-}
+
 
 
 
