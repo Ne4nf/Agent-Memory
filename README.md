@@ -4,17 +4,23 @@
 
 ## Features
 
-### Feature 1: Session Memory via Summarization (6/10 points)
+### Feature 1: Session Memory via Summarization 
 - **Automatic context management** - Summarizes conversation when exceeding 1,200 tokens
 - **90-94% compression ratio** - Reduces ~1,200 tokens → ~80 tokens
 - **Context preservation** - Maintains key facts, decisions, and open questions
 - **Incremental summarization** - Supports unlimited conversation length
 
-### Feature 2: Query Understanding & Disambiguation (4/10 points)
+<img width="1891" height="901" alt="image" src="https://github.com/user-attachments/assets/26ebea68-233b-442b-ac54-04880756e2ed" />
+
+
+### Feature 2: Query Understanding & Disambiguation 
 - **Ambiguity detection** - Identifies unclear or vague queries
 - **Multiple interpretations** - Presents possible meanings
 - **Clarifying questions** - Asks for context when needed
 - **Context augmentation** - Enriches queries with conversation history
+
+<img width="1904" height="899" alt="image" src="https://github.com/user-attachments/assets/2246c068-83cc-442a-80ef-de529121a757" />
+
 
 ## Quick Start
 
