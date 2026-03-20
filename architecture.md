@@ -6,14 +6,17 @@ Tài liệu này đặc tả việc phân tích trải nghiệm từ các giải
 
 ### 1.1. Genspark
 Genspark sử dụng kiến trúc **Dynamic Multi-Agent**. Khi user đưa request, một "Planner Agent" sẽ tự động sinh ra các "Worker Agents" (đi search web, đi vẽ ảnh) một cách linh hoạt, không cố định luồng. Kiến trúc này mang lại những điểm sáng nhưng cũng dễ gây ra lỗi ảo giác (hallucination) hoặc khiến hệ thống mắc kẹt trong vòng lặp generate liên tục.
+<img width="1011" height="895" alt="Screenshot 2026-03-20 003813" src="https://github.com/user-attachments/assets/0a13720b-6fd3-4b64-940b-241c87f160e1" />
 
 **Ưu điểm (Pros):**
 - **Web Search mượt & linh hoạt:** Khả năng tìm kiếm của Genspark đa dạng hơn, tập trung lấy context nghiên cứu (research) theo các keyword như 	rend, best, top, hot... và trỏ trực tiếp đến chuyên môn logo design.
 - **Chat tự động (Auto-detect):** Tự động nhận diện ý định và kích hoạt luồng làm việc mà không yêu cầu user thao tác rườm rà.
+<img width="1849" height="961" alt="Screenshot 2026-03-20 120151" src="https://github.com/user-attachments/assets/ed887a34-2f38-4b70-a13b-249fcbd126bc" />
 
 **Nhược điểm & Vấn đề (Cons & Issues):**
 - **Thuyết minh "bằng chữ" nhàm chán:** Việc LLM dừng lại sinh ra các đề xuất hướng thiết kế thuần túy bằng text làm tốn thời gian và khiến user rất khó để hình dung visual của logo trông sẽ như thế nào.
-- **Khuyết điểm Edit (Must redraw):** Genspark thiếu khả năng can thiệp chỉnh sửa chi tiết. Nó buộc bot phải tự vẽ lại (generate) toàn bộ bức ảnh để edit thay vì cung cấp công cụ sửa khoanh vùng.
+- **Khuyết điểm Edit (Must redraw):** Genspark thiếu khả năng can thiệp chỉnh sửa chi tiết. Nó buộc user manual layer phần cần edit thay vì "Touch edit detection" như của Lovart.
+<img width="1826" height="928" alt="image" src="https://github.com/user-attachments/assets/bccff644-1b7f-4031-8853-fc4821fff636" />
 
 ### 1.2. Lovart
 Lovart mang lại trải nghiệm thao tác thiết kế "bay bổng" hơn, nhưng lại yếu ở khả năng thấu hiểu ngữ cảnh (AI logic).
@@ -21,10 +24,13 @@ Lovart mang lại trải nghiệm thao tác thiết kế "bay bổng" hơn, như
 **Ưu điểm (Pros):**
 - **Giao diện Canvas Design vượt trội:** Trải nghiệm chỉnh sửa trực quan ngay trên vùng làm việc mang lại cảm giác dễ chịu giống Canva (Về mảng Design Canvas: Lovart > Genspark).
 - **Tính năng "Touch Edit":** Cho phép người dùng chọn một vùng ảnh và sửa (đòi hỏi mô hình Regional Prompting hoặc Image-to-Image / Inpainting chuyên biệt).
+<img width="1907" height="926" alt="Screenshot 2026-03-20 134426" src="https://github.com/user-attachments/assets/39588115-1545-40ad-99d5-0e7082dfdbcd" />
 
 **Nhược điểm & Vấn đề (Cons & Issues):**
 - **Web Search "trật trọng tâm":** Search của Lovart không focus được vào "Brand" mà bị đánh lừa bởi bề mặt "sự vật" trong query. Ví dụ: Với request "i wanna to gen logo for sport clothes store", Lovart sẽ chỉ lấy keyword "sport" để search (người chạy bộ, vận động viên) chứ không nhận diện được trọng tâm là "logo brand".
 - **Trải nghiệm Chat thủ công, rườm rà:** Hệ thống không tự detect ý định mượt mà như Genspark. User phải tự tay thao tác qua nhiều bước trung gian: Set up model, web search, thinking/fast hay agent direction.
+<img width="1815" height="957" alt="Screenshot 2026-03-20 120025" src="https://github.com/user-attachments/assets/8c1ec84c-1808-42fb-b84e-a4e262c15256" />
+<img width="1849" height="961" alt="Screenshot 2026-03-20 120151" src="https://github.com/user-attachments/assets/7f3f7135-c056-4a30-a2be-f868928272fc" />
 
 ---
 
