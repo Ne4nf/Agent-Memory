@@ -1,1013 +1,130 @@
-# Logo Design Agent - Architecture & Design
+# AI Logo Design Agent - Architecture & User Flow
 
-**Version**: 1.0  
-**Last Updated**: March 20, 2026  
-**Status**: Design Document
+Tài liệu này đặc tả việc phân tích trải nghiệm từ các giải pháp hiện có trên thị trường (Genspark, Lovart), qua đó đề xuất kiến trúc hệ thống, luồng xử lý cốt lõi (Core Logic) và trải nghiệm người dùng (User Flow) của AI Logo Design Agent.
 
-## Table of Contents
+## 1. Phân tích Trải nghiệm Thực tế (Genspark vs Lovart)
 
-1. [System Architecture](#system-architecture)
-2. [Core Components](#core-components)
-3. [User Workflow](#user-workflow)
-4. [Reasoning Engine Logic](#reasoning-engine-logic)
-5. [Data Flow](#data-flow)
-6. [Decision Trees](#decision-trees)
-7. [Interaction Patterns](#interaction-patterns)
-8. [Error Handling](#error-handling)
+### 1.1. Genspark
+Genspark sử dụng kiến trúc **Dynamic Multi-Agent**. Khi user đưa request, một "Planner Agent" sẽ tự động sinh ra các "Worker Agents" (đi search web, đi vẽ ảnh) một cách linh hoạt, không cố định luồng. Kiến trúc này mang lại những điểm sáng nhưng cũng dễ gây ra lỗi ảo giác (hallucination) hoặc khiến hệ thống mắc kẹt trong vòng lặp generate liên tục.
 
----
+**Ưu điểm (Pros):**
+- **Web Search mượt & linh hoạt:** Khả năng tìm kiếm của Genspark đa dạng hơn, tập trung lấy context nghiên cứu (research) theo các keyword như 	rend, best, top, hot... và trỏ trực tiếp đến chuyên môn logo design.
+- **Chat tự động (Auto-detect):** Tự động nhận diện ý định và kích hoạt luồng làm việc mà không yêu cầu user thao tác rườm rà.
 
-## System Architecture
+**Nhược điểm & Vấn đề (Cons & Issues):**
+- **Thuyết minh "bằng chữ" nhàm chán:** Việc LLM dừng lại sinh ra các đề xuất hướng thiết kế thuần túy bằng text làm tốn thời gian và khiến user rất khó để hình dung visual của logo trông sẽ như thế nào.
+- **Khuyết điểm Edit (Must redraw):** Genspark thiếu khả năng can thiệp chỉnh sửa chi tiết. Nó buộc bot phải tự vẽ lại (generate) toàn bộ bức ảnh để edit thay vì cung cấp công cụ sửa khoanh vùng.
 
-### High-Level System Diagram
+### 1.2. Lovart
+Lovart mang lại trải nghiệm thao tác thiết kế "bay bổng" hơn, nhưng lại yếu ở khả năng thấu hiểu ngữ cảnh (AI logic).
 
-```mermaid
-graph TB
-    UserChat["👤 User Chat Interface"]
-    AIHubSDK["🤖 AI-Hub-SDK Framework"]
-    LogoWorker["📋 Logo Design Worker"]
-    IntentDetector["🎯 Intent Detection"]
-    BrandInference["🏷️ Brand Context Inference"]
-    StyleEngine["🎨 Style Inference Engine"]
-    DesignDirector["🧭 Design Direction Selection"]
-    ImgGenTool["🖼️ Image Generation Tool<br/>DALL-E 3/Gemini Imagen"]
-    ImgAnalyzer["🔍 Image Analysis Tool<br/>Vision API"]
-    EditParser["✏️ Edit Command Parser"]
-    EvalSystem["✅ Auto-Evaluation System<br/>LLM-as-Judge"]
-    
-    CloudStorage["☁️ Cloud Storage<br/>PNG Results"]
-    Redis["📦 Redis Cache<br/>Session Data"]
-    Webhook["🔔 Webhook Notifier<br/>Result Delivery"]
-    PubSub["📨 Google Pub/Sub<br/>Async Queue"]
-    
-    UserChat -->|User Message| AIHubSDK
-    AIHubSDK -->|Orchestrate| LogoWorker
-    
-    LogoWorker -->|Detect Intent| IntentDetector
-    IntentDetector -->|Brand Details| BrandInference
-    BrandInference -->|Brand Context| StyleEngine
-    StyleEngine -->|Design Params| DesignDirector
-    
-    DesignDirector -->|Stream Reasoning| UserChat
-    DesignDirector -->|Generate Logos| ImgGenTool
-    ImgGenTool -->|Image Bytes| CloudStorage
-    
-    LogoWorker -->|Analyze References| ImgAnalyzer
-    ImgAnalyzer -->|Style Elements| StyleEngine
-    
-    LogoWorker -->|Parse Edits| EditParser
-    EditParser -->|Regenerate| ImgGenTool
-    
-    ImgGenTool -->|Queue Job| PubSub
-    PubSub -->|Long-Running| LogoWorker
-    LogoWorker -->|Store Results| Redis
-    Redis -->|Notify| Webhook
-    Webhook -->|Deliver Results| UserChat
-    
-    ImgGenTool -->|Evaluate Quality| EvalSystem
-    EvalSystem -->|Metrics| Redis
-    
-    style UserChat fill:#e1f5ff
-    style AIHubSDK fill:#f3e5f5
-    style LogoWorker fill:#fff3e0
-    style CloudStorage fill:#e8f5e9
-    style Redis fill:#e0f2f1
-    style Webhook fill:#fce4ec
-    style PubSub fill:#f0f4c3
-```
+**Ưu điểm (Pros):**
+- **Giao diện Canvas Design vượt trội:** Trải nghiệm chỉnh sửa trực quan ngay trên vùng làm việc mang lại cảm giác dễ chịu giống Canva (Về mảng Design Canvas: Lovart > Genspark).
+- **Tính năng "Touch Edit":** Cho phép người dùng chọn một vùng ảnh và sửa (đòi hỏi mô hình Regional Prompting hoặc Image-to-Image / Inpainting chuyên biệt).
 
-### Layered Architecture
-
-```mermaid
-graph LR
-    A["🎯 User Intent Layer<br/>Intent Detection"] -->|Brand Context| B["🏷️ Brand Context Layer<br/>Inference & Mapping"]
-    B -->|Design Parameters| C["🎨 Design Layer<br/>Style & Direction"]
-    C -->|Generation Config| D["🛠️ Tool Layer<br/>MCP Integration"]
-    D -->|PNG Output| E["📊 Evaluation Layer<br/>Quality Assessment"]
-    E -->|Feedback| F["💾 Persistence Layer<br/>Redis/Cloud Storage"]
-    
-    G["⚡ Execution Layer<br/>Async Queue<Pub/Sub>"]
-    C -.->|Async Jobs| G
-    G -.->|Results| F
-    
-    style A fill:#ffebee
-    style B fill:#fce4ec
-    style C fill:#f3e5f5
-    style D fill:#ede7f6
-    style E fill:#e8eaf6
-    style F fill:#e3f2fd
-    style G fill:#f1f8e9
-```
+**Nhược điểm & Vấn đề (Cons & Issues):**
+- **Web Search "trật trọng tâm":** Search của Lovart không focus được vào "Brand" mà bị đánh lừa bởi bề mặt "sự vật" trong query. Ví dụ: Với request "i wanna to gen logo for sport clothes store", Lovart sẽ chỉ lấy keyword "sport" để search (người chạy bộ, vận động viên) chứ không nhận diện được trọng tâm là "logo brand".
+- **Trải nghiệm Chat thủ công, rườm rà:** Hệ thống không tự detect ý định mượt mà như Genspark. User phải tự tay thao tác qua nhiều bước trung gian: Set up model, web search, thinking/fast hay agent direction.
 
 ---
 
-## Core Components
+## 2. Giải pháp & Bối cảnh Kiến trúc (Our Approach)
 
-### 1. Intent Detection Module
+Hệ thống AI Logo Design của chúng ta được cấu trúc để **kế thừa các điểm mạnh và loại bỏ lỗ hổng**:
 
-**Purpose**: Identify logo design requests and extract key intent signals
-
-**Inputs**: User message text  
-**Outputs**: Intent confidence score, detected intent type, extracted keywords
-
-```mermaid
-graph TD
-    UserMsg["User Message"]
-    Tokenize["Tokenize & Normalize"]
-    PatternMatch["Pattern Matching<br/>logo, design, brand"]
-    LLMClassify["LLM Classification<br/>Intent + Confidence"]
-    ExtractKW["Extract Keywords<br/>industry, style, colors"]
-    Output["Intent Signal<br/>type, confidence, keywords"]
-    
-    UserMsg --> Tokenize
-    Tokenize --> PatternMatch
-    PatternMatch -->|High Confidence| Output
-    PatternMatch -->|Ambiguous| LLMClassify
-    LLMClassify --> ExtractKW
-    ExtractKW --> Output
-    
-    style UserMsg fill:#fff9c4
-    style Output fill:#c8e6c9
-```
-
-### 2. Brand Context Inference Engine
-
-**Purpose**: Extract and structure brand information from user input
-
-**Key Logic**:
-- Extract brand name (required for context, optional for symbol-only logos)
-- Detect industry/category
-- Identify values, tone, target audience
-- Build brand profile for inference
-
-**Data Structure**:
-```
-BrandContext {
-  name: str,              # Brand name (nullable for symbol-only)
-  industry: str,          # tech, coffee, beauty, etc.
-  values: List[str],      # core values
-  tone: str,              # professional, playful, luxury, etc.
-  audience: str,          # target demographic
-  style_hints: List[str]  # user-provided style preferences
-}
-```
-
-```mermaid
-graph TD
-    UserInput["User Input Text"]
-    
-    ExtractName["Extract Brand Name"]
-    ExtractIndustry["Detect Industry Category"]
-    ExtractValues["Extract Values/Tone"]
-    ExtractAudience["Infer Target Audience"]
-    
-    CheckName{Brand Name<br/>Provided?}
-    Placeholder["Use Placeholder Name<br/>Generic Symbol"]
-    MapIndustry["Map Industry to<br/>Design Patterns"]
-    
-    ApplyDefault["Apply Industry Defaults<br/>Modern/Minimal/Luxury"]
-    BuildContext["Build Brand Context<br/>Object"]
-    
-    UserInput --> ExtractName
-    UserInput --> ExtractIndustry
-    UserInput --> ExtractValues
-    UserInput --> ExtractAudience
-    
-    ExtractName --> CheckName
-    CheckName -->|No| Placeholder
-    CheckName -->|Yes| MapIndustry
-    Placeholder --> MapIndustry
-    
-    ExtractIndustry --> ApplyDefault
-    ExtractValues --> ApplyDefault
-    ExtractAudience --> ApplyDefault
-    
-    ApplyDefault --> BuildContext
-    MapIndustry --> BuildContext
-    
-    style UserInput fill:#fff9c4
-    style BuildContext fill:#c8e6c9
-    style Placeholder fill:#ffccbc
-```
-
-### 3. Style Inference Engine
-
-**Purpose**: Map brand context to design principles and create design directions
-
-**Industry Mapping Reference**:
-```
-tech/startup       → Modern, Minimal, Geometric
-coffee/food        → Warm, Vintage, Handcrafted
-beauty/luxury      → Elegant, Minimalist, Premium
-healthcare/fitness → Clean, Trustworthy, Dynamic
-education          → Professional, Innovative, Accessible
-```
-
-```mermaid
-graph TD
-    BrandCtx["Brand Context"]
-    Ref["Reference Image<br/>Optional"]
-    
-    IndustryMap["Industry Style Mapping<br/>tech→modern, etc."]
-    ExtractRef["Extract Style Elements<br/>Colors, Shapes, Typography"]
-    MergeStyles["Merge Industry Style<br/>+ Reference Elements"]
-    ConflictResolve["Resolve Conflicts<br/>User Request > Reference"]
-    
-    Direction1["Design Direction 1<br/>Concept A + Rationale"]
-    Direction2["Design Direction 2<br/>Concept B + Rationale"]
-    Direction3["Design Direction 3<br/>Concept C + Rationale"]
-    Direction4["Design Direction 4<br/>Concept D + Rationale"]
-    
-    BrandCtx --> IndustryMap
-    Ref --> ExtractRef
-    IndustryMap --> MergeStyles
-    ExtractRef --> MergeStyles
-    MergeStyles --> ConflictResolve
-    
-    ConflictResolve --> Direction1
-    ConflictResolve --> Direction2
-    ConflictResolve --> Direction3
-    ConflictResolve --> Direction4
-    
-    style BrandCtx fill:#e3f2fd
-    style ConflictResolve fill:#fff9c4
-    style Direction1 fill:#c8e6c9
-    style Direction2 fill:#c8e6c9
-    style Direction3 fill:#c8e6c9
-    style Direction4 fill:#c8e6c9
-```
-
-### 4. Design Direction Selection Logic
-
-**Purpose**: Present direction options OR skip if request is specific
-
-**Decision Tree**:
-- **Specific Request** (e.g., "red circular logo, serif") → Skip selection, proceed to generation
-- **Ambiguous Request** (e.g., "modern tech logo") → Present 3-4 directions, wait for selection
-- **No Direction Selected** → Default to first option, document assumption
-
-```mermaid
-graph TD
-    Request["User Request"]
-    
-    CheckSpecific{Request Contains<br/>Specific Design<br/>Details?<br/>color, shape, style}
-    
-    Specific["SPECIFIC PATH:<br/>Skip Direction Selection"]
-    Ambiguous["AMBIGUOUS PATH:<br/>Present Directions"]
-    
-    GenDirections["Generate 3-4<br/>Design Direction Options"]
-    Present["Present to User<br/>with Names & Descriptions"]
-    UserSelect{User Selects<br/>Direction?}
-    Skip["User Skips<br/>Selection"}
-    
-    SelectDefault["Default to Direction #1"]
-    DocAssume["Document Assumption<br/>in Design Guidelines"]
-    
-    SelectedDir["Selected Design Direction"]
-    GenLogos["Proceed to Logo<br/>Generation"]
-    
-    Request --> CheckSpecific
-    CheckSpecific -->|Yes, specific| Specific
-    CheckSpecific -->|No, ambiguous| Ambiguous
-    
-    Specific --> SelectedDir
-    
-    Ambiguous --> GenDirections
-    GenDirections --> Present
-    Present --> UserSelect
-    
-    UserSelect -->|Selects| SelectedDir
-    UserSelect -->|Skips| Skip
-    Skip --> SelectDefault
-    SelectDefault --> DocAssume
-    DocAssume --> SelectedDir
-    
-    SelectedDir --> GenLogos
-    
-    style Specific fill:#c8e6c9
-    style Ambiguous fill:#ffccbc
-    style SelectedDir fill:#81c784
-    style GenLogos fill:#4caf50
-```
+1. **Intelligent Auto-detect:** Sử dụng AI Planner nhận diện ý định và Smart Web Search tập trung nội dung thương hiệu như Genspark, nhưng vận hành trên một luồng logic rẽ nhánh an toàn hơn.
+2. **Drafting Pattern:** Tích hợp sinh ảnh nháp tốc độ cao (Fast/Cheap Model) đi kèm dòng text mô tả, giải quyết vấn đề "đọc chữ khó hình dung".
+3. **Canvas Design & Touch Edit:** Xây dựng front-end Canvas và quy trình Inpainting chuyên sâu như Lovart cho thao tác tương tác chỉnh sửa vùng cục bộ.
+4. **Side-by-side Rendering:** Hỗ trợ render đồng thời (Concurrency) đa mô hình, giúp user so sánh trực quan các phong cách đồ hoạ.
 
 ---
 
-## User Workflow
+## 3. Kiến trúc Stateful DAG kết hợp LLM Orchestrator/Router
 
-### Complete Multi-Turn Conversation Flow
+> **Chú ý kiến trúc:** Rút kinh nghiệm từ điểm yếu Dynamic Multi-Agent của Genspark (các Agent tự do nói chuyện dễ sinh ảo giác và vòng lặp), hệ thống áp dụng kiến trúc **Stateful DAG với LLM Orchestrator/Router** (Đồ thị luồng tĩnh kết hợp bộ định tuyến động). Dữ liệu đi qua các Node theo cấu trúc tuyến tính rẽ nhánh và hoàn toàn có thể dự đoán/kiểm soát được. 
+
+Bên cạnh Text, hệ thống sở hữu **Luồng Xử lý Đa phương thức (Multimodal Input)** trọng tâm để khai thác đầu vào từ Ảnh tham khảo (Reference Image) do người dùng cung cấp.
+
+```mermaid
+graph TD
+    User([User Submit \n Text + Image]) --> ImageVision[Vision Node\nGemini/GPT-4V: Trích xuất Style, Color]
+    User --> Chat[Intent & Chat Pattern]
+    ImageVision --> Chat
+    Chat --> Planner{Planner Agent\nStateful Orchestrator}
+    
+    Planner -->|Research Brand & Trend| WebSearch[Web Search Agent\nFocus: trends, brand context]
+    Planner -->|Gộp Text Prompt + Image Insights| Router[[LLM Router Node\nClaude]]
+    
+    Router -->|1. Fast Concepting| Draft[Draft Models\nSDXL Turbo / Flux.1 Schnell]
+    Router -->|2. Text-Heavy| TxtHQ[Text Models\nIdeogram / DALL-E 3]
+    Router -->|3. Artistic/Abstract| ArtHQ[Artistic Models\nMidjourney / Imagen]
+    Router -->|4. Touch Edit| Inpaint[Inpainting API\nStable Diffusion]
+```
+
+## 4. Luồng trải nghiệm & Drafting Pattern (User Flow)
+
+**Trải nghiệm Drafting Pattern:** Khi LLM sinh ra 4 hướng idea, thay vì buộc người dùng phân tích thuần Text, UI sẽ lập tức đính kèm thêm 4 thumbnail "ảnh nháp" được gọi từ các API sinh ảnh siêu rẻ và tốc độ cực cao. Sau khi user nhìn và chọn 1 hướng bằng trực giác, hệ thống mới đẩy qua model xịn (High-Quality) để render. Đặc biệt, **sau khi render xong (trước bước Edit)**, dưới màn hình sẽ xuất hiện các **Quick action buttons (Nút thao tác nhanh)** như "Thử bản đen trắng", "Đổi font chữ hiện đại hơn"... để gợi ý người dùng tiếp tục khám phá mà không cần tự gõ prompt.
 
 ```mermaid
 sequenceDiagram
-    actor User
-    participant Chat as Chat Interface
-    participant Worker as Worker Task
-    participant Intent as Intent Detector
-    participant Brand as Brand Inference
-    participant Style as Style Engine
-    participant ImgGen as Image Generator
-    participant Eval as Auto-Evaluator
-    participant Webhook as Webhook
-    participant Redis as Redis Cache
+    actor U as User
+    participant P as Planner (DAG)
+    participant Draft as Fast Model (SDXL/Flux)
+    participant R as Router Node
+    participant HQ as HQ Models (Parallel)
 
-    User->>Chat: Message: "Design logo for TechStart"
-    Chat->>Worker: onMessage(user_msg)
-    activate Worker
+    U->>P: "Tạo logo ..." (+ Upload Image)
+    P->>P: Vision bóc tách Style + Text Context
+    P->>Draft: Gọi quick API tạo 4 ảnh Draft
+    Draft-->>U:  Trả về UI 4 Concept (Text + Thumbnail Image)
     
-    Note over Worker: === PHASE 1: INPUT ANALYSIS ===
-    Worker->>Intent: detect_intent(msg)
-    Intent-->>Worker: {type: logo_design, confidence: 0.95}
-    
-    Worker->>Brand: extract_brand(msg)
-    Brand-->>Worker: {name: TechStart, industry: tech, ...}
-    
-    Note over Worker: STREAM: "Analyzing brand context..."
-    Worker->>Chat: stream("Input Understanding: TechStart, tech...")
-    
-    Note over Worker: === PHASE 2: STYLE INFERENCE ===
-    Worker->>Style: infer_directions(brand_ctx)
-    Style-->>Worker: [Direction1, Direction2, Direction3, Direction4]
-    
-    Worker->>Chat: stream("Inferring styles based on industry...")
-    deactivate Worker
-    
-    Chat->>User: Display: 4 design direction options
-    User->>Chat: Select: "Direction 2: Geometric Modern"
-    
-    Chat->>Worker: onDirectionSelected(Direction2)
-    activate Worker
-    
-    Note over Worker: === PHASE 3: LOGO GENERATION ===
-    Worker->>ImgGen: queue_generation(design_params)
-    ImgGen-->>Worker: job_id: uuid-123
-    
-    Worker->>Redis: store_session(job_id, brand_ctx)
-    ParallelGuard: Async via Pub/Sub
-    
-    ImgGen->>ImgGen: generate_logos() [long-running]
-    ImgGen->>Redis: store_results(job_id, png_urls)
-    
-    Worker->>Eval: evaluate_quality(png_urls, brand_ctx)
-    Eval-->>Worker: {alignment: 0.92, quality: 0.88}
-    Redis->>Redis: store_eval_metrics(job_id)
-    
-    ImgGen->>Webhook: notify_completion(job_id)
-    Webhook-->>Chat: result_ready(job_id)
-    deactivate Worker
-    
-    Chat->>Redis: fetch_results(job_id)
-    Chat->>User: Display: 3-4 PNG logos + explanations
-    User->>Chat: Edit: "Change icon color to blue"
-    
-    Chat->>Worker: onEditCommand(edit)
-    activate Worker
-    
-    Note over Worker: === PHASE 4: EDIT & REGENERATION ===
-    Worker->>ImgGen: parse_edit_intent(edit_text)
-    ImgGen-->>Worker: {target: icon, color: blue}
-    
-    Worker->>ImgGen: regenerate_with_edit(logo_id, edit_params)
-    ImgGen->>ImgGen: regenerate() [async]
-    ImgGen->>Webhook: notify_completion(job_id)
-    deactivate Worker
-    
-    Webhook-->>Chat: updated_result()
-    Chat->>User: Display: Updated logo + edit summary
-    User->>Chat: "Save this version"
-    Note over Chat: MVP: Single-session, no persistence
+    U->>R: Nhìn ảnh, tự tin chọn Concept #2
+    Note over R: LLM đánh giá Text/Style Quyết định API
+    R->>HQ: Kích hoạt Lệnh song song (Concurrency)
+    HQ-->>U: Hiển thị So sánh Đa phong cách HQ
+    HQ-->>U: Trình bày Quick Action Buttons ("Thử bản đen trắng", "Đổi font...")
 ```
 
-### Phase-by-Phase Detail: Generation Flow
+## 5. Core Logic: LLM Router Node
 
-```mermaid
-graph LR
-    P1["📥 PHASE 1<br/>Input Analysis<br/>- Intent detection<br/>- Brand extraction<br/>- Reference analysis"]
-    
-    P2["🧭 PHASE 2<br/>Design Direction<br/>- Style inference<br/>- Direction generation<br/>- User selection"]
-    
-    P3["🖼️ PHASE 3<br/>Logo Generation<br/>- Queue jobs<br/>- Async gen<br/>- Auto-evaluation"]
-    
-    P4["✏️ PHASE 4<br/>Iteration & Edit<br/>- Parse edits<br/>- Regenerate<br/>- Update results"]
-    
-    P1 -->|Stream Reasoning| P2
-    P2 -->|Direction Selected| P3
-    P3 -->|Logos Complete| Chat["💬 User Chat"]
-    Chat -->|Edit Command| P4
-    P4 -->|Updated Logo| Chat
-    
-    style P1 fill:#fff9c4
-    style P2 fill:#ffccbc
-    style P3 fill:#c8e6c9
-    style P4 fill:#e1bee7
-    style Chat fill:#e3f2fd
-```
+Dùng AI (Claude) làm "bộ não" đọc yêu cầu thiết kế và tự quyết định gọi API nào. Nhờ kiến trúc hỗ trợ **Xử lý Song song (Concurrency)**, Router có thể gởi lệnh tới 2 model cùng 1 lúc và trả kết quả side-by-side (VD: "Để xem cùng 1 prompt DALL-E 3 và Imagen vẽ khác nhau ra sao").
 
----
+### Routing Rules cho LLM:
+1. **Rule 1 (Text Accuracy):** Nếu prompt yêu cầu có chữ cụ thể trong logo (VD: "Logo có chữ NovaAI").
+   
+   **Target Cụm Model:** DALL-E 3 hoặc Ideogram.
+   
+   *(Lý do: Khả năng render text của 2 model này là đỉnh nhất. Ideogram còn tỏ ra vượt trội ở mảng thiết kế, tính nhất quán. Cấu trúc học Text Encoder của các model này có khả năng hiểu được "hình dáng" của từng ký tự N, o, v, a, A, I được cấu thành như thế nào kế bên mặt ngữ nghĩa của từ).*
+2. **Rule 2 (Abstract/Artistic):** Nếu yêu cầu là khối biểu tượng trừu tượng, họa phẩm nghệ thuật hoặc photorealistic.
+   
+   **Target Cụm Model:** Midjourney API hoặc Imagen.
+   
+   *(Lý do: Cụm Model này mang tư duy hội họa sáng tạo nghệ thuật mảng miếng cực tốt với độ thẩm mỹ vô đối. Imagen sinh màu sắc rực rỡ sắc nét).*
+3. **Rule 3 (Touch Edit/Inpainting):** Nếu user đang ở bước Edit muốn sửa 1 chi tiết cục bộ.
+   
+   **Target Cụm Model:** Stable Diffusion Inpainting API.
 
-## Reasoning Engine Logic
+## 6. Chức năng Touch Edit (Smart Region Inpainting)
 
-### Visible Reasoning Display (FR-005a)
+Để đem lại trải nghiệm mượt mà, hệ thống sẽ kết hợp 2 lớp mô hình AI cho tính năng Edit, khắc phục triệt để lỗ hổng "phải vẽ lại cả bức" như Genspark:
 
-**Timing**: Real-time streaming BEFORE logo generation  
-**Channels**: Chat interface with structured blocks (not continuous text)
+1. **Auto-Segmentation (Lớp Frontend/Edge):**
+   Giao diện Canvas tích hợp công cụ **Smart Mark** hoạt động dựa trên các mô hình bóc tách đối tượng (như *SAM - Segment Anything Model*). User chỉ cần thao tác **Click** vào một đối tượng (icon cánh chim, dải màu, text), AI sẽ tự động khoanh vùng viền chính xác (*Pixel-perfect Mask*) và gắn nhãn (*Tagging*) đối tượng đó vào khung parameter chat. 
+   *(Hỗ trợ fallback: Trường hợp hình phức tạp model bắt sai viền, user có thể tự dùng công cụ Brush để tô thủ công vùng cần chọn).*
 
-```mermaid
-graph TD
-    subgraph Stream["📡 Streaming Real-Time Reasoning"]
-        Input["1️⃣ Input Understanding<br/>TechStart, AI/ML, modern"]
-        Analysis["2️⃣ Image Reference Analysis<br/>[if provided]"]
-        Inference["3️⃣ Style Inference<br/>Tech → Geometric Modern"]
-        Exploration["4️⃣ Reference Exploration<br/>Colors: blue/cyan, sans-serif"]
-    end
-    
-    subgraph Display["💬 Chat Display<br/>Bulleted blocks, not prose"]
-        Block1["✓ Understanding<br/>• Brand: TechStart<br/>• Industry: AI/ML<br/>• Style: Modern"]
-        Block2["✓ Style Inference<br/>• Mapping: Tech→Geometric<br/>• Aesthetic: Minimal<br/>• Palette: Blue tones"]
-        Block3["→ Generating logos..."]
-    end
-    
-    Stream -->|formatted as blocks| Display
-    
-    style Stream fill:#fff9c4
-    style Display fill:#c8e6c9
-```
+2. **Inpainting API (Lớp Backend):**
+   Khi user bấm gửi lệnh Edit (VD: "Đổi cánh chim thành màu đỏ"), Backend sẽ nhận cụm 3 parameter (payloads):
+   - **Source Image** (Ảnh nguyên gốc).
+   - **Binary Mask** (Lớp mặt nạ trắng/đen tạo ra từ Frontend).
+   - **Text Prompt** (Câu lệnh sửa).
+   
+   Router Node lập tức đẩy thông tin cho Model Inpainting chuyên biệt (Stable Diffusion Inpainting) bắt tay xử lý, render lại ĐÚNG khu vực Mask trong khi giữ nguyên 100% các chi tiết bên ngoài viền.
 
-### Edit Intent Recognition Logic
+## 7. Các tính năng Đề xuất Mở rộng (So với Spec ban đầu)
 
-**Purpose**: Parse natural language edits and map to logo modifications
+Để mang lại luồng trải nghiệm tốt hơn Genspark/Lovart, kiến trúc trên đã bổ sung một số tính năng mở rộng **không có trong POC Spec gốc**, bao gồm:
 
-```mermaid
-graph TD
-    EditText["Edit Command<br/>e.g., 'change icon to blue'"]
-    
-    TokenNLP["NLP Token Analysis<br/>Identify action, target, modifier"]
-    Templates["Match to Edit Templates<br/>Color, Shape, Style, Layout"]
-    Target["Identify Logo Target<br/>Icon, Text, Background, Shape"]
-    Params["Extract Parameters<br/>blue = #0000FF"]
-    Validate["Validate Edit<br/>Is it feasible?"]
-    
-    FeasibleYes["✓ Feasible"]
-    FeasibleNo["✗ Not feasible<br/>Explain & suggest alternatives"]
-    
-    RegenerateParams["Build Regen Parameters<br/>preserve other elements"]
-    Queue["Queue Regeneration"]
-    
-    EditText --> TokenNLP
-    TokenNLP --> Templates
-    Templates --> Target
-    Target --> Params
-    Params --> Validate
-    
-    Validate -->|Yes| FeasibleYes
-    Validate -->|No| FeasibleNo
-    
-    FeasibleYes --> RegenerateParams
-    FeasibleNo --> EditText
-    RegenerateParams --> Queue
-    
-    style FeasibleYes fill:#c8e6c9
-    style FeasibleNo fill:#ffccbc
-    style Queue fill:#81c784
-```
-
-### Auto-Evaluation System (LLM-as-Judge)
-
-**Purpose**: Assess logo quality and brand alignment  
-**Scope**: Internal quality monitoring (not user-facing in MVP)
-
-```mermaid
-graph TD
-    Logo["Generated Logo<br/>PNG image"]
-    BrandCtx["Brand Context<br/>TechStart, tech, modern"]
-    Guidelines["Design Guidelines<br/>Inferred parameters"]
-    
-    BranchAlign["🎯 Brand Alignment<br/>Does logo reflect brand?<br/>Score: 0-1"]
-    DesignQual["✨ Design Quality<br/>Clarity, balance, professional<br/>Score: 0-1"]
-    EditSuccess["✏️ Edit Success<br/>Did modifications preserve concept?<br/>Score: 0-1"]
-    ExplainQual["📝 Explanation Quality<br/>Are guidelines clear?<br/>Score: 0-1"]
-    
-    LLMJudge["🤖 LLM Evaluator<br/>gpt-4-vision"]
-    
-    AggScore["Aggregate Score<br/>Avg of all metrics"]
-    Result["Quality Metrics Stored<br/>Redis metadata for monitoring"]
-    
-    Logo --> LLMJudge
-    BrandCtx --> LLMJudge
-    Guidelines --> LLMJudge
-    
-    LLMJudge --> BranchAlign
-    LLMJudge --> DesignQual
-    LLMJudge --> EditSuccess
-    LLMJudge --> ExplainQual
-    
-    BranchAlign --> AggScore
-    DesignQual --> AggScore
-    EditSuccess --> AggScore
-    ExplainQual --> AggScore
-    
-    AggScore --> Result
-    
-    style LLMJudge fill:#f3e5f5
-    style Result fill:#c8e6c9
-```
-
----
-
-## Data Flow
-
-### Complete Request/Response Data Journey
-
-```mermaid
-graph TD
-    UserMsg["🔵 User Message<br/>{msg, session_id}"]
-    
-    Intent["🟢 Intent Output<br/>{type, confidence, keywords}"]
-    BrandData["🟢 Brand Context<br/>{name, industry, values, tone}"]
-    StyleDirs["🟢 Style Directions<br/>[{name, style, palette, desc}]"]
-    DesignGuidelines["🟢 Design Guidelines<br/>{ai_prompt, visual_desc,<br/>typography, techniques}"]
-    
-    GenJob["🟡 Generation Job<br/>{logo_id, job_id, status,<br/>design_params}"]
-    PNGOutput["🟡 PNG Results<br/>{urls[], colors[], timestamp}"]
-    EvalMetrics["🟡 Eval Metrics<br/>{alignment, quality,<br/>clarity_score}"]
-    
-    EditCmd["🔵 Edit Command<br/>{target, intent, params}"]
-    UpdatedLogo["🟡 Updated PNG<br/>{url, edit_summary}"]
-    
-    Redis["💾 Redis State<br/>session_data<br/>results<br/>eval_metrics"]
-    CloudStore["☁️ Cloud Storage<br/>profile: {color_mode=png18}<br/>logo images"]
-    Webhook["🔔 Webhook<br/>notification<br/>result_ready"]
-    
-    UserMsg --> Intent
-    UserMsg --> BrandData
-    BrandData --> StyleDirs
-    StyleDirs --> DesignGuidelines
-    
-    DesignGuidelines --> GenJob
-    GenJob --> PNGOutput
-    PNGOutput --> EvalMetrics
-    
-    PNGOutput --> CloudStore
-    GenJob --> Redis
-    EvalMetrics --> Redis
-    Redis --> Webhook
-    Webhook -.->|notify| UserMsg
-    
-    EditCmd --> UpdatedLogo
-    UpdatedLogo --> CloudStore
-    UpdatedLogo --> Redis
-    
-    style UserMsg fill:#bbdefb
-    style Intent fill:#c8e6c9
-    style GenJob fill:#fff9c4
-    style PNGOutput fill:#fff9c4
-    style EvalMetrics fill:#c8e6c9
-    style Redis fill:#e0f2f1
-    style CloudStore fill:#f0f4c3
-    style Webhook fill:#fce4ec
-    style EditCmd fill:#bbdefb
-    style UpdatedLogo fill:#fff9c4
-```
-
----
-
-## Decision Trees
-
-### 1. Request Analysis Decision Tree
-
-```mermaid
-graph TD
-    Req["User Request Received"]
-    
-    Q1{Intent is<br/>logo design?}
-    No1["Not a logo task<br/>Decline"]
-    Yes1["Proceed"]
-    
-    Q2{Brand Name<br/>Provided?}
-    NameNo["No brand name<br/>Use placeholder or<br/>symbol-only approach"]
-    NameYes["Extract name"]
-    
-    Q3{Request is<br/>Specific?<br/>color, shape, style}
-    Specific["Generated Direction<br/>Skip selection"]
-    Ambiguous["Generate Multiple<br/>Directions"]
-    
-    Q4{Reference<br/>Image?}
-    NoRef["Use industry defaults"]
-    HasRef["Analyze image<br/>Extract style"]
-    
-    Req --> Q1
-    Q1 -->|No| No1
-    Q1 -->|Yes| Yes1
-    
-    Yes1 --> Q2
-    Q2 -->|No| NameNo
-    Q2 -->|Yes| NameYes
-    
-    NameNo --> Q3
-    NameYes --> Q3
-    
-    Q3 -->|Yes| Specific
-    Q3 -->|No| Ambiguous
-    
-    Specific --> Q4
-    Ambiguous --> Q4
-    Q4 -->|None| NoRef
-    Q4 -->|Provided| HasRef
-    
-    NoRef -.-> Generation["Proceed to<br/>Logo Generation"]
-    HasRef -.-> Generation
-    
-    style No1 fill:#ffccbc
-    style Generation fill:#c8e6c9
-```
-
-### 2. Logo Generation Decision Tree
-
-```mermaid
-graph TD
-    DirSelected["Design Direction Selected"]
-    
-    Q1{Generation<br/>Parameters<br/>Valid?}
-    Invalid["Reject with<br/>schema error"]
-    Valid["Queue job<br/>to Pub/Sub"]
-    
-    Q2{Job Status?}
-    Timeout["Timeout >60s<br/>Inform user"]
-    Error["API Error<br/>Transparent error msg<br/>Suggest retry params"]
-    Success["Success<br/>Store PNG in Cloud"]
-    
-    Q3{Evaluation<br/>Score OK?<br/>quality > 0.7}
-    LowQual["Low quality<br/>Suggest regeneration<br/>with modified params"]
-    GoodQual["Good quality<br/>Display to user"]
-    
-    Suggest["Auto-suggest<br/>Design Variations"]
-    
-    DirSelected --> Q1
-    Q1 -->|No| Invalid
-    Q1 -->|Yes| Valid
-    
-    Valid --> Q2
-    Q2 -->|Timeout| Timeout
-    Q2 -->|Error| Error
-    Q2 -->|Success| Success
-    
-    Success --> Q3
-    Q3 -->|No| LowQual
-    Q3 -->|Yes| GoodQual
-    
-    GoodQual --> Suggest
-    
-    style Invalid fill:#ffccbc
-    style Timeout fill:#ffccbc
-    style Error fill:#ffccbc
-    style Success fill:#c8e6c9
-    style GoodQual fill:#81c784
-    style Suggest fill:#4caf50
-```
-
-### 3. Edit Interpretation Decision Tree
-
-```mermaid
-graph TD
-    Edit["Edit Command Received<br/>e.g., 'change color to blue'"]
-    
-    Q1{Edit Intent<br/>Recognized?}
-    Unknown["Unknown intent<br/>Ask for clarification"]
-    Recognized["Parse parameters"]
-    
-    Q2{Target Logo<br/>Identified?}
-    MultiLogo["Multiple logos<br/>Ask user to select"]
-    SingleLogo["Use current logo"]
-    
-    Q3{Edit is<br/>Feasible?<br/>color OK, shape OK}
-    Unfeasible["Feasible but<br/>requires major rework<br/>Suggest alternatives"]
-    Feasible["Generate<br/>edit params"]
-    
-    Q4{Preserve<br/>other elements?}
-    No["Don't preserve<br/>Full regeneration"]
-    Yes["Preserve unmodified<br/>Partial regeneration"]
-    
-    Regen["Queue Regeneration<br/>with edit params"]
-    Eval["Auto-eval<br/>new logo"]
-    Result["Display updated logo<br/>with edit summary"]
-    
-    Edit --> Q1
-    Q1 -->|No| Unknown
-    Q1 -->|Yes| Q2 & Recognized
-    
-    Q2 -->|Multiple| MultiLogo
-    Q2 -->|Single| SingleLogo
-    
-    SingleLogo --> Q3
-    MultiLogo --> Q3
-    
-    Q3 -->|No| Unfeasible
-    Q3 -->|Yes| Feasible
-    
-    Feasible --> Q4
-    Q4 -->|Yes| Yes
-    Q4 -->|No| No
-    
-    Yes --> Regen
-    No --> Regen
-    
-    Regen --> Eval
-    Eval --> Result
-    
-    style Unknown fill:#ffccbc
-    style Unfeasible fill:#ffe0b2
-    style Result fill:#c8e6c9
-```
-
----
-
-## Interaction Patterns
-
-### Pattern 1: Real-Time Streaming (FR-005a)
-
-**Service**: `AIHubStreamService`  
-**Protocol**: Server-sent events (SSE) / WebSocket
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant Chat as Chat
-    participant Worker as Worker
-    
-    User->>Chat: Select design direction
-    Chat->>Worker: onDirectionSelected()
-    activate Worker
-    
-    Worker->>Chat: stream("🔄 Analyzing brand...")
-    Chat->>User: Display: "Analyzing brand context"
-    
-    Worker->>Chat: stream("✓ Brand: Modern Tech")
-    Chat->>User: Update: Add brand analysis detail
-    
-    Worker->>Chat: stream("🔄 Inferring style...")
-    Chat->>User: Display: "Inferring style"
-    
-    Worker->>Chat: stream("✓ Style: Geometric modern with blue/cyan")
-    Chat->>User: Update: Add style detail
-    
-    Worker->>Chat: stream("🔄 Generating logos...")
-    Chat->>User: Display: Loading indicator
-    deactivate Worker
-    
-    Note over Chat: Image gen happens async via Pub/Sub
-    
-    Chat->>User: [30s later] Display: 3-4 PNG logos
-```
-
-### Pattern 2: Async Generation with Webhook Notification
-
-**Service**: `AIHubAsyncService` + Google Pub/Sub + Webhook
-
-```mermaid
-sequenceDiagram
-    participant Chat as Chat Client
-    participant Worker as Worker
-    participant Queue as Pub/Sub Queue
-    participant ImgGen as Image Generator
-    participant Webhook as Webhook Server
-    participant Redis as Redis
-    
-    Chat->>Worker: Stream reasoning (FR-005a)
-    Worker->>Queue: queue_generation_job({design_params, job_id})
-    Worker-->>Chat: ✓ Job queued, check back in 30s
-    
-    Note over Queue,ImgGen: Async Processing
-    
-    Queue->>ImgGen: dequeue(job_id)
-    ImgGen->>ImgGen: generate_logos() [long-running, ~15-30s]
-    ImgGen->>Redis: store_results(job_id, {png_urls, metadata})
-    
-    ImgGen->>Webhook: POST /logo-ready<br/>{job_id, timestamp}
-    Webhook-->>ImgGen: ✓ 200 OK
-    
-    Webhook->>Chat: send_ws_notification(job_id)
-    Chat->>Chat: fetch_results(job_id)
-    Chat->>Redis: GET job_id
-    Redis-->>Chat: {png_urls, colors, eval_metrics}
-    
-    Chat->>Chat: render_logos()
-    Chat->>User: Display logos
-```
-
-### Pattern 3: Session Data Persistence (Single-Session Model)
-
-**Duration**: During active chat session only  
-**Storage**: Redis with 1-hour TTL
-
-```mermaid
-graph TD
-    Session["Session Start<br/>session_id = uuid()"]
-    Store1["Store: Initial<br/>brand_context"]
-    Store2["Store: Selected<br/>design_direction"]
-    Store3["Store: Generation<br/>results"]
-    Store4["Store: Edit<br/>history"]
-    
-    Retrieve["Retrieve via<br/>session_id"]
-    
-    Expire["TTL Expires<br/>~60 minutes"]
-    Delete["Auto-delete<br/>from Redis"]
-    
-    Session --> Store1
-    Store1 --> Store2
-    Store2 --> Store3
-    Store3 --> Store4
-    
-    Retrieve -->|Anytime during session| Store4
-    
-    Store4 --> Expire
-    Expire --> Delete
-    
-    style Delete fill:#ffccbc
-```
-
----
-
-## Error Handling
-
-### Error Handling Strategy: Transparent Failure (FR-014)
-
-**Philosophy**: Surface errors immediately to user with actionable suggestions  
-**No Silent Retries**: User controls retry decision
-
-```mermaid
-graph TD
-    Request["Request to Tool/API"]
-    
-    Q1{Tool Call<br/>Succeeds?}
-    Success["✓ Success<br/>Continue"]
-    Fail["✗ Failure"]
-    
-    Q2{Error Type?}
-    
-    Timeout["Timeout<br/>API slow"]
-    Invalid["Invalid Request<br/>Schema error"]
-    ServiceDown["Service Down<br/>API unavailable"]
-    RateLimit["Rate Limit<br/>Too many requests"]
-    Other["Other Error<br/>Unexpected"]
-    
-    TimeoutMsg["Msg: Logo generation took too long.<br/>Try with simpler geometry shapes.<br/>Or skip details to simplify."]
-    InvalidMsg["Msg: Input parameters invalid.<br/>Please check brand context."]
-    ServiceMsg["Msg: Image service unavailable.<br/>Try again in 30 seconds."]
-    RateLimitMsg["Msg: Too many requests.<br/>Please wait 5 minutes."]
-    OtherMsg["Msg: Unexpected error [code].<br/>Contact support with error ID."]
-    
-    UserRetry["User decides:<br/>Retry or Abandon"]
-    
-    Request --> Q1
-    Q1 -->|Success| Success
-    Q1 -->|Fail| Fail
-    
-    Fail --> Q2
-    Q2 -->|Timeout| Timeout
-    Q2 -->|Invalid| Invalid
-    Q2 -->|Down| ServiceDown
-    Q2 -->|RateLimit| RateLimit
-    Q2 -->|Other| Other
-    
-    Timeout --> TimeoutMsg
-    Invalid --> InvalidMsg
-    ServiceDown --> ServiceMsg
-    RateLimit --> RateLimitMsg
-    Other --> OtherMsg
-    
-    TimeoutMsg --> UserRetry
-    InvalidMsg --> UserRetry
-    ServiceMsg --> UserRetry
-    RateLimitMsg --> UserRetry
-    OtherMsg --> UserRetry
-    
-    style Success fill:#c8e6c9
-    style Timeout fill:#ffccbc
-    style Invalid fill:#ffccbc
-    style ServiceDown fill:#ffccbc
-    style UserRetry fill:#fff9c4
-```
-
-### Error Recovery Flow
-
-```mermaid
-graph TD
-    Error["Error Occurred<br/>{type, message, context}"]
-    
-    Log["Log Error<br/>Langfuse trace<br/>with full context"]
-    
-    Categorize["Categorize Severity<br/>Critical/Warning/Info"]
-    
-    IsCritical{Critical<br/>Error?}
-    
-    NotCritical["Non-Critical<br/>Continue with<br/>fallback defaults"]
-    
-    Critical["Critical Error<br/>Session unusable"]
-    
-    UserNotif["Notify User<br/>with actionable message"]
-    
-    Suggest["Suggest Retry<br/>with adjusted params<br/>OR<br/>Alternative approach"]
-    
-    Error --> Log
-    Log --> Categorize
-    Categorize --> IsCritical
-    
-    IsCritical -->|No| NotCritical
-    IsCritical -->|Yes| Critical
-    
-    NotCritical --> UserNotif
-    Critical --> UserNotif
-    UserNotif --> Suggest
-    
-    style Log fill:#fff9c4
-    style UserNotif fill:#ffccbc
-    style Suggest fill:#ffe0b2
-```
-
----
-
-## Performance & Scalability
-
-### Request Latency Targets
-
-```
-INPUT ANALYSIS
-├─ Intent detection: ~100ms
-├─ Brand extraction: ~200ms
-└─ Total: ~300ms
-
-REASONING STREAMING (FR-005a)
-├─ Style inference: ~500ms
-├─ Stream to user: real-time (progressive)
-└─ Total: ~500ms visible
-
-DESIGN DIRECTION SELECTION
-├─ Generate 4 options: ~1-2s
-└─ Present to user: instant
-
-LOGO GENERATION (Async via Pub/Sub)
-├─ Queue job: ~50ms
-├─ DALL-E/Imagen generation: ~15-30s [async]
-├─ Auto-evaluation: ~5s [parallel]
-├─ Webhook notification: <2s after completion
-└─ Total time from user's perspective: ~2s notification + fetch results
-
-EDIT & REGENERATION
-├─ Parse edit command: ~200ms
-├─ Regenerate logo: ~15-30s [async]
-└─ Notification: <2s after completion
-```
-
-### Concurrency Model
-
-```mermaid
-graph TD
-    Session["Single User Session<br/>session_id"]
-    
-    Sync["Synchronous Operations<br/>Intent, Brand, Style<br/>User-facing, <5s"]
-    Async["Asynchronous Operations<br/>Image generation, Evaluation<br/>Queued via Pub/Sub"]
-    
-    Stream["Real-Time Streams<br/>Reasoning, Status updates<br/>WebSocket/SSE"]
-    
-    Session --> Sync
-    Sync --> |Reason ready| Stream
-    Stream --> Async
-    Async --> |Result ready| Webhook
-    Webhook --> Chat["Deliver to Chat<br/>Redis + Notification"]
-    
-    style Sync fill:#c8e6c9
-    style Async fill:#fff9c4
-    style Stream fill:#e3f2fd
-    style Chat fill:#81c784
-```
-
----
-
-## Component Responsibilities
-
-| Component | Responsibility | Owned by |
-|-----------|-----------------|----------|
-| **Intent Detection** | Classify user intent (logo design vs other) | Worker + LLM |
-| **Brand Inference** | Extract and structure brand info from text | Worker + NLP |
-| **Style Inference** | Map brand context to design directions | Worker + Inference Engine |
-| **Design Direction Selection** | Present alternatives or skip if specific | Worker + UI Logic |
-| **Image Generation** | Call DALL-E/Imagen API via MCP tool | Image Gen Tool (MCP) |
-| **Image Analysis** | Extract design elements from reference images | Vision API Tool (MCP) |
-| **Edit Parser** | Parse natural language edit commands | Worker + NLP |
-| **Auto-Evaluation** | Assess logo quality (LLM-as-judge) | Eval System (LLM) |
-| **Async Execution** | Queue and execute long-running jobs | Pub/Sub + Message Queue |
-| **Webhook Delivery** | Notify client of completion | Webhook Server |
-| **Session Storage** | Persist session state during conversation | Redis (1-hour TTL) |
-| **Cloud Storage** | Store PNG image files | Cloud Storage (GCS/S3) |
-
----
-
-## Summary Architecture Principles
-
-1. **Real-time Reasoning First**: Visible reasoning steps (FR-005a) delivered via streaming BEFORE generation
-2. **Async Everything Long**: Image generation happens async via Pub/Sub; webhook notifies client
-3. **Transparent Failure**: Errors surfaced immediately with actionable suggestions (no silent retry)
-4. **Single-Session Simplicity**: No session persistence across visits; Redis TTL sufficient
-5. **LLM-as-Judge Quality**: Auto-evaluation monitors logo quality but doesn't block delivery
-6. **Conditional Directions**: Only present direction selection if request is ambiguous
-7. **MCP Standardization**: All tools use MCP for consistent observability and error handling
-8. **Preserve Unmentioned**: Edits preserve unmentioned regions to maintain brand consistency
-
+1. **Drafting Pattern (Sinh ảnh nháp siêu tốc):** Spec gốc chỉ nói về việc đề xuất hướng đi, nhưng thực tế user không thể đọc text mà tưởng tượng ra hình. Giải pháp dùng SDXL/Flux tạo Thumbnail Preview là thiết kế thêm để cứu vãn UX.
+2. **Concurrency / Side-by-side Rendering:** Spec gốc không nhắc đến việc đánh giá năng lực các model. Ở đây kiến trúc router có hỗ trợ gọi song song nhiều API (VD: *DALL-E 3 vs Imagen*) để cung cấp cơ chế A/B testing trực quan cho designer.
+3. **Smart Mark / Móc nối Inpainting:** Spec có nhắc việc sửa chữa nhưng không đặc tả kỹ thuật. Kiến trúc bổ sung quy trình 2 lớp: Frontend dùng SAM (Segment Anything) tự động bắt viền (Pixel-perfect mask), Backend dùng Stable Diffusion Inpainting để chỉ render đúng điểm chọn, tránh hiện tượng sinh mới hoàn toàn.
+4. **Interactive Quick Actions:** Hệ thống chủ động sinh các nút thao tác nhanh (Quick Action Buttons) dưới mỗi Output vừa Generate xong. Các nút này dựa trên Context và Visual output để gợi ý user thao tác khám phá nhanh (VD: "Đổi màu đen trắng", "Sử dụng font hiện đại") thay vì ép user phải type chay trong text box (điểm cả Genspark & Lovart đều đang thiếu).
