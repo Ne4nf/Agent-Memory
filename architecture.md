@@ -109,6 +109,76 @@ BE stream NDJSON/gRPC chunks với `chunk_type` thống nhất:
 
 FE chỉ cần render theo chunk_type, không phụ thuộc vào internal implementation của task.
 
+### 3.4 Mermaid Diagram - High-Level Architecture
+
+```mermaid
+flowchart LR
+  U[User/FE] -->|query| API[AI Hub Communication API\nStream/Compute/Submit]
+  API --> ORCH[Agent Orchestrator]
+  ORCH --> A[AnalyzeDesignTask]
+  ORCH --> G[GenerateGuidelineTask]
+  ORCH --> L[GenerateLogoTask]
+  ORCH --> E[EditLogoTask]
+
+  A --> LLM[LLM Provider]
+  G --> LLM
+  L --> IMG[Image Generation Provider]
+  E --> IMG
+
+  L --> OBJ[(Object Storage/CDN)]
+  E --> OBJ
+  ORCH --> OBS[Observer/Telemetry]
+  OBS --> MON[(Logs/Tracing/Cost)]
+
+  API -->|stream chunks| U
+  OBJ -->|image_url| API
+```
+
+### 3.5 Mermaid Diagram - Query to Image Sequence
+
+```mermaid
+sequenceDiagram
+  actor FE as Frontend
+  participant BE as AI Hub Stream API
+  participant OR as Orchestrator
+  participant LLM as LLM API
+  participant IMG as Image API
+  participant STO as Storage/CDN
+
+  FE->>BE: POST /internal/v1/tasks/stream (logo_generate)
+  BE->>OR: validate input + init session
+  OR->>LLM: analyze query (context, assumptions)
+  LLM-->>OR: reasoning + structured context
+  OR-->>BE: chunk_type=reasoning
+  BE-->>FE: reasoning chunk(s)
+
+  OR->>LLM: generate design guideline
+  LLM-->>OR: guideline
+  OR-->>BE: chunk_type=guideline
+  BE-->>FE: guideline chunk
+
+  loop 3-4 variations
+    OR->>IMG: generate logo from guideline
+    IMG-->>OR: binary/url
+    OR->>STO: upload image
+    STO-->>OR: image_url
+    OR-->>BE: chunk_type=image_option
+    BE-->>FE: image_option chunk
+  end
+
+  OR-->>BE: chunk_type=done
+  BE-->>FE: done(completed)
+
+  FE->>BE: POST /internal/v1/tasks/stream (logo_edit)
+  BE->>OR: selected_image_url + edit_prompt
+  OR->>IMG: edit image
+  IMG-->>OR: edited image
+  OR->>STO: upload edited image
+  STO-->>OR: updated_image_url
+  OR-->>BE: chunk_type=edit_result + done
+  BE-->>FE: edit_result + done
+```
+
 ---
 
 ## 4. Data Schema & API Integration
