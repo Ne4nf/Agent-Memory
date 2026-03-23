@@ -1,406 +1,489 @@
-# Technical Design (POC v1) - AI Logo Design Agent
+# Technical Design Document (TDD): Logo Design Service POC
 
-Feature: 001-logo-design-agent  
-Status: POC design reset (overview-first, flexible flow)
+## 1. Program Goals
 
-## 1. Overview
+### 1.1 Objectives
 
-### 1.1 POC Goal
-Build a backend flow that is easy for FE to collaborate with:
-- FE sends one main request with `query` (+ optional context).
-- BE handles intent parsing -> reasoning stream -> image generation -> optional edit loop.
-- FE receives final image outputs and can continue iteration by sending more inputs.
+Engineering Practices:
 
-Target mindset for this document:
-- Build a strong frame, not rigid rules.
-- Keep extensibility open (fields can be added without breaking core flow).
-- Make integration with ai-hub-sdk explicit and implementation-friendly.
+- Chuyển từ coding theo từng project nhỏ sang xây dựng service có thể maintain theo team.
+- Ưu tiên clean code, validation rõ ràng, và refactoring có cấu trúc.
 
-### 1.2 Success Metrics (POC)
-- API usability: FE can complete end-to-end flow with one main endpoint and predictable task status checks.
-- Time to first reasoning chunk: <= 3s in normal load.
-- Time to first generated batch (3-4 images): <= 45s for default provider profile.
-- Completion success rate (no manual operator intervention): >= 90% in staging runs.
-- Edit success usability: user can regenerate from selected image with prompt-only edit in one roundtrip.
+Agent-based System Design:
 
-### 1.3 Technical Constraints
-- Use ai-hub-sdk serving modes as designed:
-  - SYNC for fast intent/context checks.
-  - STREAM for reasoning visibility.
-  - ASYNC for generation/edit workloads.
-- Use MCPTool for external providers (generation, vision, search).
-- Do not hard-code strict state-machine transitions in API contract.
-- Keep session handling optional and lightweight (context-friendly, not state-heavy).
-- Prefer transparent errors and retry guidance over hidden fallback behavior.
+- Thiết kế agent có khả năng Planning, Reasoning, Tool Usage thông qua Logo Design POC.
 
----
+Integration with Team Infrastructure:
 
-## 2. POC Scope (Build vs Defer)
+- Đóng gói và vận hành service bằng ai-hub-sdk.
+- Tích hợp service vào hệ sinh thái hiện tại của team theo chuẩn chung.
 
-| Area | Build in POC | Defer after POC |
-|---|---|---|
-| API surface | One main orchestrator API for query -> image, plus task status/reasoning channels | Multi-workflow API families, complex workflow routing |
-| Generation strategy | Single default provider profile per request/session | Dynamic multi-model router, parallel provider A/B |
-| Editing | Prompt-based edit from selected output | Mask-based inpainting, smart-mark canvas tools |
-| Reasoning UX | Streamed reasoning blocks before generation | Advanced interactive reasoning controls |
-| Quality control | Basic validation (size/format + minimal quality checks) | Full auto-evaluator and learned scoring loop |
-| Persistence | Lightweight context storage for continuity | Full history/versioning/project library |
-| Governance | Basic tracing + structured errors | Cost governance, quotas, enterprise policy layers |
+### 1.2 Key Deliverables
+
+- Claude Code Skills & Commands:
+  - Bộ slash commands hỗ trợ coding, debugging, reviewing và tăng tốc phát triển.
+- Logo Design Service (POC):
+  - Service hoàn chỉnh nhận logo request, phân tích query, điều phối agent và trả output image.
+- Technical Documentation:
+  - Tài liệu kiến trúc, vận hành, quality gate, và kế hoạch cải tiến vòng sau.
+
+### 1.3 Success Criteria
+
+- Service Stability:
+  - Xử lý ổn định common requests, lỗi thấp, retry có kiểm soát.
+- Code Quality:
+  - Đạt chuẩn review của team và tuân theo Agent Foundation architecture.
+- Ownership:
+  - Chủ động điều tra issue, đề xuất edge-case handling, và đóng góp cải tiến.
 
 ---
 
-## 3. System Architecture (Most Important)
+## 2. Scope & Non-goals
 
-### 3.1 BE-first architecture that FE can read and integrate quickly
+### 2.1 Scope
 
-Goal of this architecture is not to force FE into a rigid state machine. Instead, FE sends one request shape, and only adds optional fields when needed.
+- Agent Logic:
+  - Thiết kế workflow Planning, Reasoning, Tool Use cho Logo Agent.
+- Tooling:
+  - Xây dựng slash commands cho Claude Code để tăng năng suất team.
+- Service Integration:
+  - Package service qua ai-hub-sdk, validation mạnh bằng Pydantic.
+- Refactoring:
+  - Nâng code từ mức MVP lên production-grade theo chuẩn team.
+- Documentation:
+  - Viết technical guides + operational manual cho toàn bộ deliverables.
 
-FE-facing contract:
-- Input: `query` plus optional context/edit fields.
-- Output: accepted task envelope first, then final image outputs through status API (or webhook).
+### 2.2 Non-goals
 
-Core endpoint:
-- `POST /api/logo/generate`
+- UI/UX phức tạp không nằm trong phạm vi chính.
+- Không quản lý hạ tầng server/cloud/CI-CD hệ thống.
+- Không training/fine-tuning base model.
+- Không làm data labeling thủ công quy mô lớn.
 
-Operational endpoints around it:
-- `GET /api/logo/tasks/{task_id}` for async status/result.
-- `GET /api/logo/streams/{stream_id}` (or SSE/NDJSON bridge) for reasoning chunks.
+---
+
+## 3. Technical Stack & Environment
+
+- Core Framework:
+  - ai-hub-sdk là orchestration + packaging layer chính.
+- Connectivity:
+  - MCP (Model Context Protocol) cho agent-tool integration chuẩn hóa.
+- AI Models:
+  - Claude cho vibe coding/dev workflow.
+  - Gemini/GPT cho reasoning, vision/image understanding và generation pipeline.
+- Data Validation:
+  - Pydantic bắt buộc cho mọi I/O schema.
+- Development Environment:
+  - Claude Code là môi trường chính để build/test/chạy slash commands.
+- Coding Standards:
+  - PEP8 bắt buộc.
+  - Type hints bắt buộc cho function signature và biến quan trọng.
+- Commit Strategy:
+  - Conventional Commits: feat, fix, refactor, docs, test, chore.
+- Engineering Quality:
+  - Thiết kế module hóa.
+  - Unit tests cho core logic, MCP tool integration, và reasoning flow.
+- Runtime Infrastructure:
+  - Docker + Git workflow.
+- Git Workflow:
+  - Feature branching + pull request + code review trước merge.
+- Documentation:
+  - Viết Markdown trong repo, có section Refactor in next stage bắt buộc.
+
+---
+
+## 4. Product Spec Synthesis
+
+Nguồn yêu cầu chính lấy từ [spec.md](spec.md):
+
+- Core flow POC đã chốt:
+  - request -> analyze -> guideline -> generate 3-4 logos -> select -> edit -> regenerate.
+- Clarification là conditional, user được skip và hệ thống phải công khai assumptions.
+- Reasoning cần hiển thị theo từng bước (Input Understanding, Style Inference, Image Analysis khi có).
+- Output ảnh tối thiểu PNG 1024x1024, quality đủ tốt để review.
+
+Ánh xạ vào ai-hub-sdk:
+
+- Task-first architecture: mỗi stage triển khai như task độc lập.
+- Stream mode là kênh chính để FE nhận reasoning và kết quả incremental.
+- Schema-driven validation qua TaskInputBaseModel/TaskOutputBaseModel.
+
+---
+
+## 5. Proposed System Architecture
+
+### 5.1 High-Level Architecture
 
 ```mermaid
 flowchart LR
-    FE[FE Client] --> API[POST /api/logo/generate]
-    API --> Router{Request Mode Router}
+    FE[Frontend App] -->|query/image| API[AI Hub Communication API]
+    API --> ORCH[Logo Orchestrator]
 
-    Router -->|Generate Mode| SyncNormalize[SYNC normalize/intent]
-    Router -->|Edit Mode| SyncEditValidate[SYNC edit validation]
+    ORCH --> PLAN[Planning Agent]
+    ORCH --> REASON[Reasoning Agent]
+    ORCH --> TOOL[Tool Layer]
 
-    SyncNormalize --> StreamReasoning[STREAM reasoning]
-    StreamReasoning --> AsyncGenerate[ASYNC submit generation]
+    TOOL --> MCP[MCP Connector]
+    MCP --> IMG[Image Generation/Edit Provider]
+    MCP --> SEARCH[Reference Search Tool]
 
-    SyncEditValidate --> AsyncEdit[ASYNC submit edit]
+    ORCH --> STORE[(Object Storage/CDN)]
+    ORCH --> OBS[Observer + Telemetry]
+    OBS --> LOG[(Tracing/Cost/Latency Logs)]
 
-    AsyncGenerate --> Worker[Worker Pool]
-    AsyncEdit --> Worker
-
-    Worker --> Redis[(Task status/result)]
-    Worker --> MCPGen[MCP image generation]
-    Worker --> MCPVision[MCP vision analysis]
-    Worker --> MCPSearch[MCP web/image search]
-    Worker --> Webhook[Optional webhook callback]
-
-    Redis --> API
-    Webhook --> API
-    API --> FE
+    API -->|stream chunks| FE
 ```
 
-### 3.2 Why FE and BE can both understand this doc
+### 5.2 Workflow Logic (Agent Pipeline)
 
-FE reads:
-- One entry endpoint.
-- Which fields to add when switching from initial generation to edit.
-- Where to get reasoning and where to get final result.
+1. Intent Gate:
+   - Detect logo-design intent từ query.
+2. Input Parsing:
+   - Parse text + optional image reference.
+3. Clarification Gate:
+   - Nếu thiếu dữ liệu, hỏi clarification.
+   - Nếu skip, tạo assumptions có cấu trúc.
+4. Planning:
+   - Lập kế hoạch generation path và tool calls.
+5. Reasoning:
+   - Xuất reasoning chunks cho FE.
+6. Guideline Synthesis:
+   - Tạo design guideline rõ ràng trước generate.
+7. Image Generation:
+   - Generate 3-4 logo options, stream từng option.
+8. Selection & Edit:
+   - User chọn option, gửi edit prompt.
+9. Regeneration:
+   - Regenerate 1 output mặc định + edit summary.
+10. Follow-up Suggestions:
+   - Trả quick-action suggestions.
 
-BE reads:
-- Router logic and two execution modes.
-- Which steps are SYNC, STREAM, ASYNC.
-- Where each external tool is called and where status/result is persisted.
+### 5.3 Orchestrator Design
 
-### 3.3 One API for whole flow: is it okay?
+Logo Orchestrator chịu trách nhiệm:
 
-Short answer: yes for POC, with a guardrail.
+- Quản lý state theo request/session.
+- Điều phối Planning Agent, Reasoning Agent, và tools.
+- Bảo đảm order của stream chunks (sequence tăng dần).
+- Chuẩn hóa error mapping và retry policy.
+- Ghi telemetry cho latency/cost/quality flags.
 
-Recommended pattern:
-- Keep one orchestration endpoint for command intake: `POST /api/logo/generate`.
-- Keep separate read endpoints for observability/result retrieval.
+Mô hình triển khai trong ai-hub-sdk:
 
-Why this is better in POC:
-- FE implementation is simpler: one payload model, optional fields for branch.
-- BE can evolve internals without breaking FE integration.
-- Reuse is easy: adding a new optional input should not force FE endpoint migration.
+- Task 1: logo_analyze
+- Task 2: logo_generate
+- Task 3: logo_edit
+- Serving mode: STREAM-first, fallback ASYNC/SYNC tùy use case.
 
-When one API becomes problematic:
-- Request payload becomes overloaded with too many unrelated concerns.
-- Branch logic becomes hard to validate and hard to reason about.
-
-Guardrail:
-- Keep explicit `mode` internally (`generate` or `edit`) inferred from fields.
-- Reject ambiguous payloads with clear 4xx errors.
-- Version payload shape before introducing major new branches.
-
-### 3.4 Internal handle flow (concrete, step-by-step)
-
-#### A) Generate mode (initial request)
+### 5.4 Request Sequence (Generate + Edit)
 
 ```mermaid
 sequenceDiagram
-    participant FE as FE
-    participant API as BE Orchestrator API
-    participant SYNC as SYNC Task
-    participant STREAM as STREAM Task
-    participant ASYNC as ASYNC Task
-    participant STATUS as Task Status Store
+    actor FE as Frontend
+    participant API as Stream API
+    participant OR as Logo Orchestrator
+    participant AG as Planning/Reasoning Agent
+    participant MCP as MCP Tools
+    participant IMG as Image Provider
+    participant STO as Storage
 
-    FE->>API: POST /api/logo/generate {query, optional context}
-    API->>SYNC: normalize + intent check
-    SYNC-->>API: normalized_context + assumptions
-    API->>STREAM: start reasoning stream
-    STREAM-->>FE: reasoning chunks (understanding/style/constraints)
-    API->>ASYNC: submit generation task
-    ASYNC-->>STATUS: pending/processing/completed/failed + result
-    API-->>FE: accepted {request_id, stream_id, generation_task_id}
-    FE->>API: GET /api/logo/tasks/{task_id}
-    API-->>FE: completed {images, metadata, assumptions}
+    FE->>API: stream logo_generate(query, optional_refs)
+    API->>OR: validate + init context
+    OR->>AG: planning + reasoning
+    AG-->>OR: assumptions + guideline draft
+    OR-->>API: chunk(reasoning)
+    API-->>FE: reasoning chunk(s)
+
+    OR->>MCP: call image generation tool
+    MCP->>IMG: generate variations (3-4)
+    IMG-->>MCP: images
+    MCP-->>OR: raw images + metadata
+    OR->>STO: upload images
+    STO-->>OR: image_urls
+    OR-->>API: chunk(image_option)*
+    API-->>FE: image_option stream
+    OR-->>API: chunk(done)
+    API-->>FE: done
+
+    FE->>API: stream logo_edit(selected_image, edit_prompt)
+    API->>OR: validate edit input
+    OR->>MCP: call image edit tool
+    MCP->>IMG: edit image
+    IMG-->>MCP: updated image
+    MCP-->>OR: updated image + metadata
+    OR->>STO: upload updated image
+    STO-->>OR: updated_image_url
+    OR-->>API: chunk(edit_result), chunk(done)
+    API-->>FE: edit_result + done
 ```
-
-#### B) Edit mode (continue from selected image)
-
-```mermaid
-sequenceDiagram
-    participant FE as FE
-    participant API as BE Orchestrator API
-    participant SYNC as SYNC Validation
-    participant ASYNC as ASYNC Edit Task
-    participant STATUS as Task Status Store
-
-    FE->>API: POST /api/logo/generate {query, selected_image_id, edit_prompt}
-    API->>SYNC: validate edit input + resolve source image context
-    SYNC-->>API: edit-ready context
-    API->>ASYNC: submit edit regeneration
-    ASYNC-->>STATUS: pending/processing/completed/failed + result
-    API-->>FE: accepted {request_id, generation_task_id}
-    FE->>API: GET /api/logo/tasks/{task_id}
-    API-->>FE: completed {images:[edited_image], metadata}
-```
-
-### 3.5 Tool execution map (inside BE)
-
-| Step | Tool/API | Called by | Purpose |
-|---|---|---|---|
-| Normalize/intent | ai-hub SYNC (`/compute`) | Orchestrator | Parse `query`, build normalized context, assumptions |
-| Reasoning | ai-hub STREAM (`/stream`) | Orchestrator | Emit progressive reasoning chunks for FE visibility |
-| Generate | ai-hub ASYNC (`/submit`) + MCP image tool | Worker | Generate 3-4 outputs |
-| Edit | ai-hub ASYNC (`/submit`) + MCP image tool | Worker | Regenerate selected image with edit prompt |
-| Optional enrich | MCP vision/search | Worker | Analyze reference image, pull inspiration context |
-| Status/result | Redis task status | Worker + API | Persist and expose task lifecycle/results |
-
-### 3.6 Short competitor note (practical direction)
-
-- DALL-E style providers: stable prompt adherence, integration-friendly in product flow.
-- Ideogram-style providers: strong logo/text consistency in branding cases.
-- Midjourney-like stacks: strong visual output, but often higher orchestration overhead.
-
-POC recommendation:
-- Start single provider profile.
-- Collect logs/quality/cost metrics.
-- Decide provider routing only after evidence.
 
 ---
 
-## 4. Data Schema and API Integration
-
-Below are flexible Pydantic frames for each step. These are scaffolds, not rigid workflow locks.
-
-### 4.0 Payload contract policy (important for FE collaboration)
-
-- FE always sends one base model (`GenerateLogoRequest`).
-- BE infers mode from optional fields.
-- No forced client state enum is required.
-
-Mode inference rule:
-- `edit mode` when both `selected_image_id` and `edit_prompt` are present.
-- `generate mode` otherwise.
-
-Validation rule:
-- If only one of (`selected_image_id`, `edit_prompt`) is provided, return 422 with actionable message.
-
-### 4.1 Main request/response (FE-facing)
+## 6. Data Schema (Pydantic)
 
 ```python
-from typing import Optional, List, Dict, Any, Literal
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field, HttpUrl
 
 
-class GenerateLogoRequest(BaseModel):
-    query: str = Field(..., min_length=1)
+class ReferenceImage(BaseModel):
+    source_url: Optional[HttpUrl] = None
+    storage_key: Optional[str] = None
+    note: Optional[str] = None
 
-    # Optional context for collaboration with FE
-    reference_image_url: Optional[HttpUrl] = None
+
+class BrandContext(BaseModel):
     brand_name: Optional[str] = None
-    style_hints: List[str] = Field(default_factory=list)
-    audience_hints: List[str] = Field(default_factory=list)
-
-    # Optional continuation/edit inputs
-    selected_image_id: Optional[str] = None
-    edit_prompt: Optional[str] = None
-
-    # Optional tracing/context (not mandatory)
-    session_id: Optional[str] = None
-    trace_id: Optional[str] = None
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+    industry: Optional[str] = None
+    target_audience: Optional[str] = None
+    style_preference: List[str] = Field(default_factory=list)
+    color_preference: List[str] = Field(default_factory=list)
+    symbol_preference: List[str] = Field(default_factory=list)
 
 
-class ApiError(BaseModel):
-    code: str
-    message: str
-    retryable: bool = False
-    details: Dict[str, Any] = Field(default_factory=dict)
+class Assumption(BaseModel):
+    key: str
+    value: str
+    reason: str
 
 
-class GeneratedImage(BaseModel):
-    image_id: str
-    image_url: HttpUrl
-    width: int
-    height: int
-    provider: str
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+class ClarificationQuestion(BaseModel):
+    key: str
+    question: str
+    required: bool = False
 
 
-class GenerateLogoResponse(BaseModel):
-    request_id: str
-    mode: Literal["generate", "edit"]
-    status: Literal["accepted", "processing", "completed", "failed"]
-    reasoning_stream_id: Optional[str] = None
-    generation_task_id: Optional[str] = None
-    images: List[GeneratedImage] = Field(default_factory=list)
-    assumptions: List[str] = Field(default_factory=list)
-    error: Optional[ApiError] = None
-```
-
-### 4.2 Sub-flow schemas (internal orchestration)
-
-```python
-from typing import Literal
-from pydantic import BaseModel, Field
-
-
-class IntentCheckInput(BaseModel):
+class LogoGenerateInput(BaseModel):
+    session_id: str
     query: str
-    reference_image_url: Optional[HttpUrl] = None
-    hints: Dict[str, Any] = Field(default_factory=dict)
+    references: List[ReferenceImage] = Field(default_factory=list)
+    allow_skip_clarification: bool = True
+    variation_count: int = Field(default=4, ge=3, le=4)
+    output_format: Literal["png"] = "png"
+    output_size: Literal["1024x1024"] = "1024x1024"
 
 
-class IntentCheckOutput(BaseModel):
-    is_logo_request: bool
-    confidence: float
-    normalized_context: Dict[str, Any] = Field(default_factory=dict)
-    assumptions: List[str] = Field(default_factory=list)
+class DesignGuideline(BaseModel):
+    concept_statement: str
+    style_direction: List[str]
+    color_palette: List[str]
+    typography_direction: List[str]
+    icon_direction: List[str]
+    constraints: List[str]
+    assumptions: List[Assumption] = Field(default_factory=list)
 
 
-class ReasoningChunk(BaseModel):
-    stage: Literal["input_understanding", "style_inference", "constraints", "done"]
-    message: str
-    bullets: List[str] = Field(default_factory=list)
+class LogoOption(BaseModel):
+    option_id: str
+    image_url: HttpUrl
+    prompt_used: Optional[str] = None
+    seed: Optional[int] = None
+    quality_flags: List[str] = Field(default_factory=list)
 
 
-class GenerationInput(BaseModel):
-    normalized_context: Dict[str, Any] = Field(default_factory=dict)
-    reference_image_url: Optional[HttpUrl] = None
-    variation_count: int = Field(default=4, ge=1, le=4)
+class LogoGenerateOutput(BaseModel):
+    guideline: DesignGuideline
+    options: List[LogoOption]
 
 
-class GenerationOutput(BaseModel):
-    images: List[GeneratedImage] = Field(default_factory=list)
-    quality_notes: List[str] = Field(default_factory=list)
-    usage: Dict[str, Any] = Field(default_factory=dict)
-
-
-class EditInput(BaseModel):
-    selected_image_id: str
+class LogoEditInput(BaseModel):
+    session_id: str
+    selected_option_id: str
+    selected_image_url: HttpUrl
     edit_prompt: str
-    normalized_context: Dict[str, Any] = Field(default_factory=dict)
+    guideline: DesignGuideline
 
 
-class EditOutput(BaseModel):
-    image: GeneratedImage
-    edit_notes: List[str] = Field(default_factory=list)
+class LogoEditOutput(BaseModel):
+    updated_image_url: HttpUrl
+    edit_summary: str
+    preserved_elements: List[str] = Field(default_factory=list)
 
 
-class HandleFlowEnvelope(BaseModel):
-    mode: Literal["generate", "edit"]
-    normalized_context: Dict[str, Any] = Field(default_factory=dict)
-    assumptions: List[str] = Field(default_factory=list)
-    stream_id: Optional[str] = None
-    task_id: Optional[str] = None
+class StreamEnvelope(BaseModel):
+    request_id: str
+    session_id: str
+    task_type: Literal["logo_analyze", "logo_generate", "logo_edit"]
+    status: Literal["processing", "completed", "failed"]
+    chunk_type: Literal[
+        "reasoning", "clarification", "guideline", "image_option",
+        "edit_result", "suggestion", "warning", "error", "done"
+    ]
+    sequence: int
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 ```
 
-### 4.3 API into handle flow (input/output per phase)
+Validation rules bắt buộc:
 
-| Handle phase | Input model | Output model | Sync/Stream/Async |
-|---|---|---|---|
-| Parse + normalize | `IntentCheckInput` | `IntentCheckOutput` | SYNC |
-| Start reasoning | normalized context + assumptions | `ReasoningChunk` stream | STREAM |
-| Submit generation | `GenerationInput` | task id + eventual `GenerationOutput` | ASYNC |
-| Submit edit | `EditInput` | task id + eventual `EditOutput` | ASYNC |
-| Build API response | `HandleFlowEnvelope` + task result | `GenerateLogoResponse` | API layer |
-
-### 4.4 Where external APIs are called
-
-1. Intent check (SYNC)
-- Call: ai-hub-sdk compute endpoint or AIHubSyncService.
-- Purpose: parse request semantics and normalize context.
-
-2. Reasoning stream (STREAM)
-- Call: ai-hub-sdk stream endpoint or AIHubStreamService.
-- Purpose: push progressive reasoning chunks to FE.
-
-3. Generation/edit (ASYNC)
-- Call: ai-hub-sdk submit endpoint or AIHubAsyncService.
-- Worker calls MCP tools for generation/vision/search.
-- Result retrieval: task status API and optional webhook callback.
-
-### 4.5 Suggested FE-facing API set (POC)
-
-- `POST /api/logo/generate`
-    - Single command endpoint for both initial generate and optional edit continuation.
-    - Returns `accepted` quickly with `task_id` and optional `stream_id`.
-
-- `GET /api/logo/tasks/{task_id}`
-    - Read endpoint for polling task status and final result payload.
-
-- `GET /api/logo/streams/{stream_id}` or SSE channel
-    - Read endpoint/channel to deliver reasoning chunks.
-
-These keep one-command simplicity while preserving clear read channels for FE.
+- Query không rỗng, trim whitespace.
+- variation_count chỉ 3 hoặc 4.
+- Edit bắt buộc có selected image + edit prompt.
+- Khi skip clarification, assumptions phải có ít nhất 1 phần tử.
 
 ---
 
-## 5. Risks and Open Issues
+## 7. API & Service Integration
 
-### 5.1 Main risks
+### 7.1 Backend Endpoints
 
-1. Latency variability
-- Cause: provider queueing, network, heavy prompts, reference analysis.
-- Mitigation: strict timeout budgets per tool call, early reasoning stream, explicit status updates.
+- Stream Generate:
+  - POST /internal/v1/tasks/stream với task_type logo_generate.
+- Stream Edit:
+  - POST /internal/v1/tasks/stream với task_type logo_edit.
+- Async fallback:
+  - POST /internal/v1/tasks/submit
+  - GET /internal/v1/tasks/{task_id}/status
 
-2. Generation quality inconsistency
-- Cause: prompt ambiguity and provider variance.
-- Mitigation: normalized context + assumptions surfaced, lightweight quality checks, retry policy with clear user feedback.
+### 7.2 External API Calls
 
-3. Cost unpredictability
-- Cause: repeated iteration loops and multi-call pipeline.
-- Mitigation: cap variation count, cap search depth, add usage metadata to each task.
+- LLM API:
+  - Intent detection, planning, reasoning, guideline synthesis.
+- Vision API (optional in POC stretch):
+  - Analyze reference image style/color/iconography.
+- Image API:
+  - Generate 3-4 logo options.
+  - Edit selected logo theo prompt.
 
-4. Tool/schema drift
-- Cause: external MCP server updates.
-- Mitigation: strict adapter layers and schema validation at each boundary.
+### 7.3 MCP Integration
 
-### 5.2 Open technical decisions (need team alignment)
+MCP tools chuẩn hóa gọi ra ngoài:
 
-1. Default provider profile for POC launch
-- Decide one default first; evaluate router only after log-based evidence.
+- mcp_logo_generate_tool
+- mcp_logo_edit_tool
+- mcp_reference_search_tool
 
-2. Reasoning transport for FE
-- Choose NDJSON stream vs SSE bridge based on frontend infra preference.
+Mỗi tool phải có:
 
-3. Persistence depth
-- Decide minimum context retention window for practical edit iterations.
-
-4. Quality gate threshold
-- Define pass/fail criteria strictness for initial release.
-
-5. Cost guardrail policy
-- Decide per-request budget and handling behavior when budget is exceeded.
+- Input schema rõ ràng.
+- Timeout + retry policy.
+- Structured error mapping về error_code nội bộ.
 
 ---
 
-This version intentionally focuses on an overview-first, flexible backend architecture so FE can collaborate by adding inputs progressively without being blocked by rigid state contracts.
+## 8. Frontend Stack Proposal
+
+Mục tiêu FE cho POC là light-weight, tập trung vào render stream + canvas preview:
+
+- Framework:
+  - Next.js hoặc React + TypeScript.
+- State:
+  - TanStack Query cho request lifecycle.
+  - Zustand hoặc Redux Toolkit cho session UI state.
+- Streaming:
+  - Ưu tiên NDJSON stream qua HTTP gateway.
+  - Fallback gRPC-web nếu cần hiệu năng cao.
+- UI Blocks tối thiểu:
+  - Chat timeline (reasoning chunks)
+  - Guideline panel
+  - Logo gallery 3-4 options
+  - Canvas preview (pan/zoom)
+  - Edit prompt input + follow-up quick actions
+
+Contract BE-FE là StreamEnvelope; FE không phụ thuộc logic nội bộ của task.
+
+---
+
+## 9. Engineering Practices & Quality Gates
+
+### 9.1 Code Standards
+
+- PEP8 bắt buộc.
+- Type hints bắt buộc cho function signatures.
+- Mỗi module giữ phạm vi rõ ràng, tránh god-object.
+
+### 9.2 Testing Strategy
+
+- Unit tests:
+  - Validation logic
+  - Agent planning/reasoning pipeline
+  - Tool adapters qua MCP
+  - Error mapping
+- Integration tests:
+  - stream generate
+  - stream edit
+  - async fallback flow
+
+### 9.3 Git & Review
+
+- Feature branch theo ticket.
+- Conventional Commits.
+- PR bắt buộc có test evidence + checklist QA.
+
+### 9.4 Slash Commands Deliverable
+
+Bộ command đề xuất cho Claude Code:
+
+- /logo-intent-check
+- /logo-schema-validate
+- /logo-debug-stream
+- /logo-review
+- /logo-refactor-suggest
+
+Mục tiêu là chuẩn hóa workflow coding, debug và review của team.
+
+---
+
+## 10. Build vs Defer (Implementation Scope)
+
+| Area | Build in POC | Defer |
+| :--- | :--- | :--- |
+| Intent + planning | Intent detection + planning skeleton | Multi-agent planner competition |
+| Reasoning | Structured streaming reasoning | Advanced self-critique loops |
+| Image generation | Single provider, 3-4 outputs | Multi-model routing and ranking |
+| Editing | Prompt-based edit on selected logo | Region-level edit, smart mark |
+| Reference image | Basic support input + optional analysis | Full multimodal deep analysis |
+| FE | Stream render, gallery, canvas basic | Complex UI design system |
+| Ops | Docker run + logs + basic tracing | Infra scaling and CI/CD ownership |
+
+---
+
+## 11. Risks & Open Issues
+
+### 11.1 Key Risks
+
+- Latency vượt ngưỡng khi tạo 3-4 ảnh.
+- Quality biến động giữa các lần generate.
+- Chi phí tăng mạnh nếu edit lặp nhiều lần.
+- Race condition khi user gửi nhiều edit song song.
+
+### 11.2 Mitigation
+
+- Stream reasoning sớm để giữ UX.
+- Hard timeout cho từng external call.
+- Retry giới hạn 1 lần cho lỗi transient.
+- Rate limit theo session + queue edit requests.
+
+### 11.3 Open Decisions
+
+- Chốt chuẩn stream chính: NDJSON hay gRPC stream cho FE production.
+- Chính sách TTL/signed URL cho ảnh.
+- Rule deterministic seed cho edit consistency.
+- Mức quality gate: hard fail hay soft warning.
+
+---
+
+## 12. Refactor in Next Stage
+
+- Tách Orchestrator thành layer độc lập theo use case (generate/edit/follow-up).
+- Trừu tượng hóa tool adapters thành plugin registry.
+- Bổ sung model router cho A/B quality-cost optimization.
+- Chuẩn hóa domain error catalog + retry class.
+- Bổ sung contract tests giữa BE stream envelope và FE parser.
+- Tối ưu observability:
+  - dashboard cho latency, cost, success rate theo stage.
+
+---
+
+## 13. Expected Outcome
+
+- Approved Technical Design Document.
+- Clear, implementation-ready architecture cho team BE/FE.
+- Foundation phù hợp để bắt đầu coding phase ngay trong feature branch.
+
+Definition of ready for implementation:
+
+- Schema đã chốt.
+- API contract đã chốt.
+- Build/defer boundaries rõ ràng.
+- Test strategy và quality gates rõ ràng.
