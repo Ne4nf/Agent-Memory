@@ -1,165 +1,351 @@
-# AI Logo Design Agent - Architecture & User Flow
+# Technical Design: AI Logo Design Agent (POC Phase 1)
 
-Tài liệu này đặc tả việc phân tích trải nghiệm từ các giải pháp hiện có trên thị trường (Genspark, Lovart), qua đó đề xuất kiến trúc hệ thống, luồng xử lý cốt lõi (Core Logic) và trải nghiệm người dùng (User Flow) của AI Logo Design Agent.
+## 1. Overview
 
-## 1. Phân tích Trải nghiệm Thực tế (Genspark vs Lovart)
+### 1.1 Mục tiêu POC
+Xây dựng một backend pipeline theo mô hình input query -> xử lý có reasoning -> output image, bám đúng scope của spec `001-logo-design-agent`:
 
-### 1.1. Genspark
-Genspark sử dụng kiến trúc **Dynamic Multi-Agent**. Khi user đưa request, một "Planner Agent" sẽ tự động sinh ra các "Worker Agents" (đi search web, đi vẽ ảnh) một cách linh hoạt, không cố định luồng. Kiến trúc này mang lại những điểm sáng nhưng cũng dễ gây ra lỗi ảo giác (hallucination) hoặc khiến hệ thống mắc kẹt trong vòng lặp generate liên tục.
-<img width="1011" height="895" alt="Screenshot 2026-03-20 003813" src="https://github.com/user-attachments/assets/0a13720b-6fd3-4b64-940b-241c87f160e1" />
+- Nhận mô tả thương hiệu từ người dùng.
+- Phân tích ngữ cảnh và xuất reasoning minh bạch theo từng chunk.
+- Tạo design guideline rõ ràng trước khi generate ảnh.
+- Sinh trực tiếp 3-4 phương án logo PNG.
+- Cho phép chọn 1 logo và chỉnh sửa bằng prompt tự nhiên.
+- Trả về ảnh đã chỉnh sửa + edit summary.
 
-**Ưu điểm (Pros):**
-- **Web Search mượt & linh hoạt:** Khả năng tìm kiếm của Genspark đa dạng hơn, tập trung lấy context nghiên cứu (research) theo các keyword như trend, best, top, hot... và trỏ trực tiếp đến chuyên môn logo design.
-- **Chat tự động (Auto-detect):** Tự động nhận diện ý định và kích hoạt luồng làm việc mà không yêu cầu user thao tác rườm rà.
-<img width="1849" height="961" alt="Screenshot 2026-03-20 120151" src="https://github.com/user-attachments/assets/ed887a34-2f38-4b70-a13b-249fcbd126bc" />
+### 1.2 Success Metrics (POC)
+Bám theo spec và chuyển thành metric kỹ thuật có thể đo trên backend:
 
-**Nhược điểm & Vấn đề (Cons & Issues):**
-- **Khuyết điểm Edit (Must redraw):** Genspark thiếu khả năng can thiệp chỉnh sửa chi tiết. Nó buộc user manual layer phần cần edit thay vì "Touch edit detection" như của Lovart.
-<img width="1826" height="928" alt="image" src="https://github.com/user-attachments/assets/bccff644-1b7f-4031-8853-fc4821fff636" />
+- >= 90% request có design guideline trước khi image generation bắt đầu.
+- >= 90% request trả về đủ 3-4 logo options hợp lệ.
+- >= 85% phiên hoàn thành đầy đủ flow generate -> select -> edit mà không reset session.
+- p95 time to first reasoning chunk <= 1.5s.
+- p95 time to completed 3-4 outputs <= 25s.
+- Khi lỗi generation/edit, phản hồi lỗi + retry guidance <= 3s.
 
-### 1.2. Lovart
-Lovart mang lại trải nghiệm thao tác thiết kế "bay bổng" hơn, nhưng lại yếu ở khả năng thấu hiểu ngữ cảnh (AI logic).
+### 1.3 Technical Constraints
 
-**Ưu điểm (Pros):**
-- **Giao diện Canvas Design vượt trội:** Trải nghiệm chỉnh sửa trực quan ngay trên vùng làm việc mang lại cảm giác dễ chịu giống Canva (Về mảng Design Canvas: Lovart > Genspark).
-- **Tính năng "Touch Edit":** Cho phép người dùng chọn một vùng ảnh và sửa (đòi hỏi mô hình Regional Prompting hoặc Image-to-Image / Inpainting chuyên biệt).
-<img width="1907" height="926" alt="Screenshot 2026-03-20 134426" src="https://github.com/user-attachments/assets/39588115-1545-40ad-99d5-0e7082dfdbcd" />
-
-**Nhược điểm & Vấn đề (Cons & Issues):**
-- **Web Search "trật trọng tâm":** Search của Lovart không focus được vào "Brand" mà bị đánh lừa bởi bề mặt "sự vật" trong query. Ví dụ: Với request "i wanna to gen logo for sport clothes store", Lovart sẽ chỉ lấy keyword "sport" để search (người chạy bộ, vận động viên) chứ không nhận diện được trọng tâm là "logo brand".
-- **Trải nghiệm Chat thủ công, rườm rà:** Hệ thống không tự detect ý định mượt mà như Genspark. User phải tự tay thao tác qua nhiều bước trung gian: Set up model, web search, thinking/fast hay agent direction.
-<img width="1815" height="957" alt="Screenshot 2026-03-20 120025" src="https://github.com/user-attachments/assets/8c1ec84c-1808-42fb-b84e-a4e262c15256" />
-<img width="1849" height="961" alt="Screenshot 2026-03-20 120151" src="https://github.com/user-attachments/assets/7f3f7135-c056-4a30-a2be-f868928272fc" />
-
-- **Thuyết minh "bằng chữ" nhàm chán:** Việc LLM dừng lại sinh ra các đề xuất hướng thiết kế thuần túy bằng text khiến user rất khó để hình dung visual của logo trông sẽ như thế nào.
-<img width="755" height="720" alt="image" src="https://github.com/user-attachments/assets/1be48467-71d5-4b28-b57d-f7a2afd356d4" />
+- POC chỉ dùng single image generation model để giảm rủi ro tích hợp.
+- Không build rule engine cứng; logic phải data-driven bằng prompt/template + structured schema.
+- Không triển khai region editing, touch edit, smart mark trong Phase 1.
+- Session scope là single-session, không làm project persistence dài hạn.
+- Ưu tiên Stream API để FE nhận reasoning/incremental output theo thời gian thực.
 
 ---
 
-## 2. Giải pháp & Bối cảnh Kiến trúc (Our Approach)
+## 2. POC Scope
 
-Hệ thống AI Logo Design của chúng ta được cấu trúc để **kế thừa các điểm mạnh và loại bỏ lỗ hổng**:
+### 2.1 Build vs Defer
 
-1. **Intelligent Auto-detect:** Sử dụng AI Planner nhận diện ý định và Smart Web Search tập trung nội dung thương hiệu như Genspark, nhưng vận hành trên một luồng logic rẽ nhánh an toàn hơn.
-2. **Drafting Pattern:** Tích hợp sinh ảnh nháp tốc độ cao (Fast/Cheap Model) đi kèm dòng text mô tả, giải quyết vấn đề "đọc chữ khó hình dung".
-3. **Canvas Design & Touch Edit:** Xây dựng front-end Canvas và quy trình Inpainting chuyên sâu như Lovart cho thao tác tương tác chỉnh sửa vùng cục bộ.
-4. **Side-by-side Rendering:** Hỗ trợ render đồng thời (Concurrency) đa mô hình, giúp user so sánh trực quan các phong cách đồ hoạ.
+| Area | Build (Phase 1) | Defer (Phase 2+) |
+|---|---|---|
+| Input handling | Parse query + brand context extraction + optional clarification | Multi-turn profile memory across sessions |
+| Reasoning | Stream reasoning chunks (Input Understanding, Style Inference, Assumptions) | Deep chain-of-thought variants và automatic critique loop |
+| Generation | Guideline-first + generate 3-4 PNG logo options | Multi-model routing, A/B model comparison |
+| Editing | Prompt-based edit trên selected logo | Region-level editing, smart mark, mask-based editing |
+| API mode | Stream-first + optional async submit/status for fallback | Advanced orchestration workflow UI actions |
+| Quality control | Basic visual checks + explicit assumption disclosure | Judge-model auto-evaluation, quality scorer pipeline |
+| Observability | Trace usage/cost/latency và step logs | Full experiment platform + offline replay tools |
+
+### 2.2 Nguyên tắc mở rộng
+
+- Task-oriented architecture: mỗi capability là một task riêng, có input/output schema độc lập.
+- Config-driven: prompt/model/settings nằm ở config/provider thay vì hardcode rule logic.
+- Composable pipeline: thêm input mới sẽ map qua context extraction + guideline generation mà không phải sửa khung core.
+- Contract-first với FE: stream chunk types và payload cố định để FE render ổn định.
 
 ---
 
-## 3. Kiến trúc Stateful DAG kết hợp LLM Orchestrator/Router
+## 3. System Architecture
 
-> **Chú ý kiến trúc:** Rút kinh nghiệm từ điểm yếu Dynamic Multi-Agent của Genspark (các Agent tự do nói chuyện dễ sinh ảo giác và vòng lặp), hệ thống áp dụng kiến trúc **Stateful DAG với LLM Orchestrator/Router** (Đồ thị luồng tĩnh kết hợp bộ định tuyến động). Dữ liệu đi qua các Node theo cấu trúc tuyến tính rẽ nhánh và hoàn toàn có thể dự đoán/kiểm soát được. 
+### 3.1 End-to-End Flow (BE)
 
-Bên cạnh Text, hệ thống sở hữu **Luồng Xử lý Đa phương thức (Multimodal Input)** trọng tâm để khai thác đầu vào từ Ảnh tham khảo (Reference Image) do người dùng cung cấp.
+1. FE gửi request generate với query text.
+2. BE tạo `session_id`, validate input schema.
+3. `AnalyzeDesignTask` stream reasoning chunks + assumptions.
+4. `GenerateGuidelineTask` tạo design guideline có cấu trúc.
+5. `GenerateLogoTask` gọi image model để tạo 3-4 outputs.
+6. BE stream từng output chunk về FE ngay khi có ảnh.
+7. FE chọn logo và gửi edit prompt.
+8. `EditLogoTask` regenerate ảnh dựa trên selected logo + guideline + edit prompt.
+9. BE trả edit summary + output ảnh mới.
 
-```mermaid
-graph TD
-    User([User Submit \n Text + Image]) --> ImageVision[Vision Node\nGemini/GPT-4V: Trích xuất Style, Color]
-    User --> Chat[Intent & Chat Pattern]
-    ImageVision --> Chat
-    Chat --> Planner{Planner Agent\nStateful Orchestrator}
-    
-    Planner -->|Research Brand & Trend| WebSearch[Web Search Agent\nFocus: trends, brand context]
-    Planner -->|Gộp Text Prompt + Image Insights| Router[[LLM Router Node\nClaude]]
-    
-    Router -->|1. Fast Concepting| Draft[Draft Models\nSDXL Turbo / Flux.1 Schnell]
-    Router -->|2. Text-Heavy| TxtHQ[Text Models\nIdeogram / DALL-E 3]
-    Router -->|3. Artistic/Abstract| ArtHQ[Artistic Models\nMidjourney / Imagen]
-    Router -->|4. Touch Edit| Inpaint[Inpainting API\nStable Diffusion]
+### 3.2 Logical Components
+
+- Communication Layer:
+  - REST/gRPC endpoints cho submit/compute/stream.
+  - Stream endpoint là default cho trải nghiệm POC.
+- Task Layer:
+  - `AnalyzeDesignTask`
+  - `GenerateGuidelineTask`
+  - `GenerateLogoTask`
+  - `EditLogoTask`
+- Agent/Orchestrator Layer:
+  - Điều phối tool calls và runtime context.
+  - Quản lý reasoning sequence theo chunk order.
+- Tool Layer:
+  - `BrandContextTool`
+  - `StyleInferenceTool`
+  - `GuidelineBuilderTool`
+  - `ImageGenerationTool` (adapter tới external model)
+  - `ImageEditTool`
+  - `QualityCheckTool` (POC-level checks)
+- Model Layer:
+  - LLM cho reasoning/guideline.
+  - Single image model cho generate/edit.
+- Observer/Telemetry:
+  - Trace latency, usage, cost, error taxonomy.
+
+### 3.3 FE Collaboration Contract (streaming)
+
+BE stream NDJSON/gRPC chunks với `chunk_type` thống nhất:
+
+- `reasoning`: văn bản reasoning incremental.
+- `guideline`: object guideline hoàn chỉnh.
+- `image_option`: một logo option mới.
+- `edit_result`: ảnh sau chỉnh sửa.
+- `warning`: assumption/conflict resolution.
+- `error`: lỗi có retry suggestion.
+- `done`: kết thúc stage hoặc kết thúc request.
+
+FE chỉ cần render theo chunk_type, không phụ thuộc vào internal implementation của task.
+
+---
+
+## 4. Data Schema & API Integration
+
+## 4.1 Pydantic Models theo từng bước
+
+```python
+from typing import Any, Dict, List, Literal, Optional
+from pydantic import BaseModel, Field
+
+class ClarificationQuestion(BaseModel):
+    key: str
+    question: str
+    required: bool = False
+
+class Assumption(BaseModel):
+    key: str
+    value: str
+    reason: str
+
+class BrandContext(BaseModel):
+    brand_name: Optional[str] = None
+    industry: Optional[str] = None
+    target_audience: Optional[str] = None
+    style_intent: List[str] = Field(default_factory=list)
+    keywords: List[str] = Field(default_factory=list)
+
+class AnalyzeInput(BaseModel):
+    session_id: str
+    query: str
+    allow_skip_clarification: bool = True
+
+class AnalyzeOutput(BaseModel):
+    context: BrandContext
+    clarification_questions: List[ClarificationQuestion] = Field(default_factory=list)
+    assumptions: List[Assumption] = Field(default_factory=list)
+
+class DesignGuideline(BaseModel):
+    concept_statement: str
+    style_direction: List[str]
+    color_palette: List[str]
+    typography_direction: List[str]
+    symbol_direction: List[str]
+    constraints: List[str]
+    dominant_interpretation: str
+
+class GenerateLogoInput(BaseModel):
+    session_id: str
+    query: str
+    context: BrandContext
+    guideline: DesignGuideline
+    variation_count: int = Field(default=4, ge=3, le=4)
+    size: str = "1024x1024"
+    output_format: Literal["png"] = "png"
+
+class LogoOption(BaseModel):
+    option_id: str
+    image_url: str
+    thumbnail_url: Optional[str] = None
+    prompt_used: Optional[str] = None
+    seed: Optional[int] = None
+    quality_flags: List[str] = Field(default_factory=list)
+
+class GenerateLogoOutput(BaseModel):
+    options: List[LogoOption]
+    guideline: DesignGuideline
+    assumptions: List[Assumption] = Field(default_factory=list)
+
+class EditLogoInput(BaseModel):
+    session_id: str
+    selected_option_id: str
+    selected_image_url: str
+    guideline: DesignGuideline
+    edit_prompt: str
+
+class EditLogoOutput(BaseModel):
+    updated_image_url: str
+    edit_summary: str
+    preserved_elements: List[str] = Field(default_factory=list)
 ```
 
-## 4. Luồng trải nghiệm & Drafting Pattern (User Flow)
+## 4.2 Stream Envelope (BE -> FE)
 
-**Trải nghiệm Drafting Pattern (có điều kiện):** Hệ thống chỉ gọi 4 ảnh Draft khi yêu cầu còn mơ hồ và có nhiều hướng diễn giải. Nếu prompt đã chi tiết (ví dụ chỉ rõ form, màu, font), hệ thống bỏ qua Draft và đi thẳng sang render HQ. Nếu thiếu thông tin đầu vào, agent sẽ hỏi Clarification trước. Nếu user không phản hồi ở bước chọn hướng, hệ thống tự chọn phương án mặc định #1 
-
-**Sau khi render xong (trước bước Edit)**: dưới màn hình sẽ xuất hiện các **Quick action buttons (Nút thao tác nhanh)** như "Thử bản đen trắng", "Đổi font chữ hiện đại hơn"... để gợi ý người dùng tiếp tục khám phá mà không cần tự gõ prompt.
-
-```mermaid
-sequenceDiagram
-    actor U as User
-    participant P as Planner (DAG)
-    participant Draft as Fast Model (SDXL/Flux)
-    participant R as Router Node
-    participant HQ as HQ Models (Parallel)
-
-    U->>P: "Tạo logo ..." (+ Upload Image)
-   alt Thiếu thông tin
-      P-->>U: Clarification Question (hỏi bổ sung)
-      U->>P: Bổ sung hoặc Skip
-   end
-
-   P->>P: Vision bóc tách Style + Text Context
-
-   alt Prompt đã đủ chi tiết
-      Note over P,R: Skip Draft và đi thẳng render HQ
-      P->>R: Gửi Design Direction đã xác định
-   else Prompt còn mơ hồ
-      P->>Draft: Gọi API chớp nhoáng tạo 4 ảnh Draft
-      Draft-->>U: Trả về UI 4 Concept (Text + Thumbnail Image)
-
-      alt User chọn Concept
-         U->>R: Chọn Concept cụ thể
-      else User không phản hồi (timeout/skip)
-         Note over U,R: Auto-select Draft #1 (default)
-      end
-   end
-
-    Note over R: LLM đánh giá Text/Style Quyết định API
-    R->>HQ: Kích hoạt Lệnh song song (Concurrency)
-    HQ-->>U: Hiển thị So sánh Đa phong cách HQ
-    HQ-->>U: Trình bày Quick Action Buttons ("Thử bản đen trắng", "Đổi font...")
+```python
+class StreamEnvelope(BaseModel):
+    request_id: str
+    session_id: str
+    task_type: Literal["analyze", "generate", "edit"]
+    status: Literal["processing", "completed", "failed"]
+    chunk_type: Literal[
+        "reasoning", "guideline", "image_option", "edit_result", "warning", "error", "done"
+    ]
+    sequence: int
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 ```
 
-## 5. Reasoning & Inference Engine 
+## 4.3 API Integration Points
 
-Lớp này xử lý suy luận trước khi Router gọi model ảnh. Trọng tâm là biến yêu cầu thô thành Design Direction có giải thích rõ ràng.
+### External APIs được gọi ở đâu
 
-1. **Input Understanding:** Bóc tách có cấu trúc các trường: Brand Name, Industry, Core Values, Target Audience, Constraints.
-2. **Image Reference Analysis:** Nếu có ảnh tham khảo, Vision model trích xuất style cues (shape language, palette, typography, density).
-3. **Style Mapping:** Ánh xạ ngữ cảnh sang quy tắc ngành (ví dụ `Tech -> Minimalist/Geometric`, `F&B -> Warm/Vintage`) và xử lý xung đột ưu tiên.
-4. **Reference Exploration:** Gọi Web/Image Search để lấy tín hiệu xu hướng và đối sánh visual.
-5. **Streaming UX:** Toàn bộ các bước reasoning trên được stream real-time xuống UI qua `AIHubStreamService` (Input Understanding -> Image Analysis -> Style Inference -> Reference Exploration).
+- LLM API:
+  - Gọi trong `AnalyzeDesignTask` và `GenerateGuidelineTask`.
+  - Mục đích: trích context, suy luận style, tạo guideline có cấu trúc.
+- Image Generation API:
+  - Gọi trong `GenerateLogoTask` với prompt được dựng từ guideline.
+  - Sinh batch 3-4 options hoặc loop từng option.
+- Image Edit API:
+  - Gọi trong `EditLogoTask` với selected image + edit prompt + guideline context.
 
-## 6. Core Logic: LLM Router Node
-Dùng AI (Claude) làm "bộ não" đọc yêu cầu thiết kế và tự quyết định gọi API nào. Nhờ kiến trúc hỗ trợ **Xử lý Song song (Concurrency)**, Router có thể gởi lệnh tới 2 model cùng 1 lúc và trả kết quả side-by-side (VD: "Để xem cùng 1 prompt DALL-E 3 và Imagen vẽ khác nhau ra sao").
+### I/O cụ thể theo endpoint
 
-### Routing Rules cho LLM:
-1. **Rule 1 (Text Accuracy):** Nếu prompt yêu cầu có chữ cụ thể trong logo (VD: "Logo có chữ NovaAI").
-   
-   **Target Cụm Model:** DALL-E 3 hoặc Ideogram.
-   
-   *(Lý do: Khả năng render text của 2 model này là đỉnh nhất. Ideogram còn tỏ ra vượt trội ở mảng thiết kế, tính nhất quán. Cấu trúc học Text Encoder của các model này có khả năng hiểu được "hình dáng" của từng ký tự N, o, v, a, A, I được cấu thành như thế nào kế bên mặt ngữ nghĩa của từ).*
-2. **Rule 2 (Abstract/Artistic):** Nếu yêu cầu là khối biểu tượng trừu tượng, họa phẩm nghệ thuật hoặc photorealistic.
-   
-   **Target Cụm Model:** Midjourney API hoặc Imagen.
-   
-   *(Lý do: Cụm Model này mang tư duy hội họa sáng tạo nghệ thuật mảng miếng cực tốt với độ thẩm mỹ vô đối. Imagen sinh màu sắc rực rỡ sắc nét).*
-3. **Rule 3 (Touch Edit/Inpainting):** Nếu user đang ở bước Edit muốn sửa 1 chi tiết cục bộ.
-   
-   **Target Cụm Model:** Stable Diffusion Inpainting API.
+- `POST /internal/v1/tasks/stream` với task `logo_generate`
+  - Input:
+    - `query`
+    - `session_id`
+    - optional: `brand_context_hint`, `variation_count`
+  - Output stream:
+    - reasoning chunks
+    - guideline chunk
+    - 3-4 image_option chunks
+    - done chunk
 
-## 7. Chức năng Touch Edit (Smart Region Inpainting)
+- `POST /internal/v1/tasks/stream` với task `logo_edit`
+  - Input:
+    - `session_id`
+    - `selected_option_id`, `selected_image_url`
+    - `edit_prompt`
+    - `guideline`
+  - Output stream:
+    - reasoning/edit-interpreting chunk
+    - edit_result chunk
+    - done chunk
 
-Để đem lại trải nghiệm mượt mà, hệ thống sẽ kết hợp 2 lớp mô hình AI cho tính năng Edit, khắc phục triệt để lỗ hổng "phải vẽ lại cả bức" như Genspark:
+- Optional fallback async:
+  - `POST /internal/v1/tasks/submit`
+  - `GET /internal/v1/tasks/{task_id}/status`
 
-1. **Auto-Segmentation (Lớp Frontend/Edge):**
-   Giao diện Canvas tích hợp công cụ **Smart Mark** hoạt động dựa trên các mô hình bóc tách đối tượng (như *SAM - Segment Anything Model*). User chỉ cần thao tác **Click** vào một đối tượng (icon cánh chim, dải màu, text), AI sẽ tự động khoanh vùng viền chính xác (*Pixel-perfect Mask*) và gắn nhãn (*Tagging*) đối tượng đó vào khung parameter chat. 
-   *(Hỗ trợ fallback: Trường hợp hình phức tạp model bắt sai viền, user có thể tự dùng công cụ Brush để tô thủ công vùng cần chọn).*
+### Error I/O chuẩn hoá
 
-2. **Inpainting API (Lớp Backend):**
-   Khi user bấm gửi lệnh Edit (VD: "Đổi cánh chim thành màu đỏ"), Backend sẽ nhận cụm 3 parameter (payloads):
-   - **Source Image** (Ảnh nguyên gốc).
-   - **Binary Mask** (Lớp mặt nạ trắng/đen tạo ra từ Frontend).
-   - **Text Prompt** (Câu lệnh sửa).
-   
-   Router Node lập tức đẩy thông tin cho Model Inpainting chuyên biệt (Stable Diffusion Inpainting) bắt tay xử lý, render lại ĐÚNG khu vực Mask trong khi giữ nguyên 100% các chi tiết bên ngoài viền.
+Mọi lỗi phải trả về:
 
-## 8. Các tính năng Đề xuất Mở rộng (So với Spec ban đầu)
+- `error_code`
+- `message`
+- `retryable` (true/false)
+- `suggested_action`
 
-Để mang lại luồng trải nghiệm tốt hơn Genspark/Lovart, kiến trúc trên đã bổ sung một số tính năng mở rộng **không có trong POC Spec gốc**, bao gồm:
+Ví dụ lỗi:
 
-1. **Drafting Pattern (Sinh ảnh nháp siêu tốc):** Spec gốc chỉ nói về việc đề xuất hướng đi, nhưng thực tế user không thể đọc text mà tưởng tượng ra hình. Giải pháp dùng SDXL/Flux tạo Thumbnail Preview là thiết kế thêm để cứu vãn UX.
-2. **Concurrency / Side-by-side Rendering:** Spec gốc không nhắc đến việc đánh giá năng lực các model. Ở đây kiến trúc router có hỗ trợ gọi song song nhiều API (VD: *DALL-E 3 vs Imagen*) để cung cấp cơ chế A/B testing trực quan cho designer.
-3. **Smart Mark / Móc nối Inpainting:** Spec có nhắc việc sửa chữa nhưng không đặc tả kỹ thuật. Kiến trúc bổ sung quy trình 2 lớp: Frontend dùng SAM (Segment Anything) tự động bắt viền (Pixel-perfect mask), Backend dùng Stable Diffusion Inpainting để chỉ render đúng điểm chọn, tránh hiện tượng sinh mới hoàn toàn.
-4. **Interactive Quick Actions:** Hệ thống chủ động sinh các nút thao tác nhanh (Quick Action Buttons) dưới mỗi Output vừa Generate xong. Các nút này dựa trên Context và Visual output để gợi ý user thao tác khám phá nhanh (VD: "Đổi màu đen trắng", "Sử dụng font hiện đại") thay vì ép user phải type chay trong text box (điểm cả Genspark & Lovart đều đang thiếu).
+- `MODEL_TIMEOUT`
+- `INVALID_EDIT_PROMPT`
+- `IMAGE_PROVIDER_UNAVAILABLE`
+- `VALIDATION_ERROR`
+
+---
+
+## 5. Risks & Open Issues
+
+### 5.1 Latency
+
+Rủi ro:
+
+- Tạo 3-4 ảnh có thể vượt target p95 25s nếu model chậm hoặc queue dài.
+
+Giảm thiểu:
+
+- Stream reasoning sớm để FE hiển thị tiến trình.
+- Parallel hóa generate options khi provider hỗ trợ.
+- Timeout + retry 1 lần có backoff.
+- Fallback giảm từ 4 xuống 3 options khi gần timeout budget.
+
+### 5.2 Generation Quality
+
+Rủi ro:
+
+- Output không bám guideline hoặc có artifacts (text rác, pixelation).
+
+Giảm thiểu:
+
+- QualityCheckTool kiểm tra tiêu chí tối thiểu của spec.
+- Prompt template chuẩn hóa theo guideline-first pattern.
+- Trả warning rõ nếu output đạt chưa đầy đủ và gợi ý edit tiếp.
+
+### 5.3 Cost
+
+Rủi ro:
+
+- Chi phí tăng nhanh do 2 tầng model (LLM + image) và loop edit.
+
+Giảm thiểu:
+
+- Ghi usage/cost theo request_id, session_id.
+- Giới hạn mặc định vòng edit trong POC.
+- Cache reasoning/guideline trong session để tránh regenerate không cần thiết.
+
+### 5.4 Open Technical Decisions
+
+- Dùng REST stream NDJSON hay gRPC stream làm kênh chính cho FE production?
+- Chính sách lưu ảnh: object storage nội bộ, TTL bao lâu, có cần signed URL rotate không?
+- Có cần deterministic seed strategy cho tái tạo gần giống khi edit nhiều vòng?
+- Mức độ strict của quality gate: hard fail hay soft warning trong POC?
+- Session state lưu toàn bộ ở Redis hay giữ ephemeral trong worker memory?
+
+---
+
+## 6. Proposed Implementation Plan (4 tuần)
+
+### Week 1
+
+- Chốt schema + stream envelope contract với FE.
+- Dựng `AnalyzeDesignTask` + `GenerateGuidelineTask`.
+- Tích hợp prompt provider và telemetry cơ bản.
+
+### Week 2
+
+- Dựng `GenerateLogoTask` + adapter image model.
+- Trả 3-4 options qua stream, có sequence ordering.
+- Bổ sung quality checks mức cơ bản.
+
+### Week 3
+
+- Dựng `EditLogoTask` + edit summary.
+- Chốt FE flow: select option -> edit -> replace preview in place.
+- Chuẩn hóa error mapping + retry guidance.
+
+### Week 4
+
+- E2E validation theo FR/NFR/SC.
+- Tuning latency/cost và hardening logging/observability.
+- Freeze POC release notes + backlog Phase 2.
+
+---
+
+## 7. Definition of Done (POC)
+
+- Đạt các success metrics chính của spec.
+- FE nhận stream ổn định theo contract chunk_type.
+- Flow đầy đủ chạy pass: query -> reasoning/guideline -> 3-4 logos -> select -> edit -> updated image.
+- Lỗi chính đều có actionable retry response.
+- Kiến trúc task/tool/model có thể mở rộng mà không cần build rule engine cứng.
