@@ -55,56 +55,152 @@ Muc tieu nghiep vu:
 
 ## 3. System Architecture
 
-### 3.1 Agent pipeline
+### 3.1 Architecture principles (BE-first, reuse-friendly)
 
-1. Intent Gate
-   - Xac dinh request co phai logo design khong.
-2. Input Analysis
-   - Trich xuat brand context tu text va optional image reference.
-3. Clarification Gate
-   - Neu thieu thong tin: hoi clarification.
-   - Neu user skip: tao assumptions co giai thich.
-4. Planning & Reasoning
-   - Agent lap ke hoach generation va stream reasoning cho FE.
-5. Guideline Synthesis
-   - Tao design guideline co cau truc (style, color, typography, icon, constraints).
-6. Logo Generation
-   - Goi image provider de tao 3-4 options.
-7. Selection & Editing
-   - User chon 1 option -> gui edit prompt.
-8. Regeneration
-   - Goi image edit provider -> tra updated image + edit summary.
-9. Follow-up Suggestions
-   - Tra quick actions de user tiep tuc refine.
+- Task-first:
+  - Moi buoc nghiep vu la mot task doc lap (`logo_analyze`, `logo_generate`, `logo_edit`).
+  - Task expose qua `task_type`, khong hardcode theo endpoint rieng.
+- Schema-first:
+  - Input/output duoc rang buoc bang Pydantic.
+  - Them input moi = them field schema + xu ly trong task, khong can viet lai flow core.
+- Stream-first:
+  - Dung `POST /internal/v1/tasks/stream` cho UX thoi gian thuc.
+  - FE doc theo chunk contract, khong can biet logic noi bo.
+- Tool abstraction:
+  - Agent chi goi tools qua interface (local tool/MCP tool).
+  - Doi provider (image API/vision API) ma khong doi pipeline.
 
-### 3.2 Logical components
+### 3.2 Runtime components mapped to ai-hub-sdk
 
-- Communication Layer
-  - REST/gRPC gateway cua ai-hub-sdk.
-  - Stream endpoint la default.
-- Orchestrator
-  - Quan ly state theo request/session.
-  - Dieu phoi task va tool calls.
-  - Dam bao thu tu chunk theo sequence.
-- Task Layer
-  - logo_analyze
-  - logo_generate
-  - logo_edit
+- Communication Service
+  - Nhan request qua REST/gRPC gateway.
+  - Route theo `task_type` + `input_args`.
+- Task Execution Layer
+  - `BaseTask` + `TaskInputBaseModel` + `TaskOutputBaseModel`.
+  - `ServingMode.STREAM` cho logo pipeline.
+- Agent Layer
+  - `Agent` + `Orchestrator` cho planning/reasoning va tool-calling.
 - Tool Layer
-  - BrandContextTool
-  - ImageReferenceAnalysisTool (optional in POC path)
-  - GuidelineBuilderTool
-  - ImageGenerationTool
-  - ImageEditTool
-  - FollowUpSuggestionTool
-- Model Layer
-  - LLM cho planning/reasoning/guideline.
-  - Single image model cho generation/edit.
-- Infra/Observability
-  - Object storage/CDN cho image output.
-  - Tracing + latency/cost logging.
+  - Function tools va MCP tools (HTTP/SSE, retry, timeout, tool filter).
+- Integration Layer
+  - LLM API, Vision API (optional), Image Generation/Edit API.
+- Storage/Observability
+  - Object storage/CDN cho image URL.
+  - Metadata usage/latency/cost cho monitoring.
 
-### 3.3 Sequence diagram
+### 3.3 End-to-end pipeline with contracts (BE owns what)
+
+Stage A - Analyze:
+
+- Input: `LogoGenerateInput` (query, references, session_id).
+- BE xu ly:
+  - intent detection
+  - context extraction
+  - clarification decision
+  - assumptions (neu skip clarification)
+- Output chunks:
+  - `clarification` (optional)
+  - `reasoning`
+  - `guideline`
+
+Stage B - Generate:
+
+- Input: guideline + generation params.
+- BE xu ly:
+  - build prompt tu guideline
+  - call image generation provider 3-4 lan (hoac batch)
+  - upload to storage
+  - attach metadata (`seed`, `quality_flags`, timing)
+- Output chunks:
+  - `image_option` x 3-4
+  - `suggestion`
+  - `done`
+
+Stage C - Edit:
+
+- Input: `LogoEditInput` (selected image, edit prompt, guideline).
+- BE xu ly:
+  - parse edit intent
+  - call image edit provider
+  - upload updated image
+  - generate edit summary
+- Output chunks:
+  - `reasoning`
+  - `edit_result`
+  - `suggestion`
+  - `done`
+
+### 3.4 FE handoff contract (de FE chi can add input)
+
+FE can implementation theo 3 nguyen tac:
+
+- Gui dung `task_type` + `input_args` theo schema.
+- Render theo `chunk_type` cua `StreamEnvelope`.
+- Dung `sequence` de dam bao thu tu hien thi.
+
+FE khong can biet:
+
+- Prompt noi bo.
+- Tool routing.
+- Provider cu the nao dang duoc goi.
+
+FE can lam tiep:
+
+1. Form generate:
+   - query, optional references, variation_count.
+2. Stream renderer:
+   - clarification/reasoning/guideline/image_option/suggestion/done.
+3. Gallery + select option:
+   - luu `selected_option_id` + `selected_image_url`.
+4. Edit form:
+   - edit_prompt + selected option.
+5. Error handling:
+   - render `error` chunk voi `retry guidance`.
+
+### 3.5 Orchestrator execution blueprint (pseudo-flow)
+
+```text
+on_stream_request(task_type, input_args):
+  validate_schema(task_type, input_args)
+  init_request_context(request_id, session_id)
+
+  if task_type == logo_generate:
+    run logo_analyze
+      -> emit clarification/reasoning/guideline chunks
+    run logo_generate
+      -> emit image_option chunks
+      -> emit suggestion + done
+
+  if task_type == logo_edit:
+    run logo_edit
+      -> emit reasoning
+      -> emit edit_result
+      -> emit suggestion + done
+
+  on_error:
+    map_exception_to_error_code
+    emit error chunk (retryable + suggested_action)
+```
+
+### 3.6 Reuse and extensibility (khong hard rule)
+
+Mo rong them use case moi ma khong pha vo core:
+
+- Them output style moi:
+  - them field trong guideline/schema, khong doi endpoint contract.
+- Them provider moi:
+  - thay adapter trong `ImageGenerationTool`/`ImageEditTool`.
+- Them logic moi:
+  - tao task moi (vi du `logo_variation_regenerate`) va dang ky `task_type` moi.
+- Them external capability:
+  - gan MCP tool moi, co `tool_filter` de gioi han quyen.
+
+Nguyen tac de tranh rule cung:
+
+- Rule nghiep vu nam trong schema + prompt template + tool adapter config.
+- Khong embed if/else theo project-specific logic vao communication layer.
+
+### 3.7 Sequence diagram
 
 ```mermaid
 sequenceDiagram
