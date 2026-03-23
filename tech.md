@@ -51,92 +51,148 @@ Target mindset for this document:
 
 ## 3. System Architecture (Most Important)
 
-### 3.1 Backend-first pipeline (1 main API)
+### 3.1 BE-first architecture that FE can read and integrate quickly
 
-Primary contract from FE perspective:
-- Input: `query` (+ optional fields such as reference image URL, brand hints, style hints, edit intent).
-- Output: image set (initial or edited), with reasoning and task metadata.
+Goal of this architecture is not to force FE into a rigid state machine. Instead, FE sends one request shape, and only adds optional fields when needed.
 
-Recommended external endpoint:
+FE-facing contract:
+- Input: `query` plus optional context/edit fields.
+- Output: accepted task envelope first, then final image outputs through status API (or webhook).
+
+Core endpoint:
 - `POST /api/logo/generate`
 
-This endpoint is orchestration-first: it can start from scratch or continue a previous iteration depending on optional context fields.
+Operational endpoints around it:
+- `GET /api/logo/tasks/{task_id}` for async status/result.
+- `GET /api/logo/streams/{stream_id}` (or SSE/NDJSON bridge) for reasoning chunks.
 
 ```mermaid
 flowchart LR
     FE[FE Client] --> API[POST /api/logo/generate]
-    API --> Sync[SYNC: intent/context parser]
-    API --> Stream[STREAM: reasoning blocks]
-    API --> AsyncGen[ASYNC: image generation]
-    API --> AsyncEdit[ASYNC: image edit regenerate]
+    API --> Router{Request Mode Router}
 
-    AsyncGen --> Worker[Worker Pool]
+    Router -->|Generate Mode| SyncNormalize[SYNC normalize/intent]
+    Router -->|Edit Mode| SyncEditValidate[SYNC edit validation]
+
+    SyncNormalize --> StreamReasoning[STREAM reasoning]
+    StreamReasoning --> AsyncGenerate[ASYNC submit generation]
+
+    SyncEditValidate --> AsyncEdit[ASYNC submit edit]
+
+    AsyncGenerate --> Worker[Worker Pool]
     AsyncEdit --> Worker
-    Worker --> Redis[(Task Status/Result Store)]
-    Worker --> MCPGen[MCP: Image Generation Provider]
-    Worker --> MCPVision[MCP: Vision Analysis]
-    Worker --> MCPSearch[MCP: Reference Search]
-    Worker --> Webhook[Optional Callback]
+
+    Worker --> Redis[(Task status/result)]
+    Worker --> MCPGen[MCP image generation]
+    Worker --> MCPVision[MCP vision analysis]
+    Worker --> MCPSearch[MCP web/image search]
+    Worker --> Webhook[Optional webhook callback]
 
     Redis --> API
     Webhook --> API
     API --> FE
 ```
 
-### 3.2 Why this architecture fits ai-hub-sdk
+### 3.2 Why FE and BE can both understand this doc
 
-Based on SDK docs:
-- Sync API is best for quick checks and immediate decisions.
-- Stream API is best for progressive output and visibility to users.
-- Async API is best for tasks >30s and worker scaling with Pub/Sub + Redis status.
+FE reads:
+- One entry endpoint.
+- Which fields to add when switching from initial generation to edit.
+- Where to get reasoning and where to get final result.
 
-This naturally maps logo flow to:
-1. parse intent/context quickly,
-2. stream reasoning,
-3. submit long-running generation/edit,
-4. return result through status polling or webhook.
+BE reads:
+- Router logic and two execution modes.
+- Which steps are SYNC, STREAM, ASYNC.
+- Where each external tool is called and where status/result is persisted.
 
-### 3.3 Internal sub-APIs in handle flow (not FE burden)
+### 3.3 One API for whole flow: is it okay?
 
-Inside backend orchestration, split flow into sub-calls:
+Short answer: yes for POC, with a guardrail.
 
-1) Input Normalization (SYNC)
-- Responsibility: parse raw `query`, resolve missing fields, generate assumptions.
-- Output drives next steps, not rigid state transitions.
+Recommended pattern:
+- Keep one orchestration endpoint for command intake: `POST /api/logo/generate`.
+- Keep separate read endpoints for observability/result retrieval.
 
-2) Reasoning Stream (STREAM)
-- Responsibility: emit explainable reasoning chunks (understanding, style direction, assumptions, constraints).
-- FE can render this timeline while async generation is running.
+Why this is better in POC:
+- FE implementation is simpler: one payload model, optional fields for branch.
+- BE can evolve internals without breaking FE integration.
+- Reuse is easy: adding a new optional input should not force FE endpoint migration.
 
-3) Image Generation (ASYNC)
-- Responsibility: generate 3-4 candidate images from normalized context.
-- Returns task id immediately; result retrieved by polling or callback.
+When one API becomes problematic:
+- Request payload becomes overloaded with too many unrelated concerns.
+- Branch logic becomes hard to validate and hard to reason about.
 
-4) Optional Edit Regeneration (ASYNC)
-- Responsibility: if request includes `selected_image_id + edit_prompt`, regenerate variant from selected output.
-- Keeps same orchestrator endpoint; FE only adds fields.
+Guardrail:
+- Keep explicit `mode` internally (`generate` or `edit`) inferred from fields.
+- Reject ambiguous payloads with clear 4xx errors.
+- Version payload shape before introducing major new branches.
 
-### 3.4 Tool list (MCP-centric)
+### 3.4 Internal handle flow (concrete, step-by-step)
 
-Core external tools to wire:
-- Image generation MCP server (default provider profile).
-- Vision MCP server (reference/style extraction).
-- Web/image search MCP server (optional inspiration retrieval).
-- Optional embedding MCP server (semantic style matching).
+#### A) Generate mode (initial request)
 
-Tooling principle:
-- Keep least-privilege tool exposure with tool filtering.
-- Start from reliable HTTP MCP connections; add SSE only if server requires it.
+```mermaid
+sequenceDiagram
+    participant FE as FE
+    participant API as BE Orchestrator API
+    participant SYNC as SYNC Task
+    participant STREAM as STREAM Task
+    participant ASYNC as ASYNC Task
+    participant STATUS as Task Status Store
 
-### 3.5 Short competitor note (from practical testing direction)
+    FE->>API: POST /api/logo/generate {query, optional context}
+    API->>SYNC: normalize + intent check
+    SYNC-->>API: normalized_context + assumptions
+    API->>STREAM: start reasoning stream
+    STREAM-->>FE: reasoning chunks (understanding/style/constraints)
+    API->>ASYNC: submit generation task
+    ASYNC-->>STATUS: pending/processing/completed/failed + result
+    API-->>FE: accepted {request_id, stream_id, generation_task_id}
+    FE->>API: GET /api/logo/tasks/{task_id}
+    API-->>FE: completed {images, metadata, assumptions}
+```
 
-In lightweight internal comparison style (POC-level):
-- DALL-E style providers: generally stable prompt adherence and predictable API UX.
-- Ideogram-style providers: often stronger logo/text rendering consistency in some branding cases.
-- Midjourney-like stacks: can be visually strong but integration/control overhead is typically higher for strict product flows.
+#### B) Edit mode (continue from selected image)
+
+```mermaid
+sequenceDiagram
+    participant FE as FE
+    participant API as BE Orchestrator API
+    participant SYNC as SYNC Validation
+    participant ASYNC as ASYNC Edit Task
+    participant STATUS as Task Status Store
+
+    FE->>API: POST /api/logo/generate {query, selected_image_id, edit_prompt}
+    API->>SYNC: validate edit input + resolve source image context
+    SYNC-->>API: edit-ready context
+    API->>ASYNC: submit edit regeneration
+    ASYNC-->>STATUS: pending/processing/completed/failed + result
+    API-->>FE: accepted {request_id, generation_task_id}
+    FE->>API: GET /api/logo/tasks/{task_id}
+    API-->>FE: completed {images:[edited_image], metadata}
+```
+
+### 3.5 Tool execution map (inside BE)
+
+| Step | Tool/API | Called by | Purpose |
+|---|---|---|---|
+| Normalize/intent | ai-hub SYNC (`/compute`) | Orchestrator | Parse `query`, build normalized context, assumptions |
+| Reasoning | ai-hub STREAM (`/stream`) | Orchestrator | Emit progressive reasoning chunks for FE visibility |
+| Generate | ai-hub ASYNC (`/submit`) + MCP image tool | Worker | Generate 3-4 outputs |
+| Edit | ai-hub ASYNC (`/submit`) + MCP image tool | Worker | Regenerate selected image with edit prompt |
+| Optional enrich | MCP vision/search | Worker | Analyze reference image, pull inspiration context |
+| Status/result | Redis task status | Worker + API | Persist and expose task lifecycle/results |
+
+### 3.6 Short competitor note (practical direction)
+
+- DALL-E style providers: stable prompt adherence, integration-friendly in product flow.
+- Ideogram-style providers: strong logo/text consistency in branding cases.
+- Midjourney-like stacks: strong visual output, but often higher orchestration overhead.
 
 POC recommendation:
-- Keep one default provider profile first, log outputs and failure modes, then decide router design in next phase.
+- Start single provider profile.
+- Collect logs/quality/cost metrics.
+- Decide provider routing only after evidence.
 
 ---
 
@@ -144,10 +200,23 @@ POC recommendation:
 
 Below are flexible Pydantic frames for each step. These are scaffolds, not rigid workflow locks.
 
+### 4.0 Payload contract policy (important for FE collaboration)
+
+- FE always sends one base model (`GenerateLogoRequest`).
+- BE infers mode from optional fields.
+- No forced client state enum is required.
+
+Mode inference rule:
+- `edit mode` when both `selected_image_id` and `edit_prompt` are present.
+- `generate mode` otherwise.
+
+Validation rule:
+- If only one of (`selected_image_id`, `edit_prompt`) is provided, return 422 with actionable message.
+
 ### 4.1 Main request/response (FE-facing)
 
 ```python
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from pydantic import BaseModel, Field, HttpUrl
 
 
@@ -170,6 +239,13 @@ class GenerateLogoRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class ApiError(BaseModel):
+    code: str
+    message: str
+    retryable: bool = False
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
 class GeneratedImage(BaseModel):
     image_id: str
     image_url: HttpUrl
@@ -181,12 +257,13 @@ class GeneratedImage(BaseModel):
 
 class GenerateLogoResponse(BaseModel):
     request_id: str
-    status: str  # accepted | processing | completed | failed
+    mode: Literal["generate", "edit"]
+    status: Literal["accepted", "processing", "completed", "failed"]
     reasoning_stream_id: Optional[str] = None
     generation_task_id: Optional[str] = None
     images: List[GeneratedImage] = Field(default_factory=list)
     assumptions: List[str] = Field(default_factory=list)
-    error: Optional[str] = None
+    error: Optional[ApiError] = None
 ```
 
 ### 4.2 Sub-flow schemas (internal orchestration)
@@ -224,6 +301,7 @@ class GenerationInput(BaseModel):
 class GenerationOutput(BaseModel):
     images: List[GeneratedImage] = Field(default_factory=list)
     quality_notes: List[str] = Field(default_factory=list)
+    usage: Dict[str, Any] = Field(default_factory=dict)
 
 
 class EditInput(BaseModel):
@@ -235,9 +313,27 @@ class EditInput(BaseModel):
 class EditOutput(BaseModel):
     image: GeneratedImage
     edit_notes: List[str] = Field(default_factory=list)
+
+
+class HandleFlowEnvelope(BaseModel):
+    mode: Literal["generate", "edit"]
+    normalized_context: Dict[str, Any] = Field(default_factory=dict)
+    assumptions: List[str] = Field(default_factory=list)
+    stream_id: Optional[str] = None
+    task_id: Optional[str] = None
 ```
 
-### 4.3 Where external APIs are called
+### 4.3 API into handle flow (input/output per phase)
+
+| Handle phase | Input model | Output model | Sync/Stream/Async |
+|---|---|---|---|
+| Parse + normalize | `IntentCheckInput` | `IntentCheckOutput` | SYNC |
+| Start reasoning | normalized context + assumptions | `ReasoningChunk` stream | STREAM |
+| Submit generation | `GenerationInput` | task id + eventual `GenerationOutput` | ASYNC |
+| Submit edit | `EditInput` | task id + eventual `EditOutput` | ASYNC |
+| Build API response | `HandleFlowEnvelope` + task result | `GenerateLogoResponse` | API layer |
+
+### 4.4 Where external APIs are called
 
 1. Intent check (SYNC)
 - Call: ai-hub-sdk compute endpoint or AIHubSyncService.
@@ -252,18 +348,19 @@ class EditOutput(BaseModel):
 - Worker calls MCP tools for generation/vision/search.
 - Result retrieval: task status API and optional webhook callback.
 
-### 4.4 Suggested API set around main endpoint
+### 4.5 Suggested FE-facing API set (POC)
 
 - `POST /api/logo/generate`
-  - One entrypoint for both initial generate and optional edit continuation.
+    - Single command endpoint for both initial generate and optional edit continuation.
+    - Returns `accepted` quickly with `task_id` and optional `stream_id`.
 
 - `GET /api/logo/tasks/{task_id}`
-  - Proxy task status for FE polling.
+    - Read endpoint for polling task status and final result payload.
 
 - `GET /api/logo/streams/{stream_id}` or SSE channel
-  - Deliver reasoning chunks.
+    - Read endpoint/channel to deliver reasoning chunks.
 
-These support FE collaboration without forcing strict backend state contracts.
+These keep one-command simplicity while preserving clear read channels for FE.
 
 ---
 
