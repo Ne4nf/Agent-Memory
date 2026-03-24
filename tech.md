@@ -27,13 +27,13 @@ Business validation goals:
 
 ### 1.2 Success metrics (POC acceptance targets)
 
-These are committed Phase 1 POC targets for Step 1 -> Step 6 only.
+These are committed Phase 1 POC targets for Step 1 -> Step 6 only (2 required fields: brand_name, industry).
 
+- >= 90% requests extract brand_name and industry from user query.
 - >= 90% requests produce valid `guideline` before image generation starts.
-- >= 90% requests satisfy must-have fields before generation.
 - >= 85% requests return 3-4 valid logo options.
-- p95 job completion time <= 30s.
-- p95 time to first status update (enter processing) <= 5s.
+- p95 job completion time <= 30s (from submit to completed).
+- p95 time to first status update (process → processing) <= 5s.
 - On failure, actionable error and retry hint returned <= 5s.
 
 ### 1.3 Technical constraints
@@ -42,10 +42,11 @@ These are committed Phase 1 POC targets for Step 1 -> Step 6 only.
 - Primary task type for this POC: `logo_generate`.
 - Clarification is strict: generation must not run until required fields are complete.
 - Required fields (mandatory before generation):
-  - `brand_name` (company/product name)
-  - `industry` (business category or context)
-  - At least one `style_preference`
-  - At least one `color_preference`
+  - `brand_name` (company/product name) — ask first if missing
+  - `industry` (business category or context) — ask second if missing
+- Optional fields (clarification skipped if not provided):
+  - `style_preference` (e.g., minimalist, modern, playful)
+  - `color_preference` (e.g., blue, grayscale, vibrant)
 - Single job submission: input all parameters at once, receive full output (guideline + option URLs) on completion.
 - Session scope is per `session_id` with optional short-term memory reuse across multiple job submissions.
 - No separate rule engine; behavior is schema-driven + prompt-driven + tool-adapter driven.
@@ -89,15 +90,14 @@ Key reasons:
 
 ```mermaid
 flowchart TD
-    A[User Submit Job] --> B[Step 1: IntentDetectTool]
-    B --> C[Step 2: InputExtractionTool + ReferenceImageAnalyzeTool]
-    C --> D[RequiredFieldGateTool]
-    D -->|Missing required fields| E[ClarificationLoopTool]
-    E --> D
-    D -->|All required fields complete| F[Step 4: DesignInferenceTool]
-    F --> G[Step 6: LogoGenerationTool]
-    G --> H[StorageTool]
-    H --> I[Job Result Ready]
+  A[User Submit Job] --> B[Step 1: IntentDetectTool]
+  B --> C[Step 2: InputExtractionTool + ReferenceImageAnalyzeTool]
+  C -->|brand_name AND industry both present?| F[Step 4: DesignInferenceTool]
+  C -->|Missing brand_name or industry| E[ClarificationLoopTool]
+  E -->|Fields clarified| F
+  F --> G[Step 6: LogoGenerationTool]
+  G --> H[StorageTool]
+  H --> I[Job Result Ready]
 ```
 
 #### 3.1.3 Diagram 2 - System components (layered)
@@ -148,10 +148,9 @@ graph TB
 | Component or Tool | Spec step | Role | Model Type | Notes |
 | :--- | :--- | :--- | :--- | :--- |
 | IntentDetectTool | Step 1 | Detect logo design intent and route flow | Low-latency text LLM | Deterministic classifier |
-| InputExtractionTool | Step 2 | Extract brand_name, industry, style, color, symbol from text | Text LLM with structured output | Returns structured JSON |
+| InputExtractionTool | Step 2 | Extract brand_name, industry, style, color, symbol from text | Text LLM with structured output | Returns structured JSON (style/color optional) |
 | ReferenceImageAnalyzeTool | Step 2 | Analyze reference image style/color/typography/iconography | Multimodal LLM | Optional when references provided |
-| RequiredFieldGateTool | Step 3 | Validate required fields completeness (brand_name, industry, style_preference, color_preference) | Deterministic validator | Signals missing fields or gate pass |
-| ClarificationLoopTool | Step 3 | Ask targeted questions only for missing required fields; prioritize brand_name + industry | Text LLM for question generation | Loop until gate passes or max rounds reached |
+| ClarificationLoopTool | Step 3 | Ask targeted questions for missing required fields (brand_name, industry only); auto-detect as optional | Text LLM for question generation | Loop until brand_name AND industry present or max rounds reached |
 | DesignInferenceTool | Step 4 | Infer final guideline from completed context | Text LLM for design reasoning | Returns guideline JSON |
 | LogoGenerationTool | Step 6 | Generate 3-4 logo options | Fast image generation model | Throughput-optimized |
 | StorageTool | Shared | Upload images and return URLs | Cloud storage API | Used by generation |
@@ -195,13 +194,12 @@ sequenceDiagram
         WORKER->>LLM: intent detect + extraction + image analysis
         LLM-->>WORKER: structured brand context fields
         
-        loop until required fields complete
-            WORKER->>WORKER: check RequiredFieldGateTool
-            alt missing required fields (ask brand_name, industry first)
-                WORKER->>LLM: generate clarification questions internally
-                LLM-->>WORKER: questions + defaults
-                Note over WORKER: In POC: use defaults or return error if max rounds exceeded
-            else all required fields complete
+loop until brand_name AND industry both present
+        alt missing brand_name or industry
+            WORKER->>LLM: generate clarification questions for missing fields
+            LLM-->>WORKER: questions or defaults
+            Note over WORKER: If max rounds exceeded: return error with missing fields
+        else brand_name AND industry present
                 WORKER->>CTX: persist completed required fields
             end
         end
@@ -225,10 +223,10 @@ sequenceDiagram
 
 | Item | Detail |
 | :--- | :--- |
-| Input | `LogoGenerateInput` (query, references, session_id, allow_defaults) |
-| Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, RequiredFieldGateTool, ClarificationLoopTool |
-| Output | Structured fields JSON (after clarification completes) |
-| Gate | Must pass required-field gate before Step 4 |
+| Input | `LogoGenerateInput` (query, references, session_id) |
+| Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationLoopTool |
+| Output | Structured fields JSON with brand_name + industry guaranteed |
+| Gate | brand_name AND industry must both be present before Step 4 |
 | Target | Complete within first 10s of job start |
 
 #### 3.4.3 Stage B - Request analysis and guideline inference (Step 4)
@@ -266,11 +264,10 @@ Why this is simple for POC:
 
 Note on clarification in async mode:
 
-- Clarification questions are processed server-side, not returned to FE as interactive chunks.
-- If required fields are missing after extraction, the system can either:
-  - Apply default assumptions and continue (if `allow_defaults=true`)
-  - Return a clarification error with missing field list and retry hint
-- For POC, recommend: clarify-then-default for brand_name/industry, return error if style_preference or color_preference are fully missing.
+- Clarification for required fields (brand_name, industry) is processed server-side.
+- If brand_name or industry is still missing after max rounds, job returns error with missing field list.
+- If brand_name and industry are present, job skips clarification and proceeds to guideline generation.
+- Optional fields (style_preference, color_preference) are inferred from query or defaults; no clarification for these.
 
 #### 3.4.6 Session context and tool swap contract
 
@@ -281,10 +278,9 @@ Design rule:
 Mandatory context handoff on every tool call:
 
 - `session_id`
-- `required_field_state` (missing keys, rounds, passed/not)
+- `required_field_state` (brand_name, industry, passed/not, clarification rounds)
 - latest extracted `BrandContext`
 - latest approved `DesignGuideline` (if available)
-- `allow_defaults` flag
 - `sequence` counter
 
 Implementation notes:
@@ -337,16 +333,14 @@ class ClarificationQuestion(BaseModel):
 
 
 class RequiredFieldState(BaseModel):
+    # Only 2 required fields for POC
     required_keys: List[str] = Field(default_factory=lambda: [
-        "brand_name",      # Company or product name (mandatory)
-        "industry",        # Business category or context (mandatory)
-        "style_preference",  # At least one style preference (mandatory)
-        "color_preference",  # At least one color preference (mandatory)
+        "brand_name",      # Company or product name (MANDATORY)
+        "industry",        # Business category or context (MANDATORY)
     ])
     missing_keys: List[str] = Field(default_factory=list)
     passed: bool = False
     clarification_round: int = 0
-    # Note: clarify brand_name and industry first, then style + color
 
 
 class DesignGuideline(BaseModel):
@@ -371,8 +365,7 @@ class LogoGenerateInput(BaseModel):
     query: str
     references: List[ReferenceImage] = Field(default_factory=list)
     use_session_context: bool = True
-    allow_defaults: bool = False  # If true, auto-fill missing fields with defaults
-    max_clarification_rounds: int = Field(default=3, ge=1, le=5)
+    max_clarification_rounds: int = Field(default=3, ge=1, le=5)  # For brand_name + industry only
     variation_count: int = Field(default=4, ge=3, le=4)
     output_format: Literal["png"] = "png"
     output_size: Literal["1024x1024"] = "1024x1024"
@@ -411,10 +404,9 @@ Validation rules:
 
 - `query` is required and non-empty after trim.
 - `variation_count` must be 3 or 4.
-- Required-field gate must pass before `guideline` and `options` are generated.
+- Required-field gate: brand_name AND industry must both be present before guideline generation.
 - If `use_session_context=true`, backend merges request with stored context for same `session_id`.
-- If `max_clarification_rounds` is reached and required fields still missing, return error with missing key list.
-- If `allow_defaults=true`, missing style_preference and color_preference use template defaults.
+- If `max_clarification_rounds` is reached and brand_name or industry still missing, return error with missing field list.
 
 ### 4.2 External APIs and model selection
 
@@ -439,11 +431,10 @@ Reference docs:
   - Input:
     - `task_type` (required: `logo_generate`)
     - `session_id` (required)
-    - `query` (required: user request)
+    - `query` (required: user request, will be analyzed for brand_name + industry)
     - `references` (optional: list of ReferenceImage)
     - `use_session_context` (optional, default true)
-    - `allow_defaults` (optional, default false)
-    - `max_clarification_rounds` (optional)
+    - `max_clarification_rounds` (optional, default 3, applies to brand_name + industry clarification)
     - `variation_count` (optional, default 4, range 3-4)
     - `output_format` (optional, default "png")
     - `output_size` (optional, default "1024x1024")
@@ -483,12 +474,13 @@ Reference docs:
     {
       "task_id": "uuid",
       "status": "failed",
-      "error": "reason (e.g., 'Required fields missing: style_preference, color_preference after 3 rounds')",
+      "error": "reason (e.g., 'Missing required fields: brand_name, industry after 3 rounds')",
       "retry_after_seconds": 60
     }
     ```
   - Context behavior:
     - if `use_session_context=true`, system merges new query with stored context in same `session_id`
+    - clarification only for brand_name + industry; style/color inferred or defaulted
     - result metadata includes final `required_field_state`
 
 ### 4.4 Model benchmark by vendor (POC-oriented)
@@ -569,14 +561,15 @@ Mitigation:
 
 Risk:
 
-- Default assumptions may not match user intent; max rounds may be too strict or too loose.
+- User intent may not include brand_name or industry explicitly; clarification may take multiple rounds or fail.
 
 Mitigation:
 
-- Ask only for missing required fields.
-- Prioritize brand_name + industry first, then style + color.
+- Extract brand_name and industry early (Step 2) with high-confidence NLP.
+- Ask only for missing brand_name and industry (not style/color which are optional).
+- Prioritize targeted questions (e.g., "What is your company name?" before "What industry?").
 - Cap rounds by `max_clarification_rounds` and return actionable error with missing fields.
-- Provide `allow_defaults=true` option for fast-path use cases.
+- Allow inference from context (e.g., "design a logo for a fintech startup" → industry=fintech).
 
 ### 5.3 Cost
 
@@ -592,9 +585,9 @@ Mitigation:
 
 ### 5.4 Open technical decisions
 
-- Clarification fallback policy: hard fail on missing fields vs `allow_defaults=true` auto-fill with templates.
 - Polling mechanism: simple HTTP polling vs webhook vs Server-Sent Events (SSE) for result notification.
 - Signed URL TTL policy by asset type.
 - Job result retention: how long to keep completed job results available.
 - Session context TTL and reset policy (auto expiry only vs manual reset endpoint).
-- Fine-tune required-field set for production (brand_name + industry mandatory vs optional industry).
+- Default guideline style when `style_preference` is not provided (infer from industry vs hardcoded default).
+- Fallback generation model if primary `gemini-3.1-flash-image-preview` fails mid-stream.
