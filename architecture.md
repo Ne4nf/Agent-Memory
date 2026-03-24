@@ -4,617 +4,355 @@
 
 ### 1.1 POC Objective
 
-This POC builds a backend-driven Logo Design Service using a chat-first workflow:
+This POC builds a backend-driven Logo Design Service with a chat-first workflow:
 
-- **Input**: User query (text, optional image references)
-- **Backend flow**: Detect intent → Analyze inputs → Generate reasoning → Create guideline → Generate 3-4 logo options → Support prompt-based edits
-- **Output**: Image URLs (minimum PNG 1024x1024) + edit summary + design rationale
+- Input: user query (text, optional image references)
+- Backend flow: detect intent -> extract/analyze inputs -> clarification (conditional) -> reasoning/inference -> optional direction selection -> generate 3-4 logo options -> prompt-based edit -> regenerate -> follow-up suggestions
+- Output: image URLs (PNG 1024x1024 minimum), edit summary, and visible reasoning/guideline
 
-**Business validation goals**:
-- Prove users can complete the full loop: request → analyze → guideline → generate → select → edit → regenerate
-- Prove visible reasoning is understandable and useful
-- Prove editing is usable without region-level/pixel-level editing tools
-
-### 1.2 Success Metrics (Commitment to Team)
+### 1.2 Success Metrics (Team Commitments)
 
 | Metric | Target | Validation Method |
 | :--- | :--- | :--- |
-| Guideline generation rate | >= 90% | Requests with usable `guideline` chunk / total requests |
-| Logo option success rate | >= 90% | Requests returning 3-4 valid PNG options / total requests |
-| Session completion rate | >= 85% | Sessions completing full flow without restart / total sessions |
-| Edit quality (concept preservation) | >= 85% | Edit requests preserving core concept while reflecting changes / total edits |
-| **p95 TTFB (reasoning chunk)** | **<= 1.5s** | First `reasoning` chunk latency (validated vs Gemini TTFB ~500ms-1s) |
-| **p95 total generation time** | **<= 25s** | Time from request to final `done` chunk for 3-4 images (validated vs Nano Banana ~8-12s/image × 4) |
-| **Error SLA** | **<= 3s** | Error chunk emission on failure with retryable flag + guidance |
+| Guideline generation rate | >= 90% | Requests with valid guideline chunk / total generate requests |
+| Logo option success rate | >= 90% | Requests returning 3-4 valid PNG URLs / total generate requests |
+| Session completion rate | >= 85% | Sessions completing request -> generate -> edit without restart |
+| Edit quality (concept preservation) | >= 85% | Human review: edit reflects request while preserving concept |
+| p95 time to first reasoning chunk | <= 1.5s | `reasoning` first chunk latency |
+| p95 time to complete 3-4 logos | <= 25s | request start -> final `done` chunk |
+| Error response SLA | <= 3s | failure detection -> `error` chunk emission with actionable guidance |
 
-### 1.3 Technical Constraints
+### 1.3 Constraints
 
-- Single image model in POC (reduces integration risk; upgrade path defined)
-- No hardcoded business rule engine; use schema-driven + prompt-driven behavior
-- Out of scope: touch/region edit, smart mark, pixel-level object editing
-- Session scope: single-session only (no multi-turn memory)
-- Stream API is primary channel (NDJSON over SSE)
-
----
-
-## 2. Session Memory (Context Retention)
-
-### 2.1 When & What to Persist (In-Memory per Session)
-
-During a single `session_id`, the system maintains:
-
-| Context | Storage | Lifetime | Purpose |
-| :--- | :--- | :--- | :--- |
-| `session_id` | Request header | Full session | Correlate requests + enable edit workflow |
-| `user_query` | Session cache | Full session | Refer back to original intent if clarification needed |
-| `design_guideline` | Session cache | Full session | Used as input to generate + edit tasks; avoids re-inference |
-| `generated_logos` | Session cache (URLs only) | Full session | Allow user to select + edit without re-downloading |
-| `selected_option_id` | Session cache | Full session | When editing, know which logo is being modified |
-| `editing_history` | Session cache (metadata) | Full session | Track edit requests + results for fallback suggestions |
-
-### 2.2 Session Lifecycle
-
-```
-Session Start (user initiates chat)
-    ↓
-Generate: cache guideline after Stage A
-    ↓
-Display: 3-4 logos (URLs cached)
-    ↓
-User selects + edits (use cached guideline + selected URL)
-    ↓
-Edit: regenerate logo (cache result)
-    ↓
-User may request more edits (repeat)
-    ↓
-Session End (user leaves or times out after 30 min)
-    ↓
-[All caches cleared; images still in CDN]
-```
-
-### 2.3 Implementation Pattern
-
-```python
-class SessionContext:
-    def __init__(self, session_id: str):
-        self.session_id = session_id
-        self.user_query: str = None
-        self.design_guideline: DesignGuideline = None
-        self.generated_logos: List[LogoOption] = []
-        self.selected_option_id: str = None
-        self.editing_history: List[dict] = []
-    
-    def save_guideline(self, guideline: DesignGuideline):
-        """After Stage A, cache for reuse in edits"""
-        self.design_guideline = guideline
-    
-    def save_logos(self, options: List[LogoOption]):
-        """After Stage B, cache URLs"""
-        self.generated_logos = options
-    
-    def get_for_edit(self) -> tuple:
-        """Returns (selected_logo_url, guideline) for Stage C"""
-        selected = next(l for l in self.generated_logos if l.option_id == self.selected_option_id)
-        return selected.image_url, self.design_guideline
-```
+- POC uses one primary image model at runtime (with documented fallback path)
+- No dedicated business rule engine; behavior comes from schema + prompt + tool adapters
+- Out of scope: region/pixel-level editing, touch edit, smart mark
+- Session scope is single session (no long-term user memory)
+- Streaming endpoint is primary UX channel
 
 ---
 
-## 3. POC Scope
+## 2. Scope Alignment with Spec
 
-### 3.1 Build vs Defer Matrix
+### 2.1 Build vs Defer
 
-| Capability | Build (POC) | Defer | Reason |
-| :--- | :--- | :--- | :--- |
-| **Intent detection** | Detect logo intent, parse text/references | Multi-domain classifier | Gemini text analysis sufficient for MVP |
-| **Input extraction** | Extract brand name, industry, style, color, symbols | Adaptive multi-turn | Single-turn extract covers 80% of cases |
-| **Clarification** | Ask when incomplete, allow skip with assumptions | Adaptive policy loop | Hardcoded questions → LLM response sufficient |
-| **Reasoning** | Stream reasoning blocks (input understanding, inference, assumptions) | Multi-agent debate | Single LLM reasoning understandable + traceable |
-| **Guideline generation** | Structured DesignGuideline from analysis | Auto-optimization loop | Manual guideline v1 → evaluator iteration later |
-| **Logo generation** | 3-4 PNG options from guideline | Multi-model routing + ranking | Single Nano Banana model works for POC |
-| **Logo editing** | Prompt-based edit + summary | Region/object-level edit | Avoids pixel manipulation; regen sufficient |
-| **Follow-up suggestions** | Quick action suggestions | Personalized recommender | Rule-based suggestions good for POC |
-| **Storage/session** | URLs + metadata per request | Project library, version history | Single-session memory enough for POC |
-
----
-
-## 4. System Architecture & Tools
-
-### 4.1 Architecture Principles
-
-#### Task-First
-- Each business capability = independent task (`logo_analyze`, `logo_generate`, `logo_edit`)
-- Routing by `task_type`, not endpoint-specific hardcoding
-- **Benefit**: Reuse by other features without code duplication
-
-#### Schema-First
-- All contracts validated via Pydantic (`LogoGenerateInput`, `DesignGuideline`, `StreamEnvelope`)
-- Schema validation at boundary (communication layer)
-- New inputs = extend schema + update prompts, no flow rewrites
-- **Benefit**: Backward compatibility + type safety
-
-#### Stream-First
-- `POST /internal/v1/tasks/stream` is default execution path
-- Frontend renders by `chunk_type` from `StreamEnvelope`, respects `sequence`
-- **Benefit**: p95 first chunk ≤ 1.5s via early reasoning emission; frontend decoupled
-
-#### Tool Abstraction
-- Agent calls tools behind stable interface: `LLMTool`, `ImageGenerationTool`, `ImageEditTool`
-- Providers swappable (Gemini → Claude, Nano Banana → Imagen 4) without touching orchestrator
-- **Benefit**: POC agility; production upgrade path without rearchitecting
+| Area | Build (POC) | Defer |
+| :--- | :--- | :--- |
+| Intent detection | Detect logo-design intent from natural language | Multi-domain intent classifier |
+| Input extraction | Text/image extraction for brand context and style hints | Full visual search pipeline at scale |
+| Clarification | Ask questions when critical inputs missing; allow skip | Adaptive multi-turn clarification policy |
+| Reasoning and inference | Stream visible reasoning and inferred attributes | Multi-agent debate / evaluator loops |
+| Direction selection | Support optional 3-4 directions when ambiguous | Rich direction voting and ranking |
+| Generation | Generate 3-4 logo options from guideline | Multi-model auto-routing and ranking |
+| Editing | Prompt-based edit on selected option + summary | Region/object-level editing |
+| Follow-up suggestions | Quick actionable suggestions | Personalized recommendation engine |
+| Session persistence | In-memory session context + URL metadata | Project library and long-term design history |
 
 ---
 
-### 4.2 Tools by Execution Step (Aligned with Spec)
+## 3. System Architecture
 
-#### **Step 1: Intent Detection Tool**
+### 3.1 Architecture Principles
 
-**Input**: User query (string)
-**LLM**: Gemini 2.5-flash
+- Task-first:
+  - Capabilities are split by task type (`logo_analyze`, `logo_generate`, `logo_edit`)
+  - Routing by `task_type` keeps API generic and reusable
+- Schema-first:
+  - Inputs/outputs validated by Pydantic at boundaries
+  - New fields are added by extending schemas, not rewriting orchestration
+- Stream-first:
+  - `POST /internal/v1/tasks/stream` is primary path
+  - Frontend renders by chunk contract (`chunk_type`, `sequence`)
+- Tool abstraction:
+  - Orchestrator uses stable tool interfaces for LLM/image providers
+  - Providers can be swapped with minimal orchestration changes
+
+### 3.2 Layered Runtime Components
+
+| Layer | Responsibility | Key Components |
+| :--- | :--- | :--- |
+| Communication | Request validation, dispatch, stream output | Stream API, task router |
+| Task Execution | Task lifecycle and serving mode | BaseTask, task registry, ServingMode.STREAM |
+| Orchestration | Planning, tool coordination, fallback/error mapping | Logo Orchestrator |
+| Tool Layer | External API adapters | IntentTool, ExtractionTool, ReasoningTool, GenerationTool, EditTool, SuggestionTool |
+| Storage/Observability | Image URL persistence and telemetry | Object storage/CDN, Langfuse tracing |
+
+### 3.3 External APIs Used
+
+- Gemini API (text/reasoning, optional multimodal):
+  - https://ai.google.dev/gemini-api/docs/
+- Image generation options in evaluation:
+  - Google Imagen (via Gemini/Vertex ecosystem)
+  - Nano Banana (Stable Diffusion service)
+  - OpenAI image generation option (benchmark comparison)
+
+---
+
+## 4. Tools by Spec Step (Clearly Separated)
+
+### Step 1 - Detect Logo Design Intent
+
+- Tool: `IntentDetectionTool`
+- Input: user query
+- Output: `is_logo_intent`, confidence, route decision
+- Why: switch from generic image flow to logo-design flow early
 
 ```python
 class IntentDetectionTool:
-    """Trigger: User mentions logo-related keywords"""
-    
-    LOGO_KEYWORDS = ["design a logo", "create a logo", "brand logo", "logo for my business"]
-    
-    async def detect(self, query: str) -> bool:
-        """True if logo intent detected, else False → route to generic flow"""
-        return any(kw.lower() in query.lower() for kw in self.LOGO_KEYWORDS)
-    
-    async def stream_intent_analysis(self, query: str):
-        """Stream intent + context from LLM"""
-        # Emit: chunk("reasoning", "Detected logo design request for tech startup...")
-        # Emit: chunk("reasoning", "Brand context likely: innovative, modern...")
+    async def detect(self, query: str) -> dict:
+        # returns {"is_logo_intent": bool, "confidence": float, "reason": str}
+        ...
 ```
 
----
+### Step 2 - Extract and Analyze Inputs (Text/Image)
 
-#### **Step 2: Extract & Analyze Inputs Tool**
-
-**Input**: Query + optional reference images
-**LLM**: Gemini 2.5-flash (text) + Gemini multimodal (images, deferred in POC)
-**Output**: Structured `BrandContext`, `Assumption` list
+- Tool: `InputExtractionTool`
+- Input: query + optional references
+- Output: `BrandContext` (brand_name, industry, style, color, symbol) + image analysis summary
+- Why: normalize unstructured input into generation-ready structure
 
 ```python
 class InputExtractionTool:
-    """Extract design input fields from text + optional images"""
-    
-    EXTRACTABLE_FIELDS = [
-        "brand_name", "industry", "style_preference", 
-        "color_preference", "symbol_preference"
-    ]
-    
-    async def extract_from_text(self, query: str) -> BrandContext:
-        """
-        Parse query for: brand name, industry, style, colors, symbols
-        Example: "Design a modern logo for NovaAI, a tech startup. 
-                  Prefer blue palette, geometric shapes."
-        Output: BrandContext(brand_name="NovaAI", industry="tech", 
-                            style_preference=["modern"], color_preference=["blue"])
-        """
-        pass
-    
-    async def analyze_reference_images(self, image_urls: List[str]):
-        """Extract: visual style, color palette, typography, iconography"""
-        # Deferred in POC; can add later with Vision API
-        pass
+    async def extract(self, query: str, references: list[str]) -> dict:
+        ...
 ```
 
----
+### Step 3 - Clarify Request (Conditional)
 
-#### **Step 3: Clarification Tool** (Conditional)
-
-**Input**: Extracted `BrandContext`
-**Decision**: If missing critical fields → ask; else skip
-**LLM**: Gemini 2.5-flash
+- Tool: `ClarificationTool`
+- Input: extracted context
+- Output: clarification questions or skip decision + assumptions
+- Why: reduce garbage-in generation while allowing user to skip
 
 ```python
 class ClarificationTool:
-    """Emit clarification questions if info incomplete"""
-    
-    async def should_clarify(self, context: BrandContext) -> bool:
-        """True if missing style + color + industry"""
-        required_fields = ["style_preference", "color_preference", "industry"]
-        return any(not getattr(context, f) for f in required_fields)
-    
-    async def stream_clarification(self, context: BrandContext):
-        """Emit: chunk("clarification", questions=[...])"""
-        # Example: "To design accurately, could you share: industry, style, colors?"
-        # User can skip with assumptions
-        pass
+    async def decide(self, context: dict) -> dict:
+        # returns questions[] or assumptions[]
+        ...
 ```
 
----
+### Step 4 - Request Analysis and Design Inference
 
-#### **Step 4: Reasoning & Design Inference Tool**
-
-**Input**: Query + extracted context + (optional) clarification answers
-**LLM**: Gemini 2.5-flash (streaming)
-**Output**: Design attributes (concept, style, colors, typography, icons)
+- Tool: `ReasoningTool`
+- Input: context + clarification answers/assumptions
+- Output: visible reasoning chunks + inferred design attributes
+- Why: produce transparent rationale before generation
 
 ```python
 class ReasoningTool:
-    """Generate visible reasoning + infer missing design attributes"""
-    
-    async def stream_reasoning(self, context: BrandContext):
-        """
-        Stream 3-4 reasoning blocks:
-        1. Input Understanding: "You're building a modern tech logo for NovaAI"
-        2. Style Inference: "Tech → geometric, minimal, sans-serif recommended"
-        3. Color Inference: "Blue → tech trust; pair with white/neutral"
-        4. Icon Direction: "Abstract symbol over literal (scalable)"
-        """
-        # Emit reasoning chunks with sequence numbers
-        pass
-    
-    async def infer_design_attributes(self) -> dict:
-        """Return inferred attributes for guideline generation"""
-        return {
-            "concept_statement": "Modern geometric symbol for AI tech brand",
-            "style_direction": ["minimalist", "geometric", "tech-forward"],
-            "color_palette": ["#0066FF (blue)", "#FFFFFF (white)"],
-            ...
-        }
+    async def infer(self, context: dict) -> dict:
+        # returns concept/style/colors/typography/icon direction
+        ...
 ```
 
----
+### Step 5 - Design Direction Selection (Optional)
 
-#### **Step 5: Design Direction Selection Tool** (Optional)
-
-**Input**: Inferred attributes
-**Decision**: Single direction (no UI options in POC) → proceed to generation
-**Logic**: If inference is clear, skip; else show 3-4 options
+- Tool: `DirectionSelectionTool`
+- Input: inferred attributes
+- Output: selected direction (or candidate directions)
+- Why: handle ambiguous requests by narrowing creative direction
 
 ```python
-class DesignDirectionTool:
-    """Present 3-4 design directions when ambiguous"""
-    
-    DIRECTIONS = {
-        "minimal_tech": "Clean geometric symbol + modern sans-serif",
-        "futuristic_ai": "Abstract neural pattern + gradient + sharp typeface",
-        "friendly_startup": "Rounded shapes + approachable color + hand-drawn feel",
+class DirectionSelectionTool:
+    async def select(self, inferred: dict) -> dict:
         ...
-    }
-    
-    async def select_direction(self, context: BrandContext) -> str:
-        """Return best direction; in POC, auto-select first"""
-        return "minimal_tech"  # or let user select from options
 ```
 
----
+### Step 6 - Logo Generation
 
-#### **Step 6: Logo Generation Tool**
-
-**Input**: `DesignGuideline`, variation_count (3-4)
-**Image API**: Nano Banana / Stable Diffusion 3.5
-**Output**: 3-4 `LogoOption` (URL + seed + quality_flags)
+- Tool: `LogoGenerationTool`
+- Input: `DesignGuideline` + `variation_count` (3-4)
+- Output: `LogoOption[]` with URL, seed, metadata
+- Why: convert structured guideline to visual options
 
 ```python
 class LogoGenerationTool:
-    """Call image generation API with guideline-derived prompt"""
-    
-    def __init__(self, provider="nano_banana"):
-        self.client = NanoBananaClient(api_key)
-    
-    async def generate_logo(self, guideline: DesignGuideline, 
-                           variation_count: int = 4) -> List[LogoOption]:
-        """
-        1. Build prompt from guideline
-        2. Call Nano Banana × variation_count (parallel)
-        3. Upload each image to CDN
-        4. Return LogoOption list with URLs
-        """
-        prompt = self._build_prompt(guideline)
-        images = await asyncio.gather(*[
-            self.client.generate(prompt, steps=20) for _ in range(variation_count)
-        ])
-        urls = [await storage.upload(img) for img in images]
-        return [LogoOption(option_id=f"opt_{i}", image_url=url) for i, url in enumerate(urls)]
+    async def generate(self, guideline: dict, variation_count: int = 4) -> list[dict]:
+        ...
 ```
 
----
+### Step 7 - Prompt-Based Logo Editing
 
-#### **Step 7: Logo Editing Tool**
-
-**Input**: Selected logo URL + edit prompt + guideline
-**LLM**: Gemini 2.5-flash (optional: parse edit intent)
-**Image API**: Nano Banana (img2img/inpainting mode)
-**Output**: `LogoEditOutput` (new URL + edit summary)
+- Tool: `LogoEditTool`
+- Input: selected option URL + edit prompt + guideline
+- Output: edited image URL + edit summary + preserved elements
+- Why: iterative refinement while keeping original concept
 
 ```python
 class LogoEditTool:
-    """Regenerate logo based on edit prompt"""
-    
-    async def edit_logo(self, selected_url: str, edit_prompt: str, 
-                       guideline: DesignGuideline) -> LogoEditOutput:
-        """
-        1. (Optional) Parse edit intent via LLM
-        2. Call Nano Banana in img2img mode: "Make the icon blue" + original image
-        3. Upload edited result
-        4. Generate edit summary: "Changed icon color to blue; preserved layout"
-        """
-        pass
+    async def edit(self, selected_image_url: str, edit_prompt: str, guideline: dict) -> dict:
+        ...
 ```
 
----
+### Step 9 - Follow-up Suggestions
 
-#### **Step 8: Follow-up Suggestions Tool**
-
-**Input**: Generated logos + editing history
-**Logic**: Rule-based + LLM-optional
-**Output**: Quick action suggestions
+- Tool: `SuggestionTool`
+- Input: generated options + edit history
+- Output: short actionable follow-up suggestions
+- Why: guide next action and reduce user dead-end
 
 ```python
-class SuggestionsT tool:
-    """Emit actionable follow-up suggestions"""
-    
-    async def stream_suggestions(self, logos: List[LogoOption]):
-        """
-        Emit: chunk("suggestion", "Edit colors to match brand palette")
-        Emit: chunk("suggestion", "Try a different style: futuristic variant")
-        """
-        pass
+class SuggestionTool:
+    async def suggest(self, session_state: dict) -> list[str]:
+        ...
 ```
 
 ---
 
-### 4.3 System Architecture Diagram (Layered)
+## 5. End-to-End Pipeline
 
-```mermaid
-graph TB
-    FE["Frontend<br/>(Chat UI)"]
-    API["Communication Layer<br/>(Stream API)"]
-    TASK["Task Execution Layer<br/>(BaseTask + logo_generate/edit)"]
-    ORCH["Orchestrator<br/>(planning + tool routing)"]
-    TOOLS["Tools Layer"]
-    
-    INTENT["IntentDetectionTool"]
-    EXTRACT["InputExtractionTool"]
-    CLARIFY["ClarificationTool"]
-    REASON["ReasoningTool"]
-    DIRECTION["DesignDirectionTool"]
-    GENLOGO["LogoGenerationTool"]
-    EDITLOGO["LogoEditTool"]
-    SUGGEST["SuggestionsT ool"]
-    
-    GEMINI["Gemini 2.5-flash<br/>(reasoning + intent)"]
-    NANONA["Nano Banana<br/>(Stable Diffusion 3.5)"]
-    STORAGE["Storage/CDN<br/>(image URLs)"]
+### 5.1 Stage Mapping from Spec
 
-    FE -->|POST /stream| API
-    API -->|dispatch by task_type| TASK
-    TASK -->|delegate| ORCH
-    
-    ORCH -->|call| INTENT
-    ORCH -->|call| EXTRACT
-    ORCH -->|call| CLARIFY
-    ORCH -->|call| REASON
-    ORCH -->|call| DIRECTION
-    ORCH -->|call| GENLOGO
-    ORCH -->|call| EDITLOGO
-    ORCH -->|call| SUGGEST
-    
-    INTENT -->|API| GEMINI
-    REASON -->|API| GEMINI
-    EXTRACT -->|API| GEMINI
-    
-    GENLOGO -->|HTTP/MCP| NANONA
-    EDITLOGO -->|HTTP/MCP| NANONA
-    
-    GENLOGO -->|upload| STORAGE
-    EDITLOGO -->|upload| STORAGE
-    
-    STORAGE -->|signed URLs| FE
-```
+- Stage A (Analyze): Step 1, 2, 3, 4, 5
+- Stage B (Generate): Step 6
+- Stage C (Edit + Follow-up): Step 7, Step 9
 
----
-
-## 5. Model & Tool Benchmarks
-
-### 5.1 Text Models (LLM) Comparison
-
-**Use case**: Intent detection, reasoning, guideline synthesis, edit intent parsing
-
-| Model | Vendor | TTFB | Cost (per 1M tokens) | Quality | Streaming | Recommendation |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Gemini 2.5-flash** | Google | **~500ms-1s** | **$0.50 in / $2 out** | **Good** | ✅ **Yes** | ✅ **SELECT (POC)** |
-| Claude 3.5 Sonnet | Anthropic | ~2-3s ❌ | $3 in / $15 out | Excellent | ✅ Yes | Fallback (if latency OK) |
-| Claude 3 Haiku | Anthropic | ~1-1.5s | $0.25 in / $1.25 out | Good | ✅ Yes | Alt (cheaper but lower quality) |
-| OpenAI GPT-4 Turbo | OpenAI | ~2-4s ❌ | $10 in / $30 out | Excellent | ❌ No | Not suitable (too slow + expensive) |
-| Meta Llama 2 (local) | Meta | ~3-5s (GPU) | $0 (self-hosted) | Good | ✅ Yes | Alt (zero cost but setup required) |
-
-**Decision**: **Gemini 2.5-flash** for POC
-- Meets p95 < 1.5s TTFB requirement ✅
-- Cost-effective for POC ($0.50/$2 vs Claude $3/$15)
-- Native streaming for token-by-token reasoning emission
-- **Fallback**: Claude 3.5 Sonnet if reasoning quality issues (relaxed latency to p95 < 3s)
-
----
-
-### 5.2 Image Generation Models Comparison
-
-**Use case**: Logo generation (3-4 options) + editing
-
-| Model | Vendor | Latency/Image | Cost/Image | Batch Support | Quality | Edit Mode | Recommendation |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Nano Banana (SD 3.5)** | Banana | **~8-12s** | **$0.015** | ✅ **Yes (up to 4)** | Good | ✅ Img2img | ✅ **SELECT (POC)** |
-| Google Imagen 4 | Google | ~20-30s ❌ | $0.08 | ❌ No | Excellent | ✅ Yes | Later (if quality issues) |
-| Stable Diffusion XL | Stability | ~15-20s | $0.008 | ✅ Yes | Good | ✅ Yes | Local alternative |
-| OpenAI DALL-E 3 | OpenAI | ~20-40s ❌ | $0.08 | ❌ No | Excellent | ❌ Limited | Not suitable |
-| Local Stable Diffusion | Self-hosted | ~15-25s (GPU) | $0 | ✅ Yes | Good | ✅ Yes | Alt (if infra available) |
-
-**Decision**: **Nano Banana (Stable Diffusion 3.5)** for POC
-- Meets p95 < 25s for 4 images: 4 × 8-12s = 24-36s (acceptable with parallelization) ✅
-- Affordable: $0.06 per 4-image request vs Imagen $0.32 ✅
-- Batch support: generate 4 images in parallel
-- Built-in img2img for editing
-- **Post-POC upgrade path**: If quality issues in user testing → Imagen 4 (swap tool adapter, no schema changes)
-
----
-
-### 5.3 Cost & Latency Breakdown (Per Request)
-
-#### Generate 3-4 Logos (Stage B)
-
-| Component | Model | Calls | Cost/Call | Total Cost | Latency | Notes |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Intent + Reasoning** | Gemini 2.5-flash | 1 | $0.0001 | $0.0001 | ~1s | Streaming tokens |
-| **Guideline Inference** | Gemini 2.5-flash | 1 | $0.0002 | $0.0002 | ~1s | Structured output |
-| **Logo Generation** | Nano Banana SD 3.5 | 4 (parallel) | $0.015 | **$0.06** | ~10-15s | Wall-clock time |
-| **Storage Upload** | GCS/S3 | 4 | ~$0.001 | $0.004 | ~2s | Parallel |
-| **Total (Generate)** | — | — | — | **~$0.065** | **~15-20s** | Meets p95 < 25s ✅ |
-
-#### Edit Logo (Stage C)
-
-| Component | Model | Calls | Cost/Call | Total Cost | Latency | Notes |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Edit Intent Parse** | Gemini 2.5-flash | 1 | $0.00005 | $0.00005 | ~0.5s | Optional |
-| **Image Regeneration** | Nano Banana (img2img) | 1 | $0.015 | **$0.015** | ~10-12s | Faster than full gen |
-| **Storage Upload** | GCS/S3 | 1 | ~$0.001 | $0.001 | ~1s | — |
-| **Total (Edit)** | — | — | — | **~$0.017** | **~12-13s** | Meets p95 < 15s ✅ |
-
----
-
-### 5.4 Why NOT Other Options?
-
-| Option | Issue | Resolution |
-| :--- | :--- | :--- |
-| **Claude for all tasks** | TTFB ~2-3s misses p95 < 1.5s target | Use Claude as fallback; monitor quality |
-| **Imagen 4 for generation** | SLA ~20-30s misses p95 < 25s (for 4 images) | Defer to post-POC; upgrade path via tool swapping |
-| **DALL-E 3** | Expensive ($0.08/img = $0.32 for 4) + slow (~40s) | Not suitable for POC; use later if budget permits |
-| **Local Stable Diffusion** | Requires GPU infrastructure + ops overhead | Use if no vendor cost constraints; Nano Banana simpler for POC |
-| **Rule engine for guideline** | Adds 100-200ms latency + harder to maintain | Use LLM prompt + Pydantic schema instead; more flexible |
-
----
-
-## 6. End-to-End Pipeline: Three Stages
-
-### 6.1 Stage A: Analyze + Clarification
-
-| Aspect | Detail |
-| :--- | :--- |
-| **Tools Used** | IntentDetectionTool → InputExtractionTool → ClarificationTool → ReasoningTool |
-| **Input Schema** | `LogoGenerateInput`: query, references (optional), session_id |
-| **LLM Calls** | Gemini 2.5-flash × 2: intent detection + reasoning |
-| **Output Chunks** | `clarification` (if needed), `reasoning` (×3-4), `guideline` (structured JSON) |
-| **Success Criteria** | >= 90% return usable guideline |
-| **SLA** | 0-1.5s first chunk; 1.5-3s complete guideline |
-
----
-
-### 6.2 Stage B: Generate
-
-| Aspect | Detail |
-| :--- | :--- |
-| **Tools Used** | LogoGenerationTool |
-| **Input Schema** | `DesignGuideline` (from Stage A), variation_count (3-4) |
-| **Image API Calls** | Nano Banana × 3-4 (parallel; ~8-12s each) |
-| **Output Chunks** | `image_option` (×3-4), `suggestion`, `done` |
-| **Success Criteria** | >= 90% return 3-4 valid PNG images; p95 <= 25s total |
-| **SLA** | 3-20s to first image; 10-25s for all + done |
-
----
-
-### 6.3 Stage C: Edit
-
-| Aspect | Detail |
-| :--- | :--- |
-| **Tools Used** | ReasoningTool (optional), LogoEditTool |
-| **Input Schema** | `LogoEditInput`: selected_option_id, selected_image_url, edit_prompt, guideline |
-| **LLM Calls** | Gemini 2.5-flash × 1 (optional): edit intent parsing + summary |
-| **Image API Calls** | Nano Banana × 1 (img2img mode; ~8-12s SLA) |
-| **Output Chunks** | `reasoning`, `edit_result`, `suggestion`, `done` |
-| **Success Criteria** | >= 85% of edits preserve concept while reflecting changes |
-| **SLA** | 0-12s total |
-
----
-
-### 6.4 Full Sequence Diagram
+### 5.2 Sequence Diagram
 
 ```mermaid
 sequenceDiagram
     actor FE as Frontend
     participant API as Stream API
-    participant ORCH as Orchestrator
-    participant INTENT as IntentDetection
-    participant EXTRACT as InputExtraction
-    participant REASON as Reasoning
-    participant GENLOGO as LogoGeneration
-    participant EDIT as LogoEditing
-    participant GEMINI as Gemini 2.5-flash
-    participant IMG as Nano Banana
+    participant ORCH as Logo Orchestrator
+    participant IT as IntentTool
+    participant ET as ExtractionTool
+    participant CT as ClarificationTool
+    participant RT as ReasoningTool
+    participant GT as GenerationTool
+    participant EDT as EditTool
+    participant ST as SuggestionTool
+    participant LLM as Gemini API
+    participant IMG as Image Model API
     participant STO as Storage/CDN
 
-    FE->>API: POST /stream (logo_generate)
-    
-    Note over API,ORCH: === STAGE A: ANALYZE ===
-    API->>ORCH: validate + init session
-    
-    ORCH->>INTENT: detect logo intent
-    INTENT->>GEMINI: classify request
-    GEMINI-->>INTENT: confirmed logo workflow
-    
-    ORCH->>EXTRACT: extract brand context
-    EXTRACT-->>ORCH: BrandContext(industry, style, colors)
-    
-    ORCH->>REASON: stream reasoning
-    REASON->>GEMINI: analyze + infer design
-    activate GEMINI
-    GEMINI-->>REASON: reasoning tokens (stream)
-    ORCH-->>API: chunk(reasoning, seq:1)
-    API-->>FE: display reasoning
-    
-    GEMINI-->>REASON: guideline JSON
-    deactivate GEMINI
-    ORCH-->>API: chunk(guideline, seq:2)
-    API-->>FE: display guideline
+    FE->>API: POST /internal/v1/tasks/stream (logo_generate)
+    API->>ORCH: validate schema + init session
 
-    Note over API,ORCH: === STAGE B: GENERATE ===
-    ORCH->>GENLOGO: generate 4 options
-    
-    GENLOGO->>IMG: generate(prompt_1) [parallel]
-    GENLOGO->>IMG: generate(prompt_2)
-    GENLOGO->>IMG: generate(prompt_3)
-    GENLOGO->>IMG: generate(prompt_4)
-    
-    par Image Generation
-        IMG-->>GENLOGO: image_1_bytes (~10s total)
-        GENLOGO->>STO: upload
-        STO-->>GENLOGO: url_1
-        ORCH-->>API: chunk(image_option, seq:3)
-        API-->>FE: display option 1
-    and
-        IMG-->>GENLOGO: image_2_bytes
-        ...
-    end
-    
-    ORCH-->>API: chunk(suggestion, seq:7)
-    ORCH-->>API: chunk(done, seq:8)
-    API-->>FE: done signal
+    ORCH->>IT: detect intent
+    IT->>LLM: classify
+    LLM-->>IT: logo intent
 
-    FE->>API: POST /stream (logo_edit)
-    Note over API,ORCH: === STAGE C: EDIT ===
-    ORCH->>EDIT: edit selected logo
-    
-    ORCH->>REASON: (optional) parse edit intent
-    REASON->>GEMINI: parse("make it blue")
-    
-    ORCH->>IMG: edit(selected_url, "blue icon")
-    IMG-->>ORCH: edited_image (~10s)
-    ORCH->>STO: upload
-    STO-->>ORCH: edited_url
-    
-    ORCH-->>API: chunk(edit_result, seq:1)
-    API-->>FE: display edited image
-    ORCH-->>API: chunk(done, seq:2)
+    ORCH->>ET: extract inputs
+    ET->>LLM: parse text/image hints
+    LLM-->>ET: structured context
+
+    ORCH->>CT: clarification decision
+    CT-->>ORCH: questions or assumptions
+    ORCH-->>API: chunk(clarification?)
+
+    ORCH->>RT: reasoning + inference
+    RT->>LLM: infer design attributes
+    LLM-->>RT: reasoning + guideline
+    ORCH-->>API: chunk(reasoning), chunk(guideline)
+
+    ORCH->>GT: generate 3-4 logos
+    GT->>IMG: generate in parallel
+    IMG-->>GT: images
+    GT->>STO: upload
+    STO-->>GT: image urls
+    ORCH-->>API: chunk(image_option)x3-4
+
+    ORCH->>ST: follow-up suggestions
+    ST-->>ORCH: suggestions
+    ORCH-->>API: chunk(suggestion), chunk(done)
+    API-->>FE: stream complete
+
+    FE->>API: POST /internal/v1/tasks/stream (logo_edit)
+    API->>ORCH: selected option + edit prompt
+    ORCH->>EDT: apply edit
+    EDT->>IMG: img2img/edit
+    IMG-->>EDT: edited image
+    EDT->>STO: upload
+    STO-->>EDT: edited url
+    ORCH-->>API: chunk(edit_result), chunk(suggestion), chunk(done)
 ```
+
+### 5.3 Error Handling Contract
+
+- All failures are mapped to structured error chunks within 3 seconds:
+  - `MODEL_TIMEOUT`
+  - `INVALID_INPUT_SCHEMA`
+  - `PROVIDER_UNAVAILABLE`
+  - `STORAGE_UPLOAD_FAILED`
+  - `RATE_LIMIT_EXCEEDED`
+- Error chunk includes: message, retryable flag, suggested action
 
 ---
 
-## 7. Data Schema & API Integration
+## 6. Session Memory Design
 
-### 7.1 Pydantic Models
+### 6.1 Session State (Per `session_id`)
+
+| Field | Purpose |
+| :--- | :--- |
+| `session_id` | Correlation across generate/edit requests |
+| `user_query` | Preserve original request context |
+| `brand_context` | Reuse extracted context for edits |
+| `design_guideline` | Prevent re-inference before each edit |
+| `generated_options` | Keep candidate URLs/metadata |
+| `selected_option_id` | Target for edit |
+| `edit_history` | Show what was changed and propose next suggestions |
+
+### 6.2 Lifecycle
+
+- Start: session created on first valid logo request
+- During generate: save context + guideline + options
+- During edit: read selected option + guideline from session, append `edit_history`
+- End: session TTL expiration (e.g., 30 minutes of inactivity) or explicit close
+
+### 6.3 Storage Choice for POC
+
+- Primary: in-memory cache for speed and simplicity
+- Optional upgrade: Redis for multi-instance scaling and resilience
+
+---
+
+## 7. Model Benchmark and Selection Rationale
+
+### 7.1 Benchmark Notes
+
+- Scope requested by PO: compare latency, cost, and suitability
+- Costs and latency are indicative (verify during procurement and pilot runs)
+- Measurement in implementation uses Langfuse traces (`request_id`, `session_id`, `task_type`, model tag)
+
+### 7.2 Text Model Benchmark (Gemini + OpenAI)
+
+| Model | Vendor | Typical TTFB | Cost Orientation | Strength | Weakness | Fit for POC |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| Gemini 2.5 Flash | Google | Low (~sub-2s) | Low to medium | Fast streaming reasoning and low latency | Slightly lower deep reasoning than larger models | Primary text model |
+| Gemini 2.5 Pro | Google | Medium | Medium to high | Higher quality reasoning | Slower and costlier than Flash | Optional fallback for hard cases |
+| GPT-4.1 mini | OpenAI | Low to medium | Medium | Good balance of quality and speed | Costlier than Flash in many workloads | Alternative/fallback |
+| GPT-4.1 | OpenAI | Medium | High | Strong reasoning quality | Higher cost and latency | Not default for POC speed target |
+
+Decision for text:
+- Default: Gemini 2.5 Flash for intent, reasoning, guideline, and clarification
+- Fallback: Gemini 2.5 Pro or GPT-4.1 mini for quality-sensitive flows
+
+### 7.3 Image Model Benchmark (PO-Facing Cost/Speed Table)
+
+| Model/Provider | Typical Latency per Image | Cost Orientation | Batch/Parallel | Edit Support | Output Quality (Logo Use Case) | Fit for POC |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| Nano Banana (SD-based service) | Low to medium | Low | Good | Good (img2img style) | Good | Primary image model |
+| Google Imagen | Medium to high | Medium to high | Moderate | Good | Very good | Quality-first fallback |
+| OpenAI image generation option | Medium to high | Medium to high | Moderate | Moderate | Good to very good | Comparison candidate |
+
+Decision for image:
+- Default: Nano Banana to satisfy cost/speed target for 3-4 options in one request
+- Fallback/upgrade path: Imagen when quality target is not met in pilot evaluations
+- OpenAI image model remains benchmark alternative for PO comparison
+
+### 7.4 Why This Final Model Choice
+
+- Meets p95 responsiveness target more reliably at POC scale
+- Lower per-session cost for 3-4 options + iterative edits
+- Still provides clear upgrade path if quality KPI underperforms
+- Keeps architecture neutral: swap provider at tool adapter level
+
+---
+
+## 8. Data Contracts and APIs
+
+### 8.1 Core Schemas
 
 ```python
 from typing import Any, Dict, List, Literal, Optional
@@ -687,81 +425,61 @@ class StreamEnvelope(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 ```
 
----
-
-### 7.2 API Endpoints
+### 8.2 Endpoints
 
 - `POST /internal/v1/tasks/stream` (`task_type=logo_generate`)
   - Input: `LogoGenerateInput`
-  - Output (streaming): `StreamEnvelope` chunks
+  - Output: stream chunks (`reasoning`, `guideline`, `image_option`, `suggestion`, `done`)
 
 - `POST /internal/v1/tasks/stream` (`task_type=logo_edit`)
   - Input: `LogoEditInput`
-  - Output (streaming): `StreamEnvelope` chunks
+  - Output: stream chunks (`reasoning`, `edit_result`, `suggestion`, `done`)
 
 ---
 
-## 8. Risks & Mitigation
+## 9. Risks and Mitigations
 
-### 8.1 Latency Risk
+### 9.1 Latency Risk
 
-**Risk**: Generating 3-4 images may exceed p95 target
+- Risk: 3-4 image generation exceeds p95 target
+- Mitigation:
+  - stream reasoning immediately
+  - parallel image generation
+  - timeout + single retry
+  - fallback to 3 options when near timeout
 
-**Mitigation**:
-- Emit reasoning early (0-1.5s TTFB) so visible progress before image generation
-- Parallel image generation (wall-clock ~10-15s for 4 parallel calls)
-- Timeout + single retry for transient failures
-- Fallback: if 4 options exceed 25s, degrade to 3 options
+### 9.2 Quality Risk
 
----
+- Risk: output drifts from guideline
+- Mitigation:
+  - quality flags in `LogoOption`
+  - consistent prompt template derived from `DesignGuideline`
+  - warning + follow-up edit suggestion
 
-### 8.2 Quality Risk
+### 9.3 Cost Risk
 
-**Risk**: Generated logos may drift from guideline or contain artifacts
+- Risk: generation + edits increase cost per session
+- Mitigation:
+  - trace cost per `request_id` and `session_id` in Langfuse
+  - set edit-attempt cap in POC defaults
+  - reuse guideline/context from session memory
 
-**Mitigation**:
-- Apply `quality_flags` (e.g., "has_text_artifacts") per option
-- Keep prompt template consistent (derived from guideline schema)
-- Emit warning + suggest edit if quality below threshold
-- Post-POC: A/B test Imagen 4 if quality issues emerge
+### 9.4 Provider Risk
 
----
-
-### 8.3 Cost Risk
-
-**Risk**: Per-request cost from LLM + image generation + edits
-
-**Mitigation**:
-- Track cost per `request_id` and `session_id`
-- Limit edit attempts (POC default: 3 edits/session)
-- Reuse guideline + context within session to avoid re-inference
-
----
-
-### 8.4 Model Selection Risk
-
-**Risk**: Gemini 2.5-flash unavailable or rate-limited
-
-**Mitigation**:
-- Fallback to Claude 3.5 Honeyak (relax p95 to 3s)
-- Fallback to local Llama 2 (if infrastructure available, zero cost)
-
-**Risk**: Nano Banana unavailable
-
-**Mitigation**:
-- Fallback to local Stable Diffusion instance (if GPU available)
-- Fallback to Imagen 4 (accept ~25-30s latency, higher cost)
+- Risk: primary provider unavailable/rate-limited
+- Mitigation:
+  - fallback provider configured in tool adapter layer
+  - clear error chunk with retry guidance
 
 ---
 
-## 9. Decisions & Rationale
+## 10. Final Decision Summary
 
-| Decision | Chosen | Alternative | Why |
-| :--- | :--- | :--- | :--- |
-| Intent detection | Gemini keyword detection | Claude classification | Simpler + fast for POC |
-| LLM for reasoning | Gemini 2.5-flash | Claude 3.5 Sonnet | 1.5s TTFB vs 3s; cost; streaming |
-| Image generation | Nano Banana (SD 3.5) | Google Imagen 4 | 8-12s vs 20-30s; $0.015 vs $0.08/image |
-| Editing mode | Img2img regenerate | Region/pixel edit | Avoids pixel tooling; suffices for POC |
-| Session memory | In-memory cache | Database persist | Single-session OK; no long-term needs |
-| Guideline generation | LLM prompt | Rules engine | More flexible; easier to modify; faster |
-| Error handling | Structured error chunks | Retries only | Clear user messaging + retry guidance |
+| Decision Item | Final Choice | Why |
+| :--- | :--- | :--- |
+| Intent/Reasoning model | Gemini 2.5 Flash | Best latency/quality trade-off for streaming UX |
+| Primary image generation | Nano Banana | Better cost/speed for 3-4 options in POC |
+| Quality-first fallback image model | Imagen | Better quality when needed, accepted cost/latency trade-off |
+| Architecture style | Task-first + tool abstraction | Easy to extend, benchmark, and swap models |
+| Session memory | In-memory (POC) | Simple and fast, enough for single-session workflow |
+| Observability | Langfuse tracing | Enables SLA/quality/cost evidence for PO review |
