@@ -2,37 +2,39 @@
 
 ## 1. Overview
 
-### 1.1 Muc tieu POC
+### 1.1 POC objective
 
-POC xay dung Logo Design Service theo flow chat-first:
+This POC builds a backend-driven Logo Design Service using a chat-first workflow.
 
-- Input: query (text va co the kem image reference).
-- Backend: phan tich yeu cau, tao reasoning + design guideline, generate 3-4 logo options, cho phep edit bang prompt.
-- Output: image URLs (PNG 1024x1024 toi thieu) va edit summary.
+- Input: user query (text, optional image references).
+- Backend flow: detect intent, extract/analyze inputs, clarify conditionally, infer design direction, generate 3-4 options, support prompt-based editing.
+- Output: image URLs (minimum PNG 1024x1024) and edit summary.
 
-Muc tieu nghiep vu:
+Business validation goals:
 
-- Chung minh user co the hoan thanh full flow: request -> analyze -> guideline -> generate -> select -> edit -> regenerate.
-- Chung minh reasoning hien thi la huu ich va de hieu.
-- Chung minh edit flow don gian, khong can region editing.
+- Prove users can complete the full loop: request -> analyze -> guideline -> generate -> select -> edit -> regenerate.
+- Prove visible reasoning is understandable and useful.
+- Prove editing is usable without region-level editing tools in POC.
 
-### 1.2 Success metrics
+### 1.2 Success metrics (POC acceptance targets)
 
-- >= 90% request tra ve design guideline truoc khi generate image.
-- >= 90% request tra ve du 3-4 logo options.
-- >= 85% phien hoan thanh full flow ma khong can restart session.
-- >= 85% edit request cho ket qua phan anh dung y chinh sua va giu concept.
+These are POC acceptance targets, not long-term SLA commitments. They are validated after benchmark and can be re-baselined before production.
+
+- >= 90% of requests return a design guideline before image generation starts.
+- >= 90% of requests return 3-4 valid logo options.
+- >= 85% of sessions complete end-to-end flow without restart.
+- >= 85% of edit requests reflect requested changes while preserving core concept.
 - p95 time to first reasoning chunk <= 1.5s.
 - p95 time to complete 3-4 logo outputs <= 25s.
-- Loi generation/edit tra ve ly do + retry guidance <= 3s.
+- On generation/edit failure, actionable error + retry guidance returned <= 3s.
 
 ### 1.3 Technical constraints
 
-- Chi dung single image model trong POC.
-- Khong build rule engine cung; uu tien schema-driven va prompt-driven.
-- Khong lam touch edit/smart mark/region-level editing trong phase nay.
-- Session la single-session, khong can cross-session persistence.
-- Stream API la kenh chinh de FE nhan reasoning va ket qua incrementally.
+- Primary stream endpoint is the main UX channel.
+- Out of scope in POC: touch edit, smart mark, region/object-level editing.
+- Session scope: single session only.
+- No separate rule engine; behavior is schema-driven + prompt-driven + tool-adapter driven.
+- Provider switching must not require changing FE stream contract.
 
 ---
 
@@ -42,209 +44,203 @@ Muc tieu nghiep vu:
 
 | Area | Build (POC) | Defer |
 | :--- | :--- | :--- |
-| Intent + Input | Detect logo intent, parse text/reference image, extract brand context | Intent classifier mo rong da nganh |
-| Clarification | Ask clarification khi thieu du lieu, cho phep skip + assumptions | Adaptive multi-turn clarification policy |
-| Reasoning | Stream reasoning blocks: input understanding, style inference, assumptions | Advanced self-critique/multi-agent debate |
-| Guideline | Tao design guideline co cau truc truoc generation | Auto-optimization guideline bang evaluator loop |
-| Generation | Generate 3-4 logo PNG options tu guideline | Multi-model routing, auto ranking |
-| Editing | Prompt-based edit tren selected logo, tra edit summary | Region/object editing chi tiet |
-| Follow-up | Tra quick follow-up suggestions sau generation/edit | Intelligent recommendation engine ca nhan hoa |
-| Storage/Session | Luu output URL + metadata theo request/session | Version history, project library, long-term memory |
+| Intent + input | Detect logo intent, parse text/references, extract brand context | Multi-domain intent classifier |
+| Clarification | Ask clarification when needed, allow skip with explicit assumptions | Adaptive multi-turn clarification policy |
+| Reasoning | Stream reasoning blocks (input understanding, style inference, assumptions) | Multi-agent debate and self-critique loops |
+| Guideline | Generate structured design guideline before generation | Auto-optimization guideline loop via evaluator |
+| Direction selection | Optional 3-4 direction proposals for ambiguous requests | Personalized auto-ranking per user profile |
+| Generation | Generate 3-4 PNG options from guideline | Multi-model routing and automatic quality ranking |
+| Editing | Prompt-based edit on selected option + edit summary | Region/object-level editing |
+| Follow-up | Return quick follow-up suggestions | Personalized recommendation engine |
+| Storage/session | Persist output URLs + metadata per request/session | Project library, version history, long-term memory |
 
 ---
 
 ## 3. System Architecture
 
-### 3.1 Architecture principles (BE-first, reuse-friendly)
+### 3.1 Overview
 
-- Task-first:
-  - Moi buoc nghiep vu la mot task doc lap (`logo_analyze`, `logo_generate`, `logo_edit`).
-  - Task expose qua `task_type`, khong hardcode theo endpoint rieng.
-- Schema-first:
-  - Input/output duoc rang buoc bang Pydantic.
-  - Them input moi = them field schema + xu ly trong task, khong can viet lai flow core.
-- Stream-first:
-  - Dung `POST /internal/v1/tasks/stream` cho UX thoi gian thuc.
-  - FE doc theo chunk contract, khong can biet logic noi bo.
-- Tool abstraction:
-  - Agent chi goi tools qua interface (local tool/MCP tool).
-  - Doi provider (image API/vision API) ma khong doi pipeline.
+#### 3.1.1 Why this solution
 
-### 3.2 Runtime components mapped to ai-hub-sdk
+This architecture is chosen to match the full spec execution logic (Step 1,2,3,4,5,6,7,8) while keeping the backend reusable and FE-independent.
 
-- Communication Service
-  - Nhan request qua REST/gRPC gateway.
-  - Route theo `task_type` + `input_args`.
-- Task Execution Layer
-  - `BaseTask` + `TaskInputBaseModel` + `TaskOutputBaseModel`.
-  - `ServingMode.STREAM` cho logo pipeline.
-- Agent Layer
-  - `Agent` + `Orchestrator` cho planning/reasoning va tool-calling.
-- Tool Layer
-  - Function tools va MCP tools (HTTP/SSE, retry, timeout, tool filter).
-- Integration Layer
-  - LLM API, Vision API (optional), Image Generation/Edit API.
-- Storage/Observability
-  - Object storage/CDN cho image URL.
-  - Metadata usage/latency/cost cho monitoring.
+Key reasons:
 
-### 3.3 End-to-end pipeline with contracts (BE owns what)
+1. Every spec step has explicit tool boundary and ownership.
+2. FE only needs stream rendering by chunk type and sequence.
+3. Provider/model decisions are replaceable at adapter level.
+4. Stream-first gives user-visible progress during long-running image operations.
 
-Stage A - Analyze:
+#### 3.1.2 Diagram 1 - Agent pipeline (flowchart)
 
-- Input: `LogoGenerateInput` (query, references, session_id).
-- BE xu ly:
-  - intent detection
-  - context extraction
-  - clarification decision
-  - assumptions (neu skip clarification)
-- Output chunks:
-  - `clarification` (optional)
-  - `reasoning`
-  - `guideline`
-
-Stage B - Generate:
-
-- Input: guideline + generation params.
-- BE xu ly:
-  - build prompt tu guideline
-  - call image generation provider 3-4 lan (hoac batch)
-  - upload to storage
-  - attach metadata (`seed`, `quality_flags`, timing)
-- Output chunks:
-  - `image_option` x 3-4
-  - `suggestion`
-  - `done`
-
-Stage C - Edit:
-
-- Input: `LogoEditInput` (selected image, edit prompt, guideline).
-- BE xu ly:
-  - parse edit intent
-  - call image edit provider
-  - upload updated image
-  - generate edit summary
-- Output chunks:
-  - `reasoning`
-  - `edit_result`
-  - `suggestion`
-  - `done`
-
-### 3.4 FE handoff contract (de FE chi can add input)
-
-FE can implementation theo 3 nguyen tac:
-
-- Gui dung `task_type` + `input_args` theo schema.
-- Render theo `chunk_type` cua `StreamEnvelope`.
-- Dung `sequence` de dam bao thu tu hien thi.
-
-FE khong can biet:
-
-- Prompt noi bo.
-- Tool routing.
-- Provider cu the nao dang duoc goi.
-
-FE can lam tiep:
-
-1. Form generate:
-   - query, optional references, variation_count.
-2. Stream renderer:
-   - clarification/reasoning/guideline/image_option/suggestion/done.
-3. Gallery + select option:
-   - luu `selected_option_id` + `selected_image_url`.
-4. Edit form:
-   - edit_prompt + selected option.
-5. Error handling:
-   - render `error` chunk voi `retry guidance`.
-
-### 3.5 Orchestrator execution blueprint (pseudo-flow)
-
-```text
-on_stream_request(task_type, input_args):
-  validate_schema(task_type, input_args)
-  init_request_context(request_id, session_id)
-
-  if task_type == logo_generate:
-    run logo_analyze
-      -> emit clarification/reasoning/guideline chunks
-    run logo_generate
-      -> emit image_option chunks
-      -> emit suggestion + done
-
-  if task_type == logo_edit:
-    run logo_edit
-      -> emit reasoning
-      -> emit edit_result
-      -> emit suggestion + done
-
-  on_error:
-    map_exception_to_error_code
-    emit error chunk (retryable + suggested_action)
+```mermaid
+flowchart TD
+    A[User Request] --> B[Step 1: IntentDetectTool]
+    B --> C[Step 2: InputExtractionTool + ReferenceImageAnalyzeTool]
+    C --> D{Step 3: Clarify needed?}
+    D -->|Yes| E[ClarificationTool]
+    D -->|No or skip| F[AssumptionBuilderTool]
+    E --> G[Step 4: DesignInferenceTool]
+    F --> G
+    G --> H{Step 5: Direction selection needed?}
+    H -->|Yes| I[DirectionProposalTool]
+    H -->|No| J[Default direction]
+    I --> K[Step 6: LogoGenerationTool]
+    J --> K
+    K --> L[Step 7: LogoEditTool]
+    L --> M[Step 8: FollowupSuggestionTool]
 ```
 
-### 3.6 Reuse and extensibility (khong hard rule)
+#### 3.1.3 Diagram 2 - System components (layered)
 
-Mo rong them use case moi ma khong pha vo core:
+```mermaid
+graph TB
+    FE["Frontend Chat/Canvas"]
+    API["Communication Layer\n/internal/v1/tasks/stream"]
+    TASK["Task Layer\nlogo_generate/logo_edit"]
+    ORCH["Orchestrator\nplanning + coordination"]
+    TOOLS["Tool Layer\nintent/extract/clarify/infer/generate/edit"]
+    LLM["LLM APIs\nGemini/OpenAI"]
+    IMG["Image APIs\nImagen/OpenAI image"]
+    STO["Storage/CDN"]
 
-- Them output style moi:
-  - them field trong guideline/schema, khong doi endpoint contract.
-- Them provider moi:
-  - thay adapter trong `ImageGenerationTool`/`ImageEditTool`.
-- Them logic moi:
-  - tao task moi (vi du `logo_variation_regenerate`) va dang ky `task_type` moi.
-- Them external capability:
-  - gan MCP tool moi, co `tool_filter` de gioi han quyen.
+    FE --> API
+    API --> TASK
+    TASK --> ORCH
+    ORCH --> TOOLS
+    TOOLS --> LLM
+    TOOLS --> IMG
+    TOOLS --> STO
+    STO --> FE
+```
 
-Nguyen tac de tranh rule cung:
+### 3.2 Architecture principles
 
-- Rule nghiep vu nam trong schema + prompt template + tool adapter config.
-- Khong embed if/else theo project-specific logic vao communication layer.
+- Task-first:
+  - Business capabilities are task-based (`logo_generate`, `logo_edit`).
+  - Routing by `task_type`, no endpoint-specific business hardcoding.
+- Schema-first:
+  - All contracts validated by Pydantic.
+  - New fields/features evolve by schema + prompt template extension.
+- Stream-first:
+  - `POST /internal/v1/tasks/stream` is default path.
+  - FE renders by chunk contract, independent from provider internals.
+- Tool abstraction:
+  - Orchestrator calls stable tool interfaces.
+  - Model/provider switching only touches adapters.
 
-### 3.7 Sequence diagram
+### 3.3 Component breakdown (tool-level)
+
+| Component / Tool | Spec step | Role | Model Type | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| IntentDetectTool | Step 1 | Detect if request is logo design intent and route flow | Low-latency text LLM for classification | Emits early `reasoning` chunk |
+| InputExtractionTool | Step 2 | Extract brand_name, industry, style, color, symbol from text | Text LLM with structured output capability | Returns structured JSON |
+| ReferenceImageAnalyzeTool | Step 2 | Analyze reference image style/color/typography/iconography | Multimodal LLM for image understanding | Optional when references provided |
+| ClarificationTool | Step 3 | Generate clarification questions when info is insufficient | Text LLM for question generation | Supports user skip |
+| AssumptionBuilderTool | Step 3 | Build explicit assumptions if user skips clarification | Text LLM for reasoning | Stored in guideline assumptions |
+| DesignInferenceTool | Step 4 | Infer style direction and design constraints | Text LLM for design reasoning | Emits `reasoning` and `guideline` |
+| DirectionProposalTool | Step 5 (optional) | Create 3-4 design directions for ambiguous briefs | Text LLM for option generation | Returns direction list for selection/default |
+| LogoGenerationTool | Step 6 | Generate 3-4 logo options | Fast image generation model for exploration | Throughput-optimized for exploration |
+| LogoEditTool | Step 7 | Regenerate selected logo from edit prompt | High-fidelity image generation model for refinement | Fidelity-optimized for refinement |
+| FollowupSuggestionTool | Step 8 | Suggest next edits/actions | Text LLM for action suggestion | Quick action suggestions |
+| StorageTool | Shared | Upload images and return URLs | Cloud storage API | Used by generate and edit |
+
+### 3.4 End-to-end pipeline
+
+POC exposes 2 external task types only: `logo_generate` and `logo_edit`. Analyze is an internal stage within `logo_generate`.
+
+#### 3.4.1 Full sequence (Step 1 -> Step 8)
 
 ```mermaid
 sequenceDiagram
     actor FE as Frontend
     participant API as Stream API
-    participant ORCH as Logo Orchestrator
-    participant LLM as LLM API
-    participant IMG as Image API
+    participant ORCH as Orchestrator
+    participant LLM as Gemini 2.5 Flash
+    participant IMG as Nano Banana API
     participant STO as Storage/CDN
 
-    FE->>API: POST /internal/v1/tasks/stream (logo_generate)
-    API->>ORCH: validate input + init session
-    ORCH->>LLM: analyze + reasoning + guideline
-    LLM-->>ORCH: reasoning blocks + design guideline
-    ORCH-->>API: chunk(reasoning/guideline)
+    FE->>API: POST /stream (logo_generate)
+    API->>ORCH: validate schema + init context
+
+    Note over ORCH,LLM: Step 1 + 2 + 3 + 4 + 5
+    ORCH->>LLM: intent detect + extract + clarify + infer + direction
+    LLM-->>ORCH: reasoning + guideline (+ clarification/directions if needed)
+    ORCH-->>API: chunk(clarification/reasoning/guideline)
     API-->>FE: stream chunks
 
+    Note over ORCH,IMG: Step 6
     loop 3-4 options
-        ORCH->>IMG: generate image from guideline
-        IMG-->>ORCH: image bytes/url
-        ORCH->>STO: upload image
+        ORCH->>IMG: generate image
+        IMG-->>ORCH: image bytes
+        ORCH->>STO: upload
         STO-->>ORCH: image_url
         ORCH-->>API: chunk(image_option)
         API-->>FE: image_option
     end
-
-    ORCH-->>API: chunk(done)
+    ORCH-->>API: chunk(suggestion), chunk(done)
     API-->>FE: done
 
-    FE->>API: POST /internal/v1/tasks/stream (logo_edit)
-    API->>ORCH: selected_image_url + edit_prompt
-    ORCH->>IMG: edit image
-    IMG-->>ORCH: updated image
-    ORCH->>STO: upload updated image
-    STO-->>ORCH: updated_image_url
-    ORCH-->>API: chunk(edit_result), chunk(done)
-    API-->>FE: edit_result + done
+    Note over ORCH,IMG: Step 7
+    FE->>API: POST /stream (logo_edit)
+    API->>ORCH: selected option + edit prompt
+    ORCH->>LLM: parse edit intent + summarize
+    ORCH->>IMG: regenerate edited image
+    IMG-->>ORCH: edited image bytes
+    ORCH->>STO: upload
+    STO-->>ORCH: edited_image_url
+    ORCH-->>API: chunk(reasoning), chunk(edit_result), chunk(suggestion), chunk(done)
+    API-->>FE: edited output
+
+    Note over ORCH,LLM: Step 8
+    ORCH->>LLM: generate follow-up suggestions
+    LLM-->>ORCH: actionable next steps
 ```
+
+#### 3.4.2 Stage A - Analyze (Step 1 to Step 5)
+
+| Item | Detail |
+| :--- | :--- |
+| Input | `LogoGenerateInput` (query, references, session_id) |
+| Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationTool, AssumptionBuilderTool, DesignInferenceTool, DirectionProposalTool(optional) |
+| Output chunks | `clarification` (optional), `reasoning`, `guideline`, `suggestion` (optional) |
+| Target | First chunk <= 1.5s p95; guideline availability >= 90% |
+
+#### 3.4.3 Stage B - Generate (Step 6)
+
+| Item | Detail |
+| :--- | :--- |
+| Input | guideline + selected/default direction + variation_count |
+| Tools used | LogoGenerationTool, StorageTool |
+| Output chunks | `image_option` x 3-4, `suggestion`, `done` |
+| Target | 3-4 valid outputs >= 90%; total generation <= 25s p95 |
+
+#### 3.4.4 Stage C - Edit (Step 7)
+
+| Item | Detail |
+| :--- | :--- |
+| Input | `LogoEditInput` (selected image, edit prompt, guideline) |
+| Tools used | LogoEditTool, StorageTool, FollowupSuggestionTool |
+| Output chunks | `reasoning`, `edit_result`, `suggestion`, `done` |
+| Target | Edit success >= 85%; preserve concept consistency |
+
+### 3.5 Reuse and extensibility
+
+- Add fields in extraction/guideline:
+  - Extend schemas and prompt templates only.
+  - FE stream contract stays unchanged.
+- Add/switch provider:
+  - Replace adapter of LogoGenerationTool/LogoEditTool.
+  - No change in orchestrator sequence or chunk contract.
+- Add new capability:
+  - Register new `task_type` (for example `logo_variation_regenerate`).
+  - Reuse same stage tools and stream envelope.
 
 ---
 
 ## 4. Data Schema & API Integration
 
-### 4.1 Pydantic models theo tung buoc
+### 4.1 Pydantic models by stage
 
 ```python
 from typing import Any, Dict, List, Literal, Optional
@@ -274,6 +270,12 @@ class ClarificationQuestion(BaseModel):
     key: str
     question: str
     required: bool = False
+
+
+class DirectionOption(BaseModel):
+    direction_name: str
+    short_description: str
+    visual_concept_summary: str
 
 
 class DesignGuideline(BaseModel):
@@ -306,6 +308,7 @@ class LogoOption(BaseModel):
 
 class LogoGenerateOutput(BaseModel):
     guideline: DesignGuideline
+    directions: List[DirectionOption] = Field(default_factory=list)
     options: List[LogoOption]
 
 
@@ -326,10 +329,10 @@ class LogoEditOutput(BaseModel):
 class StreamEnvelope(BaseModel):
     request_id: str
     session_id: str
-    task_type: Literal["logo_analyze", "logo_generate", "logo_edit"]
+    task_type: Literal["logo_generate", "logo_edit"]
     status: Literal["processing", "completed", "failed"]
     chunk_type: Literal[
-        "reasoning", "clarification", "guideline", "image_option",
+        "reasoning", "clarification", "guideline", "direction_options", "image_option",
         "edit_result", "suggestion", "warning", "error", "done"
     ]
     sequence: int
@@ -339,54 +342,118 @@ class StreamEnvelope(BaseModel):
 
 Validation rules:
 
-- query bat buoc khong rong sau trim.
-- variation_count chi cho phep 3 hoac 4.
-- edit flow bat buoc selected image + edit prompt.
-- khi skip clarification, assumptions phai duoc tra ve trong guideline.
+- `query` is required and non-empty after trim.
+- `variation_count` must be 3 or 4.
+- Edit flow requires selected image and edit prompt.
+- If clarification is skipped, guideline must include explicit assumptions.
 
-### 4.2 External APIs goi o dau
+### 4.2 External APIs and model selection
 
-- LLM API
-  - logo_analyze: intent detection, input understanding, style inference.
-  - logo_generate: tao guideline va reasoning blocks.
-- Vision API (optional)
-  - phan tich image references de trich style/color/iconography.
-- Image API
-  - logo_generate: tao 3-4 logo options.
-  - logo_edit: regenerate image theo edit prompt tren selected logo.
+Model selection strategy:
 
-### 4.3 I/O cu the theo endpoint
+- **Text models**: Choose based on latency, reasoning capability, and cost trade-off.
+- **Image models**: Choose based on generation speed, quality fidelity, and throughput requirements.
+- **Fallback path**: Maintain secondary provider to reduce vendor lock-in and improve reliability.
 
-- POST /internal/v1/tasks/stream (task_type=logo_generate)
+Reference docs:
+
+- Google Gemini API docs: https://ai.google.dev/gemini-api/docs
+- Google Imagen docs: https://ai.google.dev/gemini-api/docs/imagen
+- Google Nano Banana docs: https://ai.google.dev/gemini-api/docs/image-generation
+- Google pricing docs: https://ai.google.dev/gemini-api/docs/pricing
+- OpenAI pricing docs: https://openai.com/api/pricing/
+- OpenAI models docs: https://platform.openai.com/docs/models
+
+### 4.3 Concrete endpoint I/O
+
+- `POST /internal/v1/tasks/stream` (`task_type=logo_generate`)
   - Input:
-    - query
-    - session_id
-    - references (optional)
-    - variation_count (optional, 3-4)
+    - `query`
+    - `session_id`
+    - `references` (optional)
+    - `variation_count` (optional, 3-4)
   - Output stream:
-    - clarification (neu can)
-    - reasoning
-    - guideline
-    - image_option x 3-4
-    - suggestion
-    - done
+    - `clarification` (if needed)
+    - `reasoning`
+    - `guideline`
+    - `direction_options` (optional)
+    - `image_option` x 3-4
+    - `suggestion`
+    - `done`
 
-- POST /internal/v1/tasks/stream (task_type=logo_edit)
+- `POST /internal/v1/tasks/stream` (`task_type=logo_edit`)
   - Input:
-    - session_id
-    - selected_option_id
-    - selected_image_url
-    - edit_prompt
-    - guideline
+    - `session_id`
+    - `selected_option_id`
+    - `selected_image_url`
+    - `edit_prompt`
+    - `guideline`
   - Output stream:
-    - reasoning
-    - edit_result
-    - suggestion
-    - done
+    - `reasoning`
+    - `edit_result`
+    - `suggestion`
+    - `done`
 
-- Optional async fallback
-  - POST /internal/v1/tasks/submit
-  - GET /internal/v1/tasks/{task_id}/status
+- Optional async fallback:
+  - `POST /internal/v1/tasks/submit`
+  - `GET /internal/v1/tasks/{task_id}/status`
+
+### 4.4 Model benchmark by vendor (POC-oriented)
+
+**Important**: Prices and latency below are for planning/PO discussion and must be re-checked before release cut. Latency estimates are typical ranges and must be validated in project load tests.
+
+#### 4.4.1 Google models
+
+**Text Models**
+
+| Model | Input ($/ 1M tokens) | Output ($/ 1M tokens) | TTFB (typical) | Full response (typical) | Best for |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `gemini-2.5-flash` | $0.30 | $2.50 | 0.5-1.2s | 2-6s | **POC default**: Low-latency classification, extraction, reasoning chains |
+| `gemini-2.5-pro` | $1.25 (≤200k) | $10.00 (≤200k) | 1.0-2.5s | 4-12s | Deep reasoning, complex multi-turn tasks, higher cost |
+
+**Image Models**
+
+| Model | Pricing type | Unit price | Latency (per image) | Best for |
+| :--- | :--- | :--- | :--- | :--- |
+| `gemini-2.5-flash-image` (Nano Banana) | Per 1M tokens | $0.039 per 1024x1024 | 8-18s | Baseline fast generation, legacy option |
+| `gemini-3.1-flash-image-preview` (Nano Banana 2) | Per 1M tokens | ~$0.067 per 1024x1024 | 6-14s | **POC primary Step 6**: Fast batch exploration (3-4 options) |
+| `gemini-3-pro-image-preview` (Nano Banana Pro) | Per 1M tokens | ~$0.134 per 1024x1024 | 10-20s | **POC primary Step 7**: High-fidelity refinement on selected option |
+| `imagen-4.0-fast-generate-001` | Per image | $0.02 | 7-15s | Alternative fast path with explicit pricing |
+| `imagen-4.0-generate-001` | Per image | $0.04 | 10-20s | Alternative quality path with explicit pricing |
+
+#### 4.4.2 OpenAI models
+
+**Text Models**
+
+| Model | Input ($/ 1M tokens) | Output ($/ 1M tokens) | TTFB (typical) | Full response (typical) | Best for |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `gpt-5.4-nano` | $0.20 | $1.25 | 0.3-0.9s | 1.5-5s | Cost-sensitive extraction, classification subtasks |
+| `gpt-5.4-mini` | $0.750 | $4.500 | 0.6-1.5s | 2-7s | **POC fallback**: Robust tool-calling, structured output |
+| `gpt-5.4` | $2.50 | $15.00 | 1.0-3.0s | 4-14s | High quality, expensive for high-volume flows |
+
+**Image Models**
+
+| Model | Pricing type | Unit price | Latency (per image) | Best for |
+| :--- | :--- | :--- | :--- | :--- |
+| `gpt-image-1.5` (state-of-the-art) | Output tokens | $32 per 1M tokens | 10-25s | **POC fallback**: Vendor diversification, strong quality, token-based cost |
+
+#### 4.4.3 POC model selection rationale
+
+**Recommended primary path:**
+- Text reasoning: `gemini-2.5-flash` (lowest latency, cost-effective)
+- Image Step 6 (generate 3-4 options): `gemini-3.1-flash-image-preview` / Nano Banana 2 (fast exploration)
+- Image Step 7 (edit selected option): `gemini-3-pro-image-preview` / Nano Banana Pro (high fidelity)
+
+**Recommended fallback path:**
+- Text: `gpt-5.4-mini` (robust tool-calling, structured output)
+- Image: `gpt-image-1.5` (vendor diversification, strong quality)
+
+**Why this combination:**
+
+1. **Primary path**: Single vendor (Google) simplifies operations; Nano Banana family provides speed-to-quality progression.
+2. **Fallback path**: OpenAI models ensure reliability and reduce vendor lock-in.
+3. **Cost-quality balance**: Nano Banana 2 optimizes throughput for exploration; Nano Banana Pro ensures refinement quality.
+4. **Latency targets**: Gemini 2.5 Flash TTFB (0.5-1.2s) fits p95 ≤1.5s target; Nano Banana 2 (6-14s per image) fits p95 ≤25s for 3-4 images.
 
 ---
 
@@ -396,42 +463,44 @@ Validation rules:
 
 Risk:
 
-- Generate 3-4 images co the vuot p95 target.
+- 3-4 image generation can exceed p95 target depending on provider queue and concurrency.
 
 Mitigation:
 
-- Stream reasoning som de FE co progress feedback.
-- Parallel generation neu provider ho tro.
-- Timeout + 1 lan retry cho transient failures.
-- Near-timeout fallback tu 4 ve 3 options.
+- Emit reasoning early to keep UX responsive.
+- Parallel generation where provider allows.
+- Timeout + retry policy for transient failures.
+- Near-timeout fallback from 4 outputs to 3 outputs.
 
 ### 5.2 Generation quality
 
 Risk:
 
-- Output khong sat guideline hoac co artifact (noise/text loi/pixelation).
+- Outputs can drift from guideline or include artifacts.
 
 Mitigation:
 
-- Quality flags theo moi logo option.
-- Prompt template guideline-first nhat quan.
-- Return warning + goi y edit tiep neu ket qua chua dat ky vong.
+- Add `quality_flags` per option.
+- Keep guideline-first prompt template stable.
+- Return warning and targeted edit suggestions.
 
 ### 5.3 Cost
 
 Risk:
 
-- Cost tang nhanh do ket hop LLM + image generation + nhieu lan edit.
+- Combined text reasoning + multi-image generation + edits can increase request cost quickly.
 
 Mitigation:
 
-- Theo doi cost theo request_id/session_id.
-- Gioi han so lan edit trong POC.
-- Tai su dung guideline/context trong session de giam goi model khong can thiet.
+- Track cost per `request_id` and `session_id`.
+- Default limit on edit retries in POC.
+- Reuse context/guideline within session.
+- Keep benchmark table updated at each milestone.
 
 ### 5.4 Open technical decisions
 
-- Chot kenh stream chinh cho FE production: NDJSON hay gRPC stream.
-- Chinh sach TTL/signed URL cho image output.
-- Co can deterministic seed de edit consistency khong.
-- Muc do quality gate: hard fail hay soft warning.
+- Production stream protocol finalization: NDJSON vs gRPC stream.
+- Signed URL TTL policy by asset type.
+- Deterministic seed policy for edit consistency.
+- Quality gate policy: hard fail vs soft warning.
+- OpenAI fallback trigger policy (manual switch vs automatic failover).
