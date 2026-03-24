@@ -32,7 +32,7 @@ These are POC acceptance targets, not long-term SLA commitments. They are valida
 
 - Primary stream endpoint is the main UX channel.
 - Out of scope in POC: touch edit, smart mark, region/object-level editing.
-- Session scope: single session only.
+- Session scope: single session only, with short-term context memory reused across requests in the same `session_id`.
 - No separate rule engine; behavior is schema-driven + prompt-driven + tool-adapter driven.
 - Provider switching must not require changing FE stream contract.
 
@@ -52,7 +52,7 @@ These are POC acceptance targets, not long-term SLA commitments. They are valida
 | Generation | Generate 3-4 PNG options from guideline | Multi-model routing and automatic quality ranking |
 | Editing | Prompt-based edit on selected option + edit summary | Region/object-level editing |
 | Follow-up | Return quick follow-up suggestions | Personalized recommendation engine |
-| Storage/session | Persist output URLs + metadata per request/session | Project library, version history, long-term memory |
+| Storage/session | Persist output URLs + metadata and session context state per `session_id` | Project library, version history, long-term memory |
 
 ---
 
@@ -97,7 +97,7 @@ flowchart TD
 graph TB
     FE["Frontend Chat/Canvas"]
     API["Communication Layer\n/internal/v1/tasks/stream"]
-    TASK["Task Layer\nlogo_analyze/logo_generate/logo_edit"]
+    TASK["Task Layer\nlogo_generate/logo_edit"]
     ORCH["Orchestrator\nplanning + coordination"]
     TOOLS["Tool Layer\nintent/extract/clarify/infer/generate/edit"]
     LLM["LLM APIs\nGemini/OpenAI"]
@@ -117,7 +117,7 @@ graph TB
 ### 3.2 Architecture principles
 
 - Task-first:
-  - Business capabilities are task-based (`logo_analyze`, `logo_generate`, `logo_edit`).
+  - Business capabilities are task-based (`logo_generate`, `logo_edit`).
   - Routing by `task_type`, no endpoint-specific business hardcoding.
 - Schema-first:
   - All contracts validated by Pydantic.
@@ -147,50 +147,29 @@ graph TB
 
 ### 3.4 End-to-end pipeline
 
-#### 3.4.1 Task flow sequences (three types)
+POC exposes 2 external task types only: `logo_generate` and `logo_edit`. Analyze is an internal stage within `logo_generate`.
 
-**Task 1: logo_analyze (Steps 1-5 only)**
-
-```mermaid
-sequenceDiagram
-    actor FE as Frontend
-    participant API as Stream API
-    participant ORCH as Orchestrator
-    participant LLM as Text LLM
-
-    FE->>API: POST /stream (task_type=logo_analyze)
-    API->>ORCH: validate schema + init context
-
-    Note over ORCH,LLM: Steps 1-5: Intent, Extract, Clarify, Infer, Direction
-    ORCH->>LLM: intent detect + extract + clarify + infer + direction
-    LLM-->>ORCH: reasoning + guideline (+ clarification/directions if needed)
-    ORCH-->>API: chunk(clarification/reasoning/guideline)
-    API-->>FE: stream chunks
-    ORCH-->>API: chunk(suggestion), chunk(done)
-    API-->>FE: done (debug/analysis path)
-```
-
-**Task 2: logo_generate (Steps 1-6, main UX flow)**
+#### 3.4.1 Full sequence (Step 1 -> Step 8)
 
 ```mermaid
 sequenceDiagram
     actor FE as Frontend
     participant API as Stream API
     participant ORCH as Orchestrator
-    participant LLM as Text LLM
-    participant IMG as Image generation
+    participant LLM as Gemini 2.5 Flash
+    participant IMG as Nano Banana API
     participant STO as Storage/CDN
 
-    FE->>API: POST /stream (task_type=logo_generate)
+    FE->>API: POST /stream (logo_generate)
     API->>ORCH: validate schema + init context
 
-    Note over ORCH,LLM: Steps 1-5: Intent, Extract, Clarify, Infer, Direction
+    Note over ORCH,LLM: Step 1 + 2 + 3 + 4 + 5
     ORCH->>LLM: intent detect + extract + clarify + infer + direction
     LLM-->>ORCH: reasoning + guideline (+ clarification/directions if needed)
     ORCH-->>API: chunk(clarification/reasoning/guideline)
     API-->>FE: stream chunks
 
-    Note over ORCH,IMG: Step 6: Generate 3-4 logo options
+    Note over ORCH,IMG: Step 6
     loop 3-4 options
         ORCH->>IMG: generate image
         IMG-->>ORCH: image bytes
@@ -201,40 +180,21 @@ sequenceDiagram
     end
     ORCH-->>API: chunk(suggestion), chunk(done)
     API-->>FE: done
-```
 
-**Task 3: logo_edit (Steps 7-8, refinement flow)**
-
-```mermaid
-sequenceDiagram
-    actor FE as Frontend
-    participant API as Stream API
-    participant ORCH as Orchestrator
-    participant LLM as Text LLM
-    participant IMG as Image generation
-    participant STO as Storage/CDN
-
-    FE->>API: POST /stream (task_type=logo_edit, selected_image_url, edit_prompt)
-    API->>ORCH: validate schema + init context
-
-    Note over ORCH,LLM: Step 7: Parse edit intent + regenerate
-    ORCH->>LLM: parse edit intent + summarize changes
-    LLM-->>ORCH: edit reasoning
-    ORCH-->>API: chunk(reasoning)
-    API-->>FE: reasoning chunk
-    
+    Note over ORCH,IMG: Step 7
+    FE->>API: POST /stream (logo_edit)
+    API->>ORCH: selected option + edit prompt
+    ORCH->>LLM: parse edit intent + summarize
     ORCH->>IMG: regenerate edited image
     IMG-->>ORCH: edited image bytes
     ORCH->>STO: upload
     STO-->>ORCH: edited_image_url
-    ORCH-->>API: chunk(edit_result)
-    API-->>FE: edited output image
+    ORCH-->>API: chunk(reasoning), chunk(edit_result), chunk(suggestion), chunk(done)
+    API-->>FE: edited output
 
-    Note over ORCH,LLM: Step 8: Follow-up suggestions
+    Note over ORCH,LLM: Step 8
     ORCH->>LLM: generate follow-up suggestions
     LLM-->>ORCH: actionable next steps
-    ORCH-->>API: chunk(suggestion), chunk(done)
-    API-->>FE: done
 ```
 
 #### 3.4.2 Stage A - Analyze (Step 1 to Step 5)
@@ -263,6 +223,23 @@ sequenceDiagram
 | Tools used | LogoEditTool, StorageTool, FollowupSuggestionTool |
 | Output chunks | `reasoning`, `edit_result`, `suggestion`, `done` |
 | Target | Edit success >= 85%; preserve concept consistency |
+
+#### 3.4.5 Session context memory (POC)
+
+- Scope:
+  - Memory is limited to one active `session_id` timeline.
+  - No cross-session personalization in this POC.
+- What is stored:
+  - latest extracted `BrandContext`
+  - latest approved `DesignGuideline`
+  - last selected option and latest edit summary
+  - generated asset URLs and key assumptions
+- How it is used:
+  - New `logo_generate` calls in the same `session_id` merge new prompt details with stored context.
+  - `logo_edit` can rely on stored guideline/context if client sends partial fields.
+  - Every response returns updated context metadata for deterministic FE state updates.
+- Expiry policy:
+  - Session context uses TTL (for example 24h) and is cleared when expired or explicitly reset.
 
 ### 3.5 Reuse and extensibility
 
@@ -328,10 +305,22 @@ class DesignGuideline(BaseModel):
     assumptions: List[Assumption] = Field(default_factory=list)
 
 
+class SessionContextState(BaseModel):
+    session_id: str
+    latest_brand_context: Optional[BrandContext] = None
+    latest_guideline: Optional[DesignGuideline] = None
+    selected_option_id: Optional[str] = None
+    selected_image_url: Optional[HttpUrl] = None
+    latest_edit_summary: Optional[str] = None
+    assumptions: List[Assumption] = Field(default_factory=list)
+    generated_option_ids: List[str] = Field(default_factory=list)
+
+
 class LogoGenerateInput(BaseModel):
     session_id: str
     query: str
     references: List[ReferenceImage] = Field(default_factory=list)
+    use_session_context: bool = True
     allow_skip_clarification: bool = True
     variation_count: int = Field(default=4, ge=3, le=4)
     output_format: Literal["png"] = "png"
@@ -354,10 +343,10 @@ class LogoGenerateOutput(BaseModel):
 
 class LogoEditInput(BaseModel):
     session_id: str
-    selected_option_id: str
-    selected_image_url: HttpUrl
+    selected_option_id: Optional[str] = None
+    selected_image_url: Optional[HttpUrl] = None
     edit_prompt: str
-    guideline: DesignGuideline
+    guideline: Optional[DesignGuideline] = None
 
 
 class LogoEditOutput(BaseModel):
@@ -369,7 +358,7 @@ class LogoEditOutput(BaseModel):
 class StreamEnvelope(BaseModel):
     request_id: str
     session_id: str
-    task_type: Literal["logo_analyze", "logo_generate", "logo_edit"]
+    task_type: Literal["logo_generate", "logo_edit"]
     status: Literal["processing", "completed", "failed"]
     chunk_type: Literal[
         "reasoning", "clarification", "guideline", "direction_options", "image_option",
@@ -384,7 +373,8 @@ Validation rules:
 
 - `query` is required and non-empty after trim.
 - `variation_count` must be 3 or 4.
-- Edit flow requires selected image and edit prompt.
+- Edit flow always requires `edit_prompt`; `selected_option_id` and `selected_image_url` can be omitted only if retrievable from session context.
+- If `use_session_context=true`, backend merges request with stored context for the same `session_id`.
 - If clarification is skipped, guideline must include explicit assumptions.
 
 ### 4.2 External APIs and model selection
@@ -406,21 +396,11 @@ Reference docs:
 
 ### 4.3 Concrete endpoint I/O
 
-- `POST /internal/v1/tasks/stream` (`task_type=logo_analyze`)
-  - Purpose:
-    - run Step 1 to Step 5 only (intent, extract/analyze, clarify, infer, direction)
-    - used for internal chaining or direct debug tools
-  - Output stream:
-    - `clarification` (if needed)
-    - `reasoning`
-    - `guideline`
-    - `direction_options` (optional)
-    - `done`
-
 - `POST /internal/v1/tasks/stream` (`task_type=logo_generate`)
   - Input:
     - `query`
     - `session_id`
+    - `use_session_context` (optional, default true)
     - `references` (optional)
     - `variation_count` (optional, 3-4)
   - Output stream:
@@ -431,19 +411,24 @@ Reference docs:
     - `image_option` x 3-4
     - `suggestion`
     - `done`
+  - Context behavior:
+    - if `use_session_context=true`, merge new query with stored context in same `session_id`
+    - stream metadata includes updated session context snapshot/version
 
 - `POST /internal/v1/tasks/stream` (`task_type=logo_edit`)
   - Input:
     - `session_id`
-    - `selected_option_id`
-    - `selected_image_url`
+    - `selected_option_id` (optional if available in session context)
+    - `selected_image_url` (optional if available in session context)
     - `edit_prompt`
-    - `guideline`
+    - `guideline` (optional if available in session context)
   - Output stream:
     - `reasoning`
     - `edit_result`
     - `suggestion`
     - `done`
+  - Context behavior:
+    - successful edit updates session context (`selected_option_id`, latest edit summary, latest image URL)
 
 - Optional async fallback:
   - `POST /internal/v1/tasks/submit`
@@ -555,3 +540,4 @@ Mitigation:
 - Deterministic seed policy for edit consistency.
 - Quality gate policy: hard fail vs soft warning.
 - OpenAI fallback trigger policy (manual switch vs automatic failover).
+- Session context TTL and reset policy (automatic expiry only vs manual reset endpoint).
