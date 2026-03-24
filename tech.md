@@ -9,6 +9,7 @@ This POC builds a backend-driven Logo Design Service using a chat-first workflow
 - Input: user query (text, optional image references).
 - Backend flow: detect intent, extract/analyze inputs, run mandatory clarification loop for required fields, infer design guideline, generate 3-4 options.
 - Output: image URLs (minimum PNG 1024x1024) and generation summary.
+- Scope boundary: POC execution stops at original spec Step 6 (logo generation). Step 7 (edit) and Step 8 (follow-up) are deferred to next phase.
 
 Business validation goals:
 
@@ -59,7 +60,7 @@ These are committed POC acceptance targets (Phase 1 baseline) after initial benc
 
 #### 3.1.1 Why this solution
 
-This architecture is chosen to match a POC-focused execution logic (Step 1,2,3,4,5) while keeping the backend reusable and FE-independent.
+This architecture is chosen to match a POC-focused execution logic up to original spec Step 6 (with Step 5 direction selection removed in POC) while keeping the backend reusable and FE-independent.
 
 Key reasons:
 
@@ -72,13 +73,13 @@ Key reasons:
 
 ```mermaid
 flowchart TD
-    A[User Request] --> B[Step 1: IntentDetectTool]
-    B --> C[Step 2: InputExtractionTool + ReferenceImageAnalyzeTool]
-  C --> D[Step 3: ClarificationTool (mandatory loop)]
-  D --> E{Required fields complete?}
-  E -->|No| D
-  E -->|Yes| F[Step 4: DesignInferenceTool]
-  F --> G[Step 5: LogoGenerationTool]
+    A[User Request] --> B[Step 1 IntentDetectTool]
+    B --> C[Step 2 InputExtractionTool + ReferenceImageAnalyzeTool]
+    C --> D[Step 3 ClarificationTool]
+    D --> E{Required fields complete?}
+    E -- No --> D
+    E -- Yes --> F[Step 4 DesignInferenceTool]
+    F --> G[Step 6 LogoGenerationTool]
 ```
 
 #### 3.1.3 Diagram 2 - System components (layered)
@@ -133,9 +134,9 @@ graph TB
 
 ### 3.4 End-to-end pipeline
 
-POC exposes 1 external task type: `logo_generate`. Analyze and mandatory clarify are internal stages within `logo_generate`.
+POC exposes 1 external task type: `logo_generate`. Analyze and mandatory clarify are internal stages within `logo_generate`. This POC maps to original spec Step 1,2,3,4,6 and defers Step 5,7,8.
 
-#### 3.4.1 Full sequence (Step 1 -> Step 5)
+#### 3.4.1 Full sequence (Step 1 -> Step 6, with Step 5 deferred)
 
 ```mermaid
 sequenceDiagram
@@ -161,7 +162,7 @@ sequenceDiagram
     ORCH-->>API: chunk(reasoning/guideline)
     API-->>FE: stream chunks
 
-    Note over ORCH,IMG: Step 5
+    Note over ORCH,IMG: Step 6
     loop 3-4 options
         ORCH->>IMG: generate image
         IMG-->>ORCH: image bytes
@@ -183,7 +184,7 @@ sequenceDiagram
 | Output chunks | `clarification` (repeat until required fields complete), `reasoning`, `guideline` |
 | Target | First chunk <= 1.5s p95; required-field completion >= 95%; guideline availability >= 90% |
 
-#### 3.4.3 Stage B - Generate (Step 5)
+#### 3.4.3 Stage B - Generate (Step 6)
 
 | Item | Detail |
 | :--- | :--- |
@@ -362,6 +363,7 @@ Reference docs:
 ### 4.4 Model benchmark by vendor (POC-oriented)
 
 **Important**: Prices and latency below are for planning/PO discussion and must be re-checked before release cut. Latency estimates are typical ranges and must be validated in project load tests.
+Observed trace numbers in this section are from one benchmark run in [logs/model_traces_benchmark_all.json](logs/model_traces_benchmark_all.json) and should be treated as directional, not final SLA.
 
 #### 4.4.1 Google models
 
@@ -369,7 +371,7 @@ Reference docs:
 
 | Model | Input ($/ 1M tokens) | Output ($/ 1M tokens) | TTFB (typical) | Full response (typical) | Best for |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| `gemini-2.5-flash` | $0.30 | $2.50 | 0.5-1.2s | 2-6s | **POC default**: Low-latency classification, extraction, reasoning chains |
+| `gemini-2.5-flash` | $0.30 | $2.50 | 0.5-1.2s | 2-6s | Cost-effective text path with strong structured reasoning |
 | `gemini-2.5-pro` | $1.25 (≤200k) | $10.00 (≤200k) | 1.0-2.5s | 4-12s | Deep reasoning, complex multi-turn tasks, higher cost |
 
 **Image Models**
@@ -377,9 +379,9 @@ Reference docs:
 | Model | Pricing type | Unit price | Latency (per image) | Best for |
 | :--- | :--- | :--- | :--- | :--- |
 | `gemini-2.5-flash-image` (Nano Banana) | Per 1M tokens | $0.039 per 1024x1024 | 8-18s | Baseline fast generation, legacy option |
-| `gemini-3.1-flash-image-preview` (Nano Banana 2) | Per 1M tokens | ~$0.067 per 1024x1024 | 6-14s | **POC primary generation**: Fast batch exploration (3-4 options) |
+| `gemini-3.1-flash-image-preview` (Nano Banana 2) | Per 1M tokens | ~$0.067 per 1024x1024 | 6-14s | Quality-oriented Google image option |
 | `gemini-3-pro-image-preview` (Nano Banana Pro) | Per 1M tokens | ~$0.134 per 1024x1024 | 10-20s | Optional higher-fidelity generation path in later phase |
-| `imagen-4.0-fast-generate-001` | Per image | $0.02 | 7-15s | Alternative fast path with explicit pricing |
+| `imagen-4.0-fast-generate-001` | Per image | $0.02 | 7-15s | **POC primary Step 6 candidate**: best throughput for 3-4 outputs |
 | `imagen-4.0-generate-001` | Per image | $0.04 | 10-20s | Alternative quality path with explicit pricing |
 
 #### 4.4.2 OpenAI models
@@ -389,7 +391,7 @@ Reference docs:
 | Model | Input ($/ 1M tokens) | Output ($/ 1M tokens) | TTFB (typical) | Full response (typical) | Best for |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | `gpt-5.4-nano` | $0.20 | $1.25 | 0.3-0.9s | 1.5-5s | Cost-sensitive extraction, classification subtasks |
-| `gpt-5.4-mini` | $0.750 | $4.500 | 0.6-1.5s | 2-7s | **POC fallback**: Robust tool-calling, structured output |
+| `gpt-5.4-mini` | $0.750 | $4.500 | 0.6-1.5s | 2-7s | **POC primary text candidate** from observed benchmark |
 | `gpt-5.4` | $2.50 | $15.00 | 1.0-3.0s | 4-14s | High quality, expensive for high-volume flows |
 
 **Image Models**
@@ -400,20 +402,53 @@ Reference docs:
 
 #### 4.4.3 POC model selection rationale
 
-**Recommended primary path:**
-- Text reasoning: `gemini-2.5-flash` (lowest latency, cost-effective)
-- Image generation: `gemini-3.1-flash-image-preview` / Nano Banana 2 (fast exploration)
+**Recommended primary path (based on observed trace for POC Step 6 throughput):**
+- Text reasoning + clarification: `gpt-5.4-mini` (fastest observed text latency among traced text models).
+- Image generation (3-4 options): `imagen-4.0-fast-generate-001` (fastest observed image latency and returns 4 images in one call in benchmark run).
 
 **Recommended fallback path:**
-- Text: `gpt-5.4-mini` (robust tool-calling, structured output)
-- Image: `gpt-image-1.5` (vendor diversification, strong quality)
+- Text: `gemini-2.5-flash` (cost-effective and stable structured reasoning).
+- Image: `imagen-4.0-generate-001` for higher-fidelity alternative, or `gpt-image-1.5` for vendor diversification.
 
 **Why this combination:**
 
-1. **Primary path**: Single vendor (Google) simplifies operations; Nano Banana family provides speed-to-quality progression.
-2. **Fallback path**: OpenAI models ensure reliability and reduce vendor lock-in.
-3. **Cost-quality balance**: Nano Banana 2 optimizes throughput for 3-4 option exploration in POC.
-4. **Latency targets**: Gemini 2.5 Flash TTFB (0.5-1.2s) fits p95 ≤1.5s target; Nano Banana 2 (6-14s per image) fits p95 ≤25s for 3-4 images.
+1. **Measured speed advantage**: In the benchmark run, `gpt-5.4-mini` and `imagen-4.0-fast-generate-001` delivered the best end-to-end latency profile for generation-only POC.
+2. **Output-count fit**: `imagen-4.0-fast-generate-001` returned 4 images in one request, directly matching POC requirement (3-4 options).
+3. **Operational resilience**: Keeping both OpenAI and Google in fallback path reduces provider risk.
+4. **Phase alignment**: This selection optimizes Step 6 throughput first; quality-first model upgrades can be evaluated in next phase.
+
+#### 4.4.4 Observed benchmark snapshot (from trace run)
+
+Run reference:
+- Source: [logs/model_traces_benchmark_all.json](logs/model_traces_benchmark_all.json)
+- Date (UTC): 2026-03-24
+- Trace id: `trace-e70166b1f1f4`
+
+Observed text latency:
+
+| Model | Provider | Latency ms | Note |
+| :--- | :--- | :---: | :--- |
+| `gpt-5.4-mini` | OpenAI | 2894 | Fastest text model in this run |
+| `gpt-5.4-nano` | OpenAI | 3434 | Second fastest text model |
+| `gemini-2.5-flash` | Google | 6708 | Slower than OpenAI mini/nano in this run |
+| `gpt-5.4` | OpenAI | 7963 | Higher latency with likely stronger reasoning depth |
+| `gemini-2.5-pro` | Google | 16209 | Highest latency text model in this run |
+
+Observed image latency and output count:
+
+| Model | Provider | Latency ms | Image count | Note |
+| :--- | :--- | :---: | :---: | :--- |
+| `imagen-4.0-fast-generate-001` | Google | 5143 | 4 | Best throughput fit for POC generation |
+| `gemini-2.5-flash-image` | Google | 6015 | 1 | Fast single-image response |
+| `imagen-4.0-generate-001` | Google | 10471 | 4 | Slower but still multi-image |
+| `gemini-3.1-flash-image-preview` | Google | 21253 | 1 | Slower in this run |
+| `gemini-3-pro-image-preview` | Google | 23131 | 1 | Highest Google image latency in this run |
+| `gpt-image-1.5` | OpenAI | 28961 | 1 | Slowest image latency in this run |
+
+Benchmark caveats:
+- Single-run snapshot, not p95/p99 statistics.
+- Prompt and provider-side load can significantly shift results.
+- Quality score was not measured in this trace; selection here is throughput-oriented for POC.
 
 ---
 
