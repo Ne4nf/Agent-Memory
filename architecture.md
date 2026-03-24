@@ -44,14 +44,13 @@ These are POC acceptance targets, not long-term SLA commitments. They are valida
 
 | Area | Build (POC) | Defer |
 | :--- | :--- | :--- |
-| Intent + input | Detect logo intent, parse text/references, extract brand context | Multi-domain intent classifier |
-| Clarification | Ask clarification when needed, allow skip with explicit assumptions | Adaptive multi-turn clarification policy |
-| Reasoning | Stream reasoning blocks (input understanding, style inference, assumptions) | Multi-agent debate and self-critique loops |
-| Guideline | Generate structured design guideline before generation | Auto-optimization guideline loop via evaluator |
-| Direction selection | Optional 3-4 direction proposals for ambiguous requests | Personalized auto-ranking per user profile |
-| Generation | Generate 3-4 PNG options from guideline | Multi-model routing and automatic quality ranking |
-| Editing | Prompt-based edit on selected option + edit summary | Region/object-level editing |
-| Follow-up | Return quick follow-up suggestions | Personalized recommendation engine |
+| Intent + input | IntentDetectTool + InputExtractionTool + ReferenceImageAnalyzeTool | Multi-domain intent classifier |
+| Clarification | ClarificationTool + AssumptionBuilderTool | Adaptive multi-turn clarification policy |
+| Reasoning + guideline | DesignInferenceTool (reasoning + structured guideline) | Multi-agent debate and self-critique loops |
+| Direction selection | DirectionProposalTool (optional 3-4 directions) | Personalized auto-ranking per user profile |
+| Generation | LogoGenerationTool (3-4 PNG options) + StorageTool | Multi-model routing and automatic quality ranking |
+| Editing | LogoEditTool + StorageTool + edit summary | Region/object-level editing |
+| Follow-up | FollowupSuggestionTool (quick action suggestions) | Personalized recommendation engine |
 | Storage/session | Persist output URLs + metadata per request/session | Project library, version history, long-term memory |
 
 ---
@@ -62,7 +61,7 @@ These are POC acceptance targets, not long-term SLA commitments. They are valida
 
 #### 3.1.1 Why this solution
 
-This architecture is chosen to match the full spec execution logic (Step 1,2,3,4,5,6,7,9) while keeping the backend reusable and FE-independent.
+This architecture is chosen to match the full spec execution logic (Step 1,2,3,4,5,6,7,8) while keeping the backend reusable and FE-independent.
 
 Key reasons:
 
@@ -88,7 +87,7 @@ flowchart TD
     I --> K[Step 6: LogoGenerationTool]
     J --> K
     K --> L[Step 7: LogoEditTool]
-    L --> M[Step 9: FollowupSuggestionTool]
+    L --> M[Step 8: FollowupSuggestionTool]
 ```
 
 #### 3.1.3 Diagram 2 - System components (layered)
@@ -140,14 +139,14 @@ graph TB
 | AssumptionBuilderTool | Step 3 | Build explicit assumptions if user skips clarification | `gemini-2.5-flash` | Stored in guideline assumptions |
 | DesignInferenceTool | Step 4 | Infer style direction and design constraints | `gemini-2.5-flash` | Emits `reasoning` and `guideline` |
 | DirectionProposalTool | Step 5 (optional) | Create 3-4 design directions for ambiguous briefs | `gemini-2.5-flash` | Returns direction list for selection/default |
-| LogoGenerationTool | Step 6 | Generate 3-4 logo options | `imagen-4.0-fast-generate-001` | Throughput-optimized for exploration |
-| LogoEditTool | Step 7 | Regenerate selected logo from edit prompt | `imagen-4.0-generate-001` | Fidelity-optimized for refinement |
-| FollowupSuggestionTool | Step 9 | Suggest next edits/actions | `gemini-2.5-flash` | Quick action suggestions |
+| LogoGenerationTool | Step 6 | Generate 3-4 logo options | `nano-banana-2` | Throughput-optimized for exploration |
+| LogoEditTool | Step 7 | Regenerate selected logo from edit prompt | `nano-banana-pro` | Fidelity-optimized for refinement |
+| FollowupSuggestionTool | Step 8 | Suggest next edits/actions | `gemini-2.5-flash` | Quick action suggestions |
 | StorageTool | Shared | Upload images and return URLs | Storage/CDN | Used by generate and edit |
 
 ### 3.4 End-to-end pipeline
 
-#### 3.4.1 Full sequence (Step 1 -> Step 9)
+#### 3.4.1 Full sequence (Step 1 -> Step 8)
 
 ```mermaid
 sequenceDiagram
@@ -155,7 +154,7 @@ sequenceDiagram
     participant API as Stream API
     participant ORCH as Orchestrator
     participant LLM as Gemini 2.5 Flash
-    participant IMG as Imagen API
+    participant IMG as Nano Banana API
     participant STO as Storage/CDN
 
     FE->>API: POST /stream (logo_generate)
@@ -190,7 +189,7 @@ sequenceDiagram
     ORCH-->>API: chunk(reasoning), chunk(edit_result), chunk(suggestion), chunk(done)
     API-->>FE: edited output
 
-    Note over ORCH,LLM: Step 9
+    Note over ORCH,LLM: Step 8
     ORCH->>LLM: generate follow-up suggestions
     LLM-->>ORCH: actionable next steps
 ```
@@ -248,6 +247,20 @@ Frontend does not need to know:
 - prompt templates
 - provider/model names
 - tool routing
+
+### 3.7 Task and endpoint design (optimized)
+
+Recommended design:
+
+1. Keep one stream endpoint: `POST /internal/v1/tasks/stream`.
+2. Use `task_type` to route 3 capabilities: `logo_analyze`, `logo_generate`, `logo_edit`.
+3. Keep `logo_analyze` available for direct call (debug, replay, A/B tests), but in normal UX it is chained internally inside `logo_generate`.
+
+Why this is optimal:
+
+- Single FE integration path, lower coupling.
+- Task-first backend remains reusable and testable.
+- Clear separation: endpoint count is transport concern, `task_type` count is business capability concern.
 
 ---
 
@@ -362,12 +375,12 @@ Validation rules:
 
 ### 4.2 External APIs used by tool
 
-- Text + reasoning tools (Step 1,2,3,4,5,9):
+- Text + reasoning tools (Step 1,2,3,4,5,8):
   - Primary: `gemini-2.5-flash`
-  - Fallback adapter: OpenAI mini/flagship text model
+  - Fallback adapter: OpenAI GPT mini/flagship text model
 - Image generation/edit tools:
-  - Primary Step 6: `imagen-4.0-fast-generate-001`
-  - Primary Step 7: `imagen-4.0-generate-001`
+  - Primary Step 6: `nano-banana-2`
+  - Primary Step 7: `nano-banana-pro`
   - Optional fallback: OpenAI `gpt-image-1.5`
 
 Reference docs:
@@ -378,6 +391,17 @@ Reference docs:
 - OpenAI pricing docs: https://openai.com/api/pricing/
 
 ### 4.3 Concrete endpoint I/O
+
+- `POST /internal/v1/tasks/stream` (`task_type=logo_analyze`)
+  - Purpose:
+    - run Step 1 to Step 5 only (intent, extract/analyze, clarify, infer, direction)
+    - used for internal chaining or direct debug tools
+  - Output stream:
+    - `clarification` (if needed)
+    - `reasoning`
+    - `guideline`
+    - `direction_options` (optional)
+    - `done`
 
 - `POST /internal/v1/tasks/stream` (`task_type=logo_generate`)
   - Input:
@@ -417,33 +441,41 @@ Prices below are for planning/PO discussion and must be re-checked before releas
 
 #### 4.4.1 Text model benchmark
 
-| Vendor | Model | Input price (per 1M tokens) | Output price (per 1M tokens) | POC fit |
+| Vendor | Model | Input price (per 1M tokens) | Output price (per 1M tokens) | Typical latency (TTFB / full response) | POC fit |
 | :--- | :--- | :--- | :--- | :--- |
-| Google | `gemini-2.5-flash` | $0.30 | $2.50 | Strong default for low-latency reasoning + extraction |
-| Google | `gemini-2.5-pro` | $1.25 (<=200k prompt) | $10.00 (<=200k prompt) | Better deep reasoning, higher cost |
-| OpenAI | GPT-5.4 mini | $0.750 | $4.500 | Good fallback for robust tool-calling text tasks |
-| OpenAI | GPT-5.4 | $2.50 | $15.00 | High quality, expensive for high-volume POC flow |
+| Google | `gemini-2.5-flash` | $0.30 | $2.50 | ~0.5-1.2s / ~2-6s | Strong default for low-latency reasoning + extraction |
+| Google | `gemini-2.5-pro` | $1.25 (<=200k prompt) | $10.00 (<=200k prompt) | ~1.0-2.5s / ~4-12s | Better deep reasoning, higher cost |
+| OpenAI | `gpt-5.4-mini` | $0.750 | $4.500 | ~0.6-1.5s / ~2-7s | Good fallback for robust tool-calling text tasks |
+| OpenAI | `gpt-5.4-nano` | $0.20 | $1.25 | ~0.3-0.9s / ~1.5-5s | Best for cost-sensitive extraction/classification subtasks |
+| OpenAI | `gpt-5.4` | $2.50 | $15.00 | ~1.0-3.0s / ~4-14s | High quality, expensive for high-volume POC flow |
 
 #### 4.4.2 Image model benchmark
 
-| Vendor | Model | Price basis | Unit price | POC fit |
+| Vendor | Model | Price basis | Unit price | Typical latency (single image) | POC fit |
 | :--- | :--- | :--- | :--- | :--- |
-| Google | `imagen-4.0-fast-generate-001` | per generated image | $0.02 | Best for Step 6 exploration (3-4 options) |
-| Google | `imagen-4.0-generate-001` | per generated image | $0.04 | Better quality for final/edit refinement |
-| Google | `imagen-4.0-ultra-generate-001` | per generated image | $0.06 | Highest quality, use only when quality issues found |
-| OpenAI | `gpt-image-1.5` | output tokens pricing | $32 per 1M output tokens | Strong fallback/vendor diversification, requires token-based cost estimation |
+| Google | `nano-banana` | token/image based | see Google pricing page | ~8-18s | Baseline image generation path in Gemini image-generation stack |
+| Google | `nano-banana-2` | token/image based | see Google pricing page | ~6-14s | Better speed-quality balance for Step 6 (3-4 options) |
+| Google | `nano-banana-pro` | token/image based | see Google pricing page | ~10-20s | Better fidelity for Step 7 edit on selected logo |
+| Google | `imagen-4.0-fast-generate-001` | per generated image | $0.02 | ~7-15s | Alternative fast path with explicit per-image pricing |
+| Google | `imagen-4.0-generate-001` | per generated image | $0.04 | ~10-20s | Alternative quality path with explicit per-image pricing |
+| OpenAI | `gpt-image-1.5` | output tokens pricing | $32 per 1M output tokens | ~10-25s | Strong fallback/vendor diversification, requires token-based cost estimation |
 
 #### 4.4.3 Selected POC decision
 
 - Text: `gemini-2.5-flash`
-- Image Step 6 (generate options): `imagen-4.0-fast-generate-001`
-- Image Step 7 (edit selected): `imagen-4.0-generate-001`
+- Image Step 6 (generate options): `nano-banana-2`
+- Image Step 7 (edit selected): `nano-banana-pro`
 
 Why this combination:
 
 1. Keeps one primary vendor path for simpler operations.
-2. Balances throughput cost (Step 6) and quality consistency (Step 7).
+2. Balances throughput speed (Step 6) and quality consistency (Step 7).
 3. Keeps OpenAI fallback path ready if procurement/reliability changes.
+
+Note:
+
+- Price rows with explicit values come from public pricing pages.
+- Latency rows are planning benchmarks (typical ranges) and must be validated in project load tests.
 
 ---
 
