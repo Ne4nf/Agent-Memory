@@ -4,37 +4,57 @@
 
 ### 1.1 POC objective
 
-This POC builds a backend-driven Logo Design Service using a chat-first workflow.
+This POC builds a backend-driven Logo Design Service using an **async task-based** workflow.
 
 - Input: user query (text, optional image references).
-- Backend flow: detect intent, extract/analyze inputs, clarify conditionally, infer design direction, generate 3-4 options, support prompt-based editing.
-- Output: image URLs (minimum PNG 1024x1024) and edit summary.
+- Backend flow (simplified, 6 steps):
+  1. Detect intent
+  2. Extract/analyze inputs + reference images
+  3. Clarify via **mandatory field validation loop** (new—replaces optional clarification + skip)
+  4. Infer design direction + produce guideline (directly, no Step 5 selection)
+  5. Generate 3-4 PNG options
+  6. Return guideline + options + session context
+- Output: structured guideline + 3-4 image URLs + updated session_context
+- Edit (Step 7) and Follow-up (Step 8) **deferred to Phase 2**
 
 Business validation goals:
 
-- Prove users can complete the full loop: request -> analyze -> guideline -> generate -> select -> edit -> regenerate.
-- Prove visible reasoning is understandable and useful.
-- Prove editing is usable without region-level editing tools in POC.
+- Prove users can request → analyze → get guideline → receive 3-4 options in one async flow
+- Prove mandatory field validation produces consistently good guidelines (>= 85% quality)
+- Prove visible reasoning is understandable and useful
+- Prove session context threading works correctly across provider changes
 
 ### 1.2 Success metrics (POC acceptance targets)
 
-These are POC acceptance targets, not long-term SLA commitments. They are validated after benchmark and can be re-baselined before production.
+These are committed POC acceptance targets (Phase 1 baseline) for the simplified 4-step async flow. Targets are intentionally buffered for implementation risk and can be tightened in a later phase.
 
-- >= 90% of requests return a design guideline before image generation starts.
-- >= 90% of requests return 3-4 valid logo options.
-- >= 85% of sessions complete end-to-end flow without restart.
-- >= 85% of edit requests reflect requested changes while preserving core concept.
-- p95 time to first reasoning chunk <= 1.5s.
-- p95 time to complete 3-4 logo outputs <= 25s.
-- On generation/edit failure, actionable error + retry guidance returned <= 3s.
+**Analyze + Generate phase (Steps 1-6, async):**
+- >= 85% of requests produce validated `guideline` after mandatory field loop completes
+- >= 85% of requests return 3-4 valid logo options
+- >= 100% of sessions that reach generation stage produce images without restart (no retry needed)
+- p95 time for Steps 1-4 (analyze + infer) <= 2.5s
+- p95 time for Step 6 (generate 3-4 options) <= 35s
+- On clarification loop, user receives clear mandatory field questions within <= 2.5s
+- On generation failure, actionable error message returned <= 5s
 
-### 1.3 Technical constraints
+**Rationale**: Simplified POC (skip Step 5 direction selection, Steps 7-8 edit/follow-up) reduces orchestrator complexity. Clarification becomes **validation loop** (not optional), improving guideline quality from ground up. Async pattern with explicit session context threadsing makes each step independent and debuggable.
 
-- Primary stream endpoint is the main UX channel.
-- Out of scope in POC: touch edit, smart mark, region/object-level editing.
-- Session scope: single session only.
-- No separate rule engine; behavior is schema-driven + prompt-driven + tool-adapter driven.
-- Provider switching must not require changing FE stream contract.
+### 1.3 Technical constraints (POC-scoped)
+
+- Primary endpoint pattern is **async (task submit + polling)**, not stream
+  - Reason: Clarification loop naturally requires user interaction between steps; async with task resumption fits better than streaming
+  - Session context is **explicitly passed** through all tool calls (input/output parameters), not hidden in stream state
+- Out of scope in POC: 
+  - Step 5 (DirectionProposalTool) - Removed, DesignInferenceTool infers single best direction
+  - Step 7 (Edit) - Deferred to Phase 2
+  - Step 8 (Follow-up) - Deferred to Phase 2
+  - Touch edit, smart mark, region/object-level editing
+- Clarification becomes **mandatory validation loop**:
+  - Orchestrator keeps asking until all mandatory fields (`name`, `style`, `color`, `symbol`) satisfied
+  - No skip-with-assumptions; every request must produce fully validated guideline
+- Session scope: single session only, with short-term context memory reused across requests in the same `session_id`
+- No separate rule engine; behavior is schema-driven + prompt-driven + tool-adapter driven
+- Provider switching must not require changing FE polling contract or session context schema
 
 ---
 
@@ -45,14 +65,14 @@ These are POC acceptance targets, not long-term SLA commitments. They are valida
 | Area | Build (POC) | Defer |
 | :--- | :--- | :--- |
 | Intent + input | Detect logo intent, parse text/references, extract brand context | Multi-domain intent classifier |
-| Clarification | Ask clarification when needed, allow skip with explicit assumptions | Adaptive multi-turn clarification policy |
-| Reasoning | Stream reasoning blocks (input understanding, style inference, assumptions) | Multi-agent debate and self-critique loops |
-| Guideline | Generate structured design guideline before generation | Auto-optimization guideline loop via evaluator |
-| Direction selection | Optional 3-4 direction proposals for ambiguous requests | Personalized auto-ranking per user profile |
-| Generation | Generate 3-4 PNG options from guideline | Multi-model routing and automatic quality ranking |
-| Editing | Prompt-based edit on selected option + edit summary | Region/object-level editing |
-| Follow-up | Return quick follow-up suggestions | Personalized recommendation engine |
-| Storage/session | Persist output URLs + metadata per request/session | Project library, version history, long-term memory |
+| Clarification | Mandatory field validation loop: ask until `{name, style, color, symbol}` provided | Adaptive multi-turn clarification policy |
+| Reasoning | Step 4 inference produces guideline directly; no separate direction selection | Multi-agent debate and self-critique loops |
+| Guideline | Generate structured design guideline before generation (Step 4 output) | Auto-optimization guideline loop via evaluator |
+| Direction selection | **SKIP - Removed**: DesignInferenceTool infers single best direction directly | Personalized auto-ranking per user profile |
+| Generation | Generate 3-4 PNG options from guideline (Step 6) | Multi-model routing and automatic quality ranking |
+| Editing | **SKIP - Deferred to Phase 2** | Region/object-level editing, prompt-based refinement |
+| Follow-up | **SKIP - Deferred to Phase 2** | Personalized recommendation engine |
+| Storage/session | Persist guideline + image URLs + session context state per `session_id` | Project library, version history, long-term memory |
 
 ---
 
@@ -71,158 +91,213 @@ Key reasons:
 3. Provider/model decisions are replaceable at adapter level.
 4. Stream-first gives user-visible progress during long-running image operations.
 
-#### 3.1.2 Diagram 1 - Agent pipeline (flowchart)
+#### 3.1.2 Diagram 1 - Agent pipeline (POC-scoped, simplified)
 
 ```mermaid
 flowchart TD
     A[User Request] --> B[Step 1: IntentDetectTool]
     B --> C[Step 2: InputExtractionTool + ReferenceImageAnalyzeTool]
-    C --> D{Step 3: Clarify needed?}
-    D -->|Yes| E[ClarificationTool]
-    D -->|No or skip| F[AssumptionBuilderTool]
-    E --> G[Step 4: DesignInferenceTool]
-    F --> G
-    G --> H{Step 5: Direction selection needed?}
-    H -->|Yes| I[DirectionProposalTool]
-    H -->|No| J[Default direction]
-    I --> K[Step 6: LogoGenerationTool]
-    J --> K
-    K --> L[Step 7: LogoEditTool]
-    L --> M[Step 8: FollowupSuggestionTool]
+    C --> D{Step 3: Mandatory fields\nname/style/color/symbol?}
+    D -->|Missing| E[ClarificationTool ask]
+    E --> F[User answers]
+    F --> D
+    D -->|Complete| G[Step 4: DesignInferenceTool\ninfer + produce guideline]
+    G --> H[Step 6: LogoGenerationTool\ngenerate 3-4 options]
+    H --> I[Done - return options + session context]
 ```
 
-#### 3.1.3 Diagram 2 - System components (layered)
+**POC-scoped design**: Removed Step 5 (DirectionProposalTool) and Steps 7-8 (Edit/Follow-up). Clarification becomes a **validation loop** until mandatory fields satisfied.
+
+#### 3.1.3 Diagram 2 - System components (async pattern)
 
 ```mermaid
 graph TB
-    FE["Frontend Chat/Canvas"]
-    API["Communication Layer\n/internal/v1/tasks/stream"]
-    TASK["Task Layer\nlogo_generate/logo_edit"]
-    ORCH["Orchestrator\nplanning + coordination"]
-    TOOLS["Tool Layer\nintent/extract/clarify/infer/generate/edit"]
+    FE["Frontend Chat/Canvas\n(polling client)"]
+    API["Async API\n/tasks/submit + /tasks/{id}/status"]
+    QUEUE["Task Queue\n(FIFO orchestration)"]
+    ORCH["Orchestrator\nsteps coordination + session context"]
+    TOOLS["Tool Layer\nintent/extract/clarify/infer/generate"]
     LLM["LLM APIs\nGemini/OpenAI"]
     IMG["Image APIs\nImagen/OpenAI image"]
     STO["Storage/CDN"]
 
     FE --> API
-    API --> TASK
-    TASK --> ORCH
+    API --> QUEUE
+    QUEUE --> ORCH
     ORCH --> TOOLS
     TOOLS --> LLM
     TOOLS --> IMG
     TOOLS --> STO
     STO --> FE
+    
+    Note1["Session context flows<br/>explicitly through<br/>each tool call"]
 ```
 
-### 3.2 Architecture principles
+**Async advantages for POC**:
+- No need for streaming protocol complexity
+- Clarification loop naturally integrates with task resumption
+- Each LLM step is independently retryable
+- Session context state is **deterministic** at each checkpoint
+
+### 3.2 Architecture principles (POC-optimized)
 
 - Task-first:
-  - Business capabilities are task-based (`logo_generate`, `logo_edit`).
-  - Routing by `task_type`, no endpoint-specific business hardcoding.
+  - Business capabilities are task-based (`logo_generate`)
+  - Routing by `task_type`, no endpoint-specific business hardcoding
+  - POC Phase 2 can add `logo_edit` as separate task_type
 - Schema-first:
-  - All contracts validated by Pydantic.
-  - New fields/features evolve by schema + prompt template extension.
-- Stream-first:
-  - `POST /internal/v1/tasks/stream` is default path.
-  - FE renders by chunk contract, independent from provider internals.
-- Tool abstraction:
-  - Orchestrator calls stable tool interfaces.
-  - Model/provider switching only touches adapters.
+  - All contracts validated by Pydantic
+  - New fields/features evolve by schema + prompt template extension
+- Async-first (POC):
+  - `POST /internal/v1/tasks/submit` returns task_id immediately
+  - FE polls `GET /internal/v1/tasks/{task_id}/status` for results
+  - Reason: Clarification loop requires user input; async fits naturally
+  - Phase 2 can introduce streaming if needed for image output performance
+- Tool abstraction + session context threading:
+  - Orchestrator calls stable tool interfaces with **explicit session_context parameters**
+  - Each tool receives session_context, updates it, returns updated copy
+  - Provider/model switching only touches adapters
+  - No hidden state mutations; session context is auditable at every step
 
-### 3.3 Component breakdown (tool-level)
+### 3.3 Component breakdown (POC-scoped tools only)
 
-| Component / Tool | Spec step | Role | Model Type | Notes |
+| Component / Tool | Spec step | Role | Model Type | In POC? |
 | :--- | :--- | :--- | :--- | :--- |
-| IntentDetectTool | Step 1 | Detect if request is logo design intent and route flow | Low-latency text LLM for classification | Emits early `reasoning` chunk |
-| InputExtractionTool | Step 2 | Extract brand_name, industry, style, color, symbol from text | Text LLM with structured output capability | Returns structured JSON |
-| ReferenceImageAnalyzeTool | Step 2 | Analyze reference image style/color/typography/iconography | Multimodal LLM for image understanding | Optional when references provided |
-| ClarificationTool | Step 3 | Generate clarification questions when info is insufficient | Text LLM for question generation | Supports user skip |
-| AssumptionBuilderTool | Step 3 | Build explicit assumptions if user skips clarification | Text LLM for reasoning | Stored in guideline assumptions |
-| DesignInferenceTool | Step 4 | Infer style direction and design constraints | Text LLM for design reasoning | Emits `reasoning` and `guideline` |
-| DirectionProposalTool | Step 5 (optional) | Create 3-4 design directions for ambiguous briefs | Text LLM for option generation | Returns direction list for selection/default |
-| LogoGenerationTool | Step 6 | Generate 3-4 logo options | Fast image generation model for exploration | Throughput-optimized for exploration |
-| LogoEditTool | Step 7 | Regenerate selected logo from edit prompt | High-fidelity image generation model for refinement | Fidelity-optimized for refinement |
-| FollowupSuggestionTool | Step 8 | Suggest next edits/actions | Text LLM for action suggestion | Quick action suggestions |
-| StorageTool | Shared | Upload images and return URLs | Cloud storage API | Used by generate and edit |
+| IntentDetectTool | Step 1 | Detect logo design intent and route flow | Low-latency text LLM for classification | ✅ Yes |
+| InputExtractionTool | Step 2 | Extract brand_name, industry, style, color, symbol from text | Text LLM with structured output capability | ✅ Yes |
+| ReferenceImageAnalyzeTool | Step 2 | Analyze reference image style/color/typography/iconography | Multimodal LLM for image understanding | ✅ Yes (optional) |
+| ClarificationTool | Step 3 | **Loop**: ask mandatory field questions until `{name, style, color, symbol}` all satisfied | Text LLM for question generation | ✅ Yes |
+| AssumptionBuilderTool | Step 3 | Build explicit assumptions if user skips clarification | Text LLM for reasoning | ❌ Skipped |
+| DesignInferenceTool | Step 4 | Infer best design direction and produce guideline from validated fields | Text LLM for design reasoning | ✅ Yes |
+| DirectionProposalTool | Step 5 (optional) | Create 3-4 design directions for selection | Text LLM for option generation | ❌ Skipped |
+| LogoGenerationTool | Step 6 | Generate 3-4 PNG options from guideline | Fast image generation model for exploration | ✅ Yes |
+| LogoEditTool | Step 7 | Regenerate edited logo from edit prompt | High-fidelity image generation model | ❌ Deferred Phase 2 |
+| FollowupSuggestionTool | Step 8 | Suggest next edits/actions | Text LLM for action suggestion | ❌ Deferred Phase 2 |
+| StorageTool | Shared | Upload images and return signed URLs | Cloud storage API | ✅ Yes |
 
 ### 3.4 End-to-end pipeline
 
 POC exposes 2 external task types only: `logo_generate` and `logo_edit`. Analyze is an internal stage within `logo_generate`.
 
-#### 3.4.1 Full sequence (Step 1 -> Step 8)
+#### 3.4.1 POC flow (Step 1 -> Step 6, async pattern)
 
 ```mermaid
 sequenceDiagram
     actor FE as Frontend
-    participant API as Stream API
+    participant API as Async API
+    participant QUEUE as Task Queue
     participant ORCH as Orchestrator
     participant LLM as Gemini 2.5 Flash
-    participant IMG as Nano Banana API
+    participant IMG as Image API
     participant STO as Storage/CDN
 
-    FE->>API: POST /stream (logo_generate)
-    API->>ORCH: validate schema + init context
+    Note over FE,API: PHASE 1: SUBMIT (Async)
+    FE->>API: POST /internal/v1/tasks/submit (logo_generate)
+    API->>QUEUE: enqueue task_id + session_id + logo_generate request
+    API-->>FE: return task_id + session_token
 
-    Note over ORCH,LLM: Step 1 + 2 + 3 + 4 + 5
-    ORCH->>LLM: intent detect + extract + clarify + infer + direction
-    LLM-->>ORCH: reasoning + guideline (+ clarification/directions if needed)
-    ORCH-->>API: chunk(clarification/reasoning/guideline)
-    API-->>FE: stream chunks
+    Note over ORCH,LLM: PHASE 2: PROCESS (Orchestrator)
+    QUEUE->>ORCH: dequeue task (logo_generate + session_context)
+    ORCH->>LLM: Step 1 + 2: intent detect + extract
+    LLM-->>ORCH: extracted brand_context
 
-    Note over ORCH,IMG: Step 6
-    loop 3-4 options
-        ORCH->>IMG: generate image
-        IMG-->>ORCH: image bytes
-        ORCH->>STO: upload
-        STO-->>ORCH: image_url
-        ORCH-->>API: chunk(image_option)
-        API-->>FE: image_option
+    loop Step 3: Clarification validation
+        ORCH->>ORCH: check: has name, style, color, symbol?
+        alt Missing mandatory fields
+            ORCH-->>FE: emit chunk(clarification_needed) + session_token
+            FE-->>API: user answers → re-submit with clarification_context
+            QUEUE->>ORCH: resume task with updated context
+        else Complete
+            break All mandatory fields satisfied
+        end
     end
-    ORCH-->>API: chunk(suggestion), chunk(done)
-    API-->>FE: done
 
-    Note over ORCH,IMG: Step 7
-    FE->>API: POST /stream (logo_edit)
-    API->>ORCH: selected option + edit prompt
-    ORCH->>LLM: parse edit intent + summarize
-    ORCH->>IMG: regenerate edited image
-    IMG-->>ORCH: edited image bytes
-    ORCH->>STO: upload
-    STO-->>ORCH: edited_image_url
-    ORCH-->>API: chunk(reasoning), chunk(edit_result), chunk(suggestion), chunk(done)
-    API-->>FE: edited output
+    ORCH->>LLM: Step 4: design inference (produce guideline)
+    LLM-->>ORCH: guideline + design direction
 
-    Note over ORCH,LLM: Step 8
-    ORCH->>LLM: generate follow-up suggestions
-    LLM-->>ORCH: actionable next steps
+    loop Step 6: Generate 3-4 options
+        ORCH->>IMG: generate image (variant i)
+        IMG-->>ORCH: image bytes
+        ORCH->>STO: upload image
+        STO-->>ORCH: image_url
+        ORCH->>ORCH: save to session_context
+    end
+
+    ORCH->>QUEUE: mark task complete
+    FE->>API: GET /internal/v1/tasks/{task_id}/status
+    API-->>FE: return guideline + 3-4 image URLs + updated session_context
+
+    Note over FE,API: Task returned to FE; session_id ready for Phase 2 (future: edit/regeneration)
 ```
 
-#### 3.4.2 Stage A - Analyze (Step 1 to Step 5)
+**Advantages of async pattern for POC:**
+- Each LLM step is **independent and stateless** (easier to test/debug)
+- Clarification loop naturally integrates with task resumption
+- Session context **explicitly threaded** through task state
+- Orchestrator can **parallelize image generation** within Step 6 without blocking API response
+
+#### 3.4.2 Stage A - Analyze + Validate (Steps 1-4, POC-scoped)
 
 | Item | Detail |
 | :--- | :--- |
 | Input | `LogoGenerateInput` (query, references, session_id) |
-| Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationTool, AssumptionBuilderTool, DesignInferenceTool, DirectionProposalTool(optional) |
-| Output chunks | `clarification` (optional), `reasoning`, `guideline`, `suggestion` (optional) |
-| Target | First chunk <= 1.5s p95; guideline availability >= 90% |
+| Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationTool (loop), DesignInferenceTool |
+| **Key difference** | **ClarificationTool runs in a loop** until all mandatory fields (`name`, `style`, `color`, `symbol`) are satisfied; no skip-with-assumptions allowed |
+| Output chunks | `guideline` (from Step 4), session context updated with validated brand_context |
+| Target | All 1-4 steps complete in p95 <= 2.5s; 100% guideline availability (mandatory validation) |
 
-#### 3.4.3 Stage B - Generate (Step 6)
+#### 3.4.3 Stage B - Generate (Step 6, POC endpoint)
 
 | Item | Detail |
 | :--- | :--- |
-| Input | guideline + selected/default direction + variation_count |
+| Input | guideline (from Stage A) + session_context + variation_count (3-4) |
 | Tools used | LogoGenerationTool, StorageTool |
-| Output chunks | `image_option` x 3-4, `suggestion`, `done` |
-| Target | 3-4 valid outputs >= 90%; total generation <= 25s p95 |
+| Output | 3-4 image URLs + updated session_context (selected_option_id for next phase) |
+| Target | 3-4 valid outputs >= 85%; p95 generation time <= 35s |
 
-#### 3.4.4 Stage C - Edit (Step 7)
+**Note**: Edit (Step 7) and Follow-up (Step 8) are **deferred to Phase 2**. POC ends when 3-4 options returned with guidelines.
 
-| Item | Detail |
-| :--- | :--- |
-| Input | `LogoEditInput` (selected image, edit prompt, guideline) |
-| Tools used | LogoEditTool, StorageTool, FollowupSuggestionTool |
-| Output chunks | `reasoning`, `edit_result`, `suggestion`, `done` |
-| Target | Edit success >= 85%; preserve concept consistency |
+#### 3.4.5 Session context threading (critical for tool swaps)
+
+**Problem**: When tools are swapped (e.g., provider change), session context must flow **through all tool calls**. This must be **explicit**, not implicit.
+
+**Solution - Session context is passed as method parameter in all tool interfaces:**
+
+```python
+class ClarificationTool:
+    def ask_mandatory_fields(
+        self,
+        extracted_context: BrandContext,
+        session_context: SessionContextState,  # ← explicit in
+        **kwargs
+    ) -> Tuple[ClarificationQuestions, SessionContextState]:  # ← explicit out
+        """Ask which mandatory fields are missing, return updated session."""
+        
+class DesignInferenceTool:
+    def infer_guideline(
+        self,
+        brand_context: BrandContext,
+        session_context: SessionContextState,  # ← explicit in
+        **kwargs
+    ) -> Tuple[DesignGuideline, SessionContextState]:  # ← explicit out
+        """Infer best direction + guideline, return updated session."""
+
+class LogoGenerationTool:
+    def generate_batch(
+        self,
+        guideline: DesignGuideline,
+        session_context: SessionContextState,  # ← explicit in
+        variation_count: int = 3,
+        **kwargs
+    ) -> Tuple[List[LogoOption], SessionContextState]:  # ← explicit out
+        """Generate 3-4 images, return updated session + image URLs."""
+```
+
+**Benefits:**
+- Session context is **deterministic and auditable** (no hidden state mutations)
+- Tool adapter can be swapped without breaking session flow
+- Clarification loop progress is **tracked in session_context** (question count, answered fields)
+- Each tool **only consumes what it needs** from context (clear contract)
 
 ### 3.5 Reuse and extensibility
 
@@ -288,10 +363,22 @@ class DesignGuideline(BaseModel):
     assumptions: List[Assumption] = Field(default_factory=list)
 
 
+class SessionContextState(BaseModel):
+    session_id: str
+    latest_brand_context: Optional[BrandContext] = None
+    latest_guideline: Optional[DesignGuideline] = None
+    selected_option_id: Optional[str] = None
+    selected_image_url: Optional[HttpUrl] = None
+    latest_edit_summary: Optional[str] = None
+    assumptions: List[Assumption] = Field(default_factory=list)
+    generated_option_ids: List[str] = Field(default_factory=list)
+
+
 class LogoGenerateInput(BaseModel):
     session_id: str
     query: str
     references: List[ReferenceImage] = Field(default_factory=list)
+    use_session_context: bool = True
     allow_skip_clarification: bool = True
     variation_count: int = Field(default=4, ge=3, le=4)
     output_format: Literal["png"] = "png"
@@ -314,10 +401,10 @@ class LogoGenerateOutput(BaseModel):
 
 class LogoEditInput(BaseModel):
     session_id: str
-    selected_option_id: str
-    selected_image_url: HttpUrl
+    selected_option_id: Optional[str] = None
+    selected_image_url: Optional[HttpUrl] = None
     edit_prompt: str
-    guideline: DesignGuideline
+    guideline: Optional[DesignGuideline] = None
 
 
 class LogoEditOutput(BaseModel):
@@ -342,10 +429,87 @@ class StreamEnvelope(BaseModel):
 
 Validation rules:
 
+### 4.1 Pydantic models (POC Phase 1)
+
+```python
+from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, Field, HttpUrl
+
+
+class ReferenceImage(BaseModel):
+   source_url: Optional[HttpUrl] = None
+   storage_key: Optional[str] = None
+
+
+class BrandContext(BaseModel):
+   """Extracted user input. All fields are optional initially; some become mandatory through validation loop."""
+   brand_name: Optional[str] = None
+   industry: Optional[str] = None
+   style_preference: List[str] = Field(default_factory=list)  # Mandatory: >= 1 style after clarification
+   color_preference: List[str] = Field(default_factory=list)  # Mandatory: >= 1 color after clarification
+   symbol_preference: List[str] = Field(default_factory=list)
+
+
+class Assumption(BaseModel):
+   key: str
+   value: str
+   reason: str
+
+
+class ClarificationQuestion(BaseModel):
+   key: str  # e.g., "industry", "style", "color"
+   question: str
+   required: bool = True
+
+
+class DesignGuideline(BaseModel):
+   """Output of Step 4 inference. All fields populated only after full validation loop."""
+   concept_statement: str  # Synthesized from brand_context
+   style_direction: List[str]  # >= 1, inferred or provided
+   color_palette: List[str]  # >= 1, inferred or provided
+   typography_direction: List[str]
+   icon_direction: List[str]
+   constraints: List[str] = Field(default_factory=list)
+
+
+class SessionContextState(BaseModel):
+   """Persists across requests in same session_id for Phase 2 (edit) reuse."""
+   session_id: str
+   latest_brand_context: Optional[BrandContext] = None
+   latest_guideline: Optional[DesignGuideline] = None
+   generated_option_ids: List[str] = Field(default_factory=list)
+
+
+class LogoGenerateInput(BaseModel):
+   """Request to generate logo."""
+   task_type: str = "logo_generate"
+   session_id: str
+   query: str
+   references: List[ReferenceImage] = Field(default_factory=list)
+   use_session_context: bool = True  # Merge with stored context in same session_id
+   variation_count: int = Field(default=4, ge=3, le=4)
+   output_size: str = "1024x1024"
+
+
+class LogoOption(BaseModel):
+   option_id: str
+   image_url: HttpUrl
+   quality_flags: List[str] = Field(default_factory=list)  # e.g., ["artifact_detected"], or []
+
+
+class LogoGenerateOutput(BaseModel):
+   """Response from Step 6 (generate). No directions (Step 5 removed)."""
+   guideline: DesignGuideline
+   options: List[LogoOption]  # 3-4 images
+```
+
+Validation rules (POC Phase 1):
+
 - `query` is required and non-empty after trim.
 - `variation_count` must be 3 or 4.
-- Edit flow requires selected image and edit prompt.
-- If clarification is skipped, guideline must include explicit assumptions.
+- Clarification loop is **mandatory**: orchestrator keeps asking until `{name, style, color, symbol}` are all satisfied.
+- If `use_session_context=true`, backend merges request with stored `latest_guideline` and `latest_brand_context` in same `session_id`.
+- LogoEditInput/Output deferred to Phase 2.
 
 ### 4.2 External APIs and model selection
 
@@ -364,39 +528,103 @@ Reference docs:
 - OpenAI pricing docs: https://openai.com/api/pricing/
 - OpenAI models docs: https://platform.openai.com/docs/models
 
-### 4.3 Concrete endpoint I/O
+### 4.3 Concrete endpoint I/O (POC async pattern)
 
-- `POST /internal/v1/tasks/stream` (`task_type=logo_generate`)
-  - Input:
-    - `query`
-    - `session_id`
-    - `references` (optional)
-    - `variation_count` (optional, 3-4)
-  - Output stream:
-    - `clarification` (if needed)
-    - `reasoning`
-    - `guideline`
-    - `direction_options` (optional)
-    - `image_option` x 3-4
-    - `suggestion`
-    - `done`
+**POC endpoints (Async, non-streaming):**
 
-- `POST /internal/v1/tasks/stream` (`task_type=logo_edit`)
-  - Input:
-    - `session_id`
-    - `selected_option_id`
-    - `selected_image_url`
-    - `edit_prompt`
-    - `guideline`
-  - Output stream:
-    - `reasoning`
-    - `edit_result`
-    - `suggestion`
-    - `done`
+#### POST `/internal/v1/tasks/submit` (logo_generate)
 
-- Optional async fallback:
-  - `POST /internal/v1/tasks/submit`
-  - `GET /internal/v1/tasks/{task_id}/status`
+**Request body** (`LogoGenerateInput`):
+```json
+{
+  "task_type": "logo_generate",
+  "session_id": "sess-abc123",
+  "query": "Design a logo for Azure Bean Vietnamese coffee",
+  "references": [],
+  "use_session_context": true
+}
+```
+
+**Response** (202 Accepted):
+```json
+{
+  "task_id": "task-xyz789",
+  "session_token": "token-abc",
+  "status": "PENDING",
+  "message": "Task queued. Poll status endpoint for progress."
+}
+```
+
+#### GET `/internal/v1/tasks/{task_id}/status`
+
+**Response** (200 OK, after completion):
+```json
+{
+  "task_id": "task-xyz789",
+  "session_id": "sess-abc123",
+  "status": "COMPLETED",
+  "result": {
+    "guideline": {
+      "concept_statement": "...",
+      "style_direction": ["minimal", "modern"],
+      "color_palette": ["#001f3f", "#ff6b35"],
+      "typography_direction": ["sans-serif"],
+      "icon_direction": ["abstract geometry"],
+      "constraints": []
+    },
+    "options": [
+      {
+        "option_id": "opt-1",
+        "image_url": "https://cdn.../logo_opt1.png",
+        "generated_at": "2026-03-24T10:00:00Z"
+      },
+      {
+        "option_id": "opt-2",
+        "image_url": "https://cdn.../logo_opt2.png",
+        "generated_at": "2026-03-24T10:00:00Z"
+      }
+    ]
+  },
+  "session_context": {
+    "session_id": "sess-abc123",
+    "latest_brand_context": {
+      "brand_name": "Azure Bean",
+      "industry": "F&B / Coffee",
+      "style_preference": ["minimal", "modern"],
+      "color_preference": ["#001f3f", "#ff6b35"],
+      "symbol_preference": ["abstract bean + wave"]
+    },
+    "generated_option_ids": ["opt-1", "opt-2", "opt-3"]
+  }
+}
+```
+
+**Response** (200 OK, clarification needed - awaiting user input):
+```json
+{
+  "task_id": "task-xyz789",
+  "session_id": "sess-abc123",
+  "status": "AWAITING_INPUT",
+  "clarification_needed": {
+    "missing_mandatory_fields": ["industry", "color_preference"],
+    "clarification_message": "To create better guidelines, please provide:\n1) Your business industry\n2) Preferred color palette"
+  },
+  "session_token": "token-abc"
+}
+```
+
+**User's next action**: Submit re-request with clarification answers → orchestrator resumes task → polling continues.
+
+#### (Future Phase 2) logo_edit endpoint
+
+_Edit feature (Step 7) deferred to Phase 2._
+
+**Why async instead of stream for POC?**
+- Clarification loop requires **user interaction** between LLM calls → async with polling is more natural than streaming
+- Session context threading is **explicit** and easier to audit than streaming state mutations
+- Each LLM/image step is **independent task** that can be debugged/retried independently
+- Image generation can **parallelize** internally without blocking API response stream
+- Phase 2 can re-introduce stream for **image streaming output** if needed (separate from logic flow)
 
 ### 4.4 Model benchmark by vendor (POC-oriented)
 
@@ -416,8 +644,8 @@ Reference docs:
 | Model | Pricing type | Unit price | Latency (per image) | Best for |
 | :--- | :--- | :--- | :--- | :--- |
 | `gemini-2.5-flash-image` (Nano Banana) | Per 1M tokens | $0.039 per 1024x1024 | 8-18s | Baseline fast generation, legacy option |
-| `gemini-3.1-flash-image-preview` (Nano Banana 2) | Per 1M tokens | ~$0.067 per 1024x1024 | 6-14s | **POC primary Step 6**: Fast batch exploration (3-4 options) |
-| `gemini-3-pro-image-preview` (Nano Banana Pro) | Per 1M tokens | ~$0.134 per 1024x1024 | 10-20s | **POC primary Step 7**: High-fidelity refinement on selected option |
+| `gemini-3.1-flash-image-preview` (Nano Banana 2) | Per 1M tokens | ~$0.067 per 1024x1024 | 6-14s | **POC primary Step 6**: Fast 3-4 option generation |
+| `gemini-3-pro-image-preview` (Nano Banana Pro) | Per 1M tokens | ~$0.134 per 1024x1024 | 10-20s | Phase 2 (edit/refinement) |
 | `imagen-4.0-fast-generate-001` | Per image | $0.02 | 7-15s | Alternative fast path with explicit pricing |
 | `imagen-4.0-generate-001` | Per image | $0.04 | 10-20s | Alternative quality path with explicit pricing |
 
@@ -437,23 +665,26 @@ Reference docs:
 | :--- | :--- | :--- | :--- | :--- |
 | `gpt-image-1.5` (state-of-the-art) | Output tokens | $32 per 1M tokens | 10-25s | **POC fallback**: Vendor diversification, strong quality, token-based cost |
 
-#### 4.4.3 POC model selection rationale
+#### 4.4.3 POC model selection rationale (simplified for Phase 1)
 
-**Recommended primary path:**
-- Text reasoning: `gemini-2.5-flash` (lowest latency, cost-effective)
-- Image Step 6 (generate 3-4 options): `gemini-3.1-flash-image-preview` / Nano Banana 2 (fast exploration)
-- Image Step 7 (edit selected option): `gemini-3-pro-image-preview` / Nano Banana Pro (high fidelity)
+**POC Phase 1 (Steps 1-6 only):**
+- Text reasoning: `gemini-2.5-flash` (lowest latency, cost-effective for Steps 1-4)
+- Image generation: `gemini-3.1-flash-image-preview` / Nano Banana 2 (fast, good quality for 3-4 exploration options)
 
 **Recommended fallback path:**
 - Text: `gpt-5.4-mini` (robust tool-calling, structured output)
 - Image: `gpt-image-1.5` (vendor diversification, strong quality)
 
-**Why this combination:**
+**Why this combination (Phase 1):**
 
-1. **Primary path**: Single vendor (Google) simplifies operations; Nano Banana family provides speed-to-quality progression.
+1. **Primary path**: Single vendor (Google) simplifies operations; Nano Banana 2 is optimized for fast exploration (6-14s per image = ~20-50s for 3-4 options).
 2. **Fallback path**: OpenAI models ensure reliability and reduce vendor lock-in.
-3. **Cost-quality balance**: Nano Banana 2 optimizes throughput for exploration; Nano Banana Pro ensures refinement quality.
-4. **Latency targets**: Gemini 2.5 Flash TTFB (0.5-1.2s) fits p95 ≤1.5s target; Nano Banana 2 (6-14s per image) fits p95 ≤25s for 3-4 images.
+3. **Cost-quality balance**: Minimal cost for POC validation; ample quality for guideline + 3-4 concepts.
+4. **Latency targets**: Gemini 2.5 Flash TTFB (0.5-1.2s) fits p95 <=2.5s for Steps 1-4; Nano Banana 2 (6-14s per image) fits p95 <=35s for Step 6.
+
+**Phase 2 (when edit added):**
+- Upgrade image model to Nano Banana Pro OR evaluate OpenAI for refinement quality
+- Keep same LLM models unless performance requires upgrade
 
 ---
 
@@ -463,44 +694,47 @@ Reference docs:
 
 Risk:
 
-- 3-4 image generation can exceed p95 target depending on provider queue and concurrency.
+- 3-4 image generation can exceed p95 target (35s) depending on provider queue and concurrency.
 
 Mitigation:
 
-- Emit reasoning early to keep UX responsive.
-- Parallel generation where provider allows.
+- Parallelize image generation within Step 6 where possible.
 - Timeout + retry policy for transient failures.
-- Near-timeout fallback from 4 outputs to 3 outputs.
+- Near-timeout fallback: if approaching 35s limit, reduce from 4 outputs to 3 outputs.
+- Monitor per-image latency percentiles to detect provider degradation early.
 
 ### 5.2 Generation quality
 
 Risk:
 
 - Outputs can drift from guideline or include artifacts.
+- Guideline may be underspecified if mandatory field validation is insufficient.
 
 Mitigation:
 
-- Add `quality_flags` per option.
-- Keep guideline-first prompt template stable.
-- Return warning and targeted edit suggestions.
+- Add `quality_flags` per option (e.g., "artifact_detected", "off_guideline").
+- Keep guideline-first prompt template stable and well-validated.
+- Collect user feedback signal: thumbs-up/down on generated options to improve validation loop.
+- Phase 2 can add guideline refinement based on feedback.
 
 ### 5.3 Cost
 
 Risk:
 
-- Combined text reasoning + multi-image generation + edits can increase request cost quickly.
+- Text reasoning (Steps 1-4) + multi-image generation (Step 6) cost can accumulate if many clarification loops.
 
 Mitigation:
 
 - Track cost per `request_id` and `session_id`.
-- Default limit on edit retries in POC.
-- Reuse context/guideline within session.
-- Keep benchmark table updated at each milestone.
+- Limit clarification loop retries (e.g., max 3 rounds of questions).
+- Reuse context/guideline within session to avoid re-processing same request.
+- Keep model benchmark table updated; rotate to cheaper models if quality parity achieved.
 
-### 5.4 Open technical decisions
+### 5.4 Open technical decisions (Phase 1)
 
-- Production stream protocol finalization: NDJSON vs gRPC stream.
-- Signed URL TTL policy by asset type.
-- Deterministic seed policy for edit consistency.
-- Quality gate policy: hard fail vs soft warning.
-- OpenAI fallback trigger policy (manual switch vs automatic failover).
+- Task queue implementation: in-memory vs Redis vs cloud queue service?
+- Clarification loop max rounds policy: hard limit vs adaptive per user behavior?
+- Signed URL TTL policy by asset type (guideline vs generated images)?
+- Session context TTL and reset policy (automatic 24h expiry vs manual reset endpoint)?
+- OpenAI fallback trigger policy: manual switch vs automatic failover on error?
+- Phase 2 decisions (deferred): Edit step quality gate, deterministic seed policy for reproducibility.
