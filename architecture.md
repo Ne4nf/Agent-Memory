@@ -44,13 +44,14 @@ These are POC acceptance targets, not long-term SLA commitments. They are valida
 
 | Area | Build (POC) | Defer |
 | :--- | :--- | :--- |
-| Intent + input | IntentDetectTool + InputExtractionTool + ReferenceImageAnalyzeTool | Multi-domain intent classifier |
-| Clarification | ClarificationTool + AssumptionBuilderTool | Adaptive multi-turn clarification policy |
-| Reasoning + guideline | DesignInferenceTool (reasoning + structured guideline) | Multi-agent debate and self-critique loops |
-| Direction selection | DirectionProposalTool (optional 3-4 directions) | Personalized auto-ranking per user profile |
-| Generation | LogoGenerationTool (3-4 PNG options) + StorageTool | Multi-model routing and automatic quality ranking |
-| Editing | LogoEditTool + StorageTool + edit summary | Region/object-level editing |
-| Follow-up | FollowupSuggestionTool (quick action suggestions) | Personalized recommendation engine |
+| Intent + input | Detect logo intent, parse text/references, extract brand context | Multi-domain intent classifier |
+| Clarification | Ask clarification when needed, allow skip with explicit assumptions | Adaptive multi-turn clarification policy |
+| Reasoning | Stream reasoning blocks (input understanding, style inference, assumptions) | Multi-agent debate and self-critique loops |
+| Guideline | Generate structured design guideline before generation | Auto-optimization guideline loop via evaluator |
+| Direction selection | Optional 3-4 direction proposals for ambiguous requests | Personalized auto-ranking per user profile |
+| Generation | Generate 3-4 PNG options from guideline | Multi-model routing and automatic quality ranking |
+| Editing | Prompt-based edit on selected option + edit summary | Region/object-level editing |
+| Follow-up | Return quick follow-up suggestions | Personalized recommendation engine |
 | Storage/session | Persist output URLs + metadata per request/session | Project library, version history, long-term memory |
 
 ---
