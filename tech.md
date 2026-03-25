@@ -10,7 +10,7 @@ POC in-scope flow:
 
 - Step 1: Detect logo design intent.
 - Step 2: Extract and analyze user inputs (text/reference image).
-- Step 3: Clarify in loop until required fields are complete.
+- Step 3: Validate required fields with fail-fast clarification hints.
 - Step 4: Analyze request and infer design guideline.
 - Step 6: Generate 3-4 logo options.
 
@@ -22,7 +22,7 @@ Out of scope for this POC:
 Business validation goals:
 
 - Prove users can submit a request and receive complete output (guideline + options) in one async job.
-- Prove strict clarification loop improves output quality consistency.
+- Prove fail-fast required-field validation improves output quality consistency.
 - Prove async execution provides simple input-output contract for FE integration.
 
 ### 1.2 Success metrics (POC acceptance targets)
@@ -30,24 +30,25 @@ Business validation goals:
 These are committed Phase 1 POC targets for Step 1 -> Step 6 only (2 required fields: brand_name, industry).
 
 - >= 90% requests extract brand_name and industry from user query.
-- >= 90% requests produce valid `guideline` before image generation starts.
+- >= 90% requests that pass required-field gate produce valid `guideline` before image generation starts.
 - >= 85% requests return 3-4 valid logo options.
 - p95 job completion time <= 30s (from submit to completed).
-- p95 time to first status update (process → processing) <= 5s.
+- p95 time to first status transition (queued -> processing) <= 5s.
 - On failure, actionable error and retry hint returned <= 5s.
 
 ### 1.3 Technical constraints
 
 - Primary endpoints: async `POST /internal/v1/tasks/submit` and `GET /internal/v1/tasks/{task_id}/status`.
 - Primary task type for this POC: `logo_generate`.
-- Clarification is strict: generation must not run until required fields are complete.
+- Fail-fast validation is strict: generation must not run until required fields are complete.
 - Required fields (mandatory before generation):
-  - `brand_name` (company/product name) — ask first if missing
-  - `industry` (business category or context) — ask second if missing
-- Optional fields (clarification skipped if not provided):
+  - `brand_name` (company/product name)
+  - `industry` (business category or context)
+- Optional fields (non-blocking if not provided):
   - `style_preference` (e.g., minimalist, modern, playful)
   - `color_preference` (e.g., blue, grayscale, vibrant)
-- Single job submission: input all parameters at once, receive full output (guideline + option URLs) on completion.
+- Single request per job; input may be partial when `use_session_context` is enabled.
+- Required-field precedence is fixed: explicit fields in request > extracted fields from new query > stored session context.
 - Session scope is per `session_id` with optional short-term memory reuse across multiple job submissions.
 - No separate rule engine; behavior is schema-driven + prompt-driven + tool-adapter driven.
 - Provider switching must not change task semantics or output contract.
@@ -61,7 +62,7 @@ These are committed Phase 1 POC targets for Step 1 -> Step 6 only (2 required fi
 | Area | Build (POC) | Defer |
 | :--- | :--- | :--- |
 | Intent + input | Detect logo intent, parse text/references, extract brand context | Multi-domain intent classifier |
-| Clarification | Mandatory clarification loop until required fields are complete | Adaptive personalized questioning policy |
+| Clarification | Fail-fast required-field validation with suggested follow-up questions | Adaptive personalized questioning policy |
 | Reasoning | Internal reasoning for extraction and inference | Multi-agent self-critique loops |
 | Guideline | Generate structured design guideline before generation | Automatic guideline optimization loop |
 | Generation | Generate 3-4 PNG options from guideline | Auto model-routing and ranking |
@@ -81,7 +82,7 @@ This architecture is designed for strict quality gating in POC with simple async
 
 Key reasons:
 
-1. Clarification loop enforces required design inputs before generation begins.
+1. Fail-fast required-field validation enforces required design inputs before generation begins.
 2. Async execution keeps FE simple: submit job, poll status, render output when ready.
 3. All processing happens server-side; FE does not hold the connection.
 4. Session context is explicit and propagated between tools for deterministic behavior.
@@ -93,8 +94,7 @@ flowchart TD
   A[User Submit Job] --> B[Step 1: IntentDetectTool]
   B --> C[Step 2: InputExtractionTool + ReferenceImageAnalyzeTool]
   C -->|brand_name AND industry both present?| F[Step 4: DesignInferenceTool]
-  C -->|Missing brand_name or industry| E[ClarificationLoopTool]
-  E -->|Fields clarified| F
+  C -->|Missing brand_name or industry| E[Fail with missing_fields + suggested_questions]
   F --> G[Step 6: LogoGenerationTool]
   G --> H[StorageTool]
   H --> I[Job Result Ready]
@@ -109,7 +109,7 @@ graph TB
     QUEUE[Job Queue]
     WORKER[Background Worker\nTask Orchestrator]
     CTX["Session Context Store\nrequired fields + guideline"]
-    TOOLBOX["Tool Layer\nintent extract clarify infer generate"]
+    TOOLBOX["Tool Layer\nintent extract validate infer generate"]
     LLM["Text or multimodal LLM APIs"]
     IMG["Image generation APIs"]
     STO["Storage or CDN"]
@@ -140,7 +140,7 @@ graph TB
   - `GET /internal/v1/tasks/{task_id}/status` polls for result.
   - FE receives deterministic JSON output when ready, no streaming chunks.
 - Context-first tool handoff:
-  - Every tool invocation receives the same `SessionContextState` snapshot.
+  - Every step must access a consistent context state (by snapshot or context reference).
   - Tool swap must preserve context I/O contract, not implicit memory.
 
 ### 3.3 Component breakdown (tool-level)
@@ -150,11 +150,11 @@ graph TB
 | IntentDetectTool | Step 1 | Detect logo design intent and route flow | Low-latency text LLM | Deterministic classifier |
 | InputExtractionTool | Step 2 | Extract brand_name, industry, style, color, symbol from text | Text LLM with structured output | Returns structured JSON (style/color optional) |
 | ReferenceImageAnalyzeTool | Step 2 | Analyze reference image style/color/typography/iconography | Multimodal LLM | Optional when references provided |
-| ClarificationLoopTool | Step 3 | Ask targeted questions for missing required fields (brand_name, industry only); auto-detect as optional | Text LLM for question generation | Loop until brand_name AND industry present or max rounds reached |
+| ClarificationHintTool | Step 3 | Validate required fields and generate suggested follow-up questions for missing fields | Text LLM for question generation | Fail-fast: return error payload immediately if brand_name or industry is missing |
 | DesignInferenceTool | Step 4 | Infer final guideline from completed context | Text LLM for design reasoning | Returns guideline JSON |
 | LogoGenerationTool | Step 6 | Generate 3-4 logo options | Fast image generation model | Throughput-optimized |
 | StorageTool | Shared | Upload images and return URLs | Cloud storage API | Used by generation |
-| SessionContextTool | Shared | Read/update context snapshot per job | Context adapter over cache or DB | Required for deterministic tool swap |
+| SessionContextTool | Shared | Read/update context snapshot per session and key job checkpoints | Context adapter over cache or DB | Required for deterministic tool swap |
 
 ### 3.4 End-to-end pipeline
 
@@ -173,17 +173,19 @@ sequenceDiagram
     participant IMG as Image API
     participant STO as Storage or CDN
 
-    FE->>API: POST /submit (task_type=logo_generate, all inputs)
+    FE->>API: POST /submit (task_type=logo_generate, partial or full inputs)
     API->>QUEUE: enqueue job
     QUEUE-->>API: return task_id
     API-->>FE: {task_id, status: "queued"}
 
     loop polling (every 2-5s)
-        FE->>API: GET /status?task_id=...
+        FE->>API: GET /internal/v1/tasks/{task_id}/status
         alt job still processing
             API-->>FE: {status: "processing", progress: 30}
         else job completed
             API-->>FE: {status: "completed", result: {...}}
+        else job failed
+            API-->>FE: {status: "failed", error_code, missing_fields, suggested_questions}
         end
     end
 
@@ -193,40 +195,39 @@ sequenceDiagram
         
         WORKER->>LLM: intent detect + extraction + image analysis
         LLM-->>WORKER: structured brand context fields
-        
-loop until brand_name AND industry both present
+
+        WORKER->>WORKER: apply precedence (explicit request > extracted query > session context)
+
         alt missing brand_name or industry
-            WORKER->>LLM: generate clarification questions for missing fields
-            LLM-->>WORKER: questions or defaults
-            Note over WORKER: If max rounds exceeded: return error with missing fields
+          WORKER->>LLM: generate suggested_questions for missing required fields
+          LLM-->>WORKER: suggested_questions
+          WORKER->>QUEUE: mark job failed with error_code + missing_fields + suggested_questions
         else brand_name AND industry present
-                WORKER->>CTX: persist completed required fields
-            end
+          WORKER->>CTX: persist completed required fields
+          WORKER->>LLM: generate design guideline from completed context
+          LLM-->>WORKER: reasoning + guideline JSON
+
+          loop 3-4 image options
+              WORKER->>IMG: generate image from guideline
+              IMG-->>WORKER: image bytes
+              WORKER->>STO: upload to storage
+              STO-->>WORKER: image_url
+          end
+
+          WORKER->>CTX: persist guideline + generated option URLs
+          WORKER->>QUEUE: mark job completed with LogoGenerateOutput
         end
-
-        WORKER->>LLM: generate design guideline from completed context
-        LLM-->>WORKER: reasoning + guideline JSON
-
-        loop 3-4 image options
-            WORKER->>IMG: generate image from guideline
-            IMG-->>WORKER: image bytes
-            WORKER->>STO: upload to storage
-            STO-->>WORKER: image_url
-        end
-
-        WORKER->>CTX: persist guideline + generated option URLs
-        WORKER->>QUEUE: mark job completed with LogoGenerateOutput
     end
 ```
 
-#### 3.4.2 Stage A - Intake and mandatory clarification loop (Step 1-3)
+#### 3.4.2 Stage A - Intake and fail-fast required-field validation (Step 1-3)
 
 | Item | Detail |
 | :--- | :--- |
-| Input | `LogoGenerateInput` (query, references, session_id) |
-| Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationLoopTool |
-| Output | Structured fields JSON with brand_name + industry guaranteed |
-| Gate | brand_name AND industry must both be present before Step 4 |
+| Input | `LogoGenerateInput` (query, optional explicit brand fields, references, session_id) |
+| Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationHintTool |
+| Output | Either (a) merged fields with brand_name + industry guaranteed, or (b) failed job payload with `error_code`, `missing_fields`, `suggested_questions` |
+| Gate | brand_name AND industry must both be present; otherwise fail-fast |
 | Target | Complete within first 10s of job start |
 
 #### 3.4.3 Stage B - Request analysis and guideline inference (Step 4)
@@ -251,23 +252,23 @@ loop until brand_name AND industry both present
 
 POC uses pure async (simple input-output model):
 
-- Submit once: `POST /internal/v1/tasks/submit` with complete input.
+- Submit once: `POST /internal/v1/tasks/submit` with single request per job (input may be partial when `use_session_context=true`).
 - Poll for result: `GET /internal/v1/tasks/{task_id}/status` (simple short-polling recommended for POC).
 - Single output: result contains full guideline + option URLs when job completes.
 
 Why this is simple for POC:
 
 1. No streaming protocol complexity on FE (no NDJSON or gRPC streaming).
-2. Clarification loop runs entirely server-side; if user input is incomplete, system fills defaults or errors after max rounds.
+2. Required-field validation runs server-side with fail-fast behavior; if brand_name or industry is missing after merge, return failed job with machine-readable hints.
 3. FE logic is straightforward: submit, poll, render.
 4. Perfect for learning: output contract is deterministic JSON, not chunk-by-chunk parsing.
 
-Note on clarification in async mode:
+Note on fail-fast validation in async mode:
 
-- Clarification for required fields (brand_name, industry) is processed server-side.
-- If brand_name or industry is still missing after max rounds, job returns error with missing field list.
-- If brand_name and industry are present, job skips clarification and proceeds to guideline generation.
-- Optional fields (style_preference, color_preference) are inferred from query or defaults; no clarification for these.
+- Required fields are resolved using fixed precedence: explicit request > extracted query > stored session context.
+- If brand_name or industry is missing after merge, job fails immediately.
+- Failed response includes `error_code`, `missing_fields`, and `suggested_questions` so FE can submit a new job.
+- Optional fields (style_preference, color_preference) are inferred from query or defaults; they do not block generation.
 
 #### 3.4.6 Session context and tool swap contract
 
@@ -275,20 +276,43 @@ Design rule:
 
 - Tool swap is allowed only if input/output context contract is unchanged.
 
+Clarification:
+
+- "Context handoff" means each step can read a consistent context and write delta updates.
+- It does not require passing full serialized `SessionContextState` payload on every internal call.
+- Recommended approach: pass lightweight execution context + context reference/version, fetch full state from SessionContextTool when needed.
+
 Mandatory context handoff on every tool call:
 
 - `session_id`
-- `required_field_state` (brand_name, industry, passed/not, clarification rounds)
+- `required_field_state` (brand_name, industry, passed/not)
 - latest extracted `BrandContext`
 - latest approved `DesignGuideline` (if available)
 - `sequence` counter
+- `context_version` (for optimistic concurrency)
+
+Context model split:
+
+- Execution context (per `task_id`):
+  - `task_id`, `session_id`, `sequence`, `current_step`, `required_field_state`, trace metadata.
+  - Used to keep one async job deterministic from Step 1 -> Step 6.
+- Session context (per `session_id`):
+  - latest `BrandContext`, latest `DesignGuideline`, generated option history, optional confirmed preferences.
+  - Used for cross-job reuse (for example, after one completed generation, user asks to generate more options).
 
 Implementation notes:
 
 - Worker owns task execution state for single job.
-- SessionContextTool persists snapshot at key checkpoints (after gate passes, after guideline generated).
-- Each tool reads context snapshot and returns delta updates.
+- SessionContextTool persists snapshot at key checkpoints (after gate passes, after guideline generated, after options generated).
+- Each tool reads required context fields and returns delta updates (not full-state overwrite).
 - Worker merges deltas and advances task state.
+- Use `context_version` (or ETag-like revision) to prevent stale writes when multiple jobs share one session.
+
+Precedence rule (fixed and mandatory):
+
+1. explicit fields in request
+2. extracted fields from new query
+3. stored session context
 
 ### 3.5 Reuse and extensibility
 
@@ -326,10 +350,9 @@ class BrandContext(BaseModel):
     symbol_preference: List[str] = Field(default_factory=list)
 
 
-class ClarificationQuestion(BaseModel):
-    key: str
+class SuggestedQuestion(BaseModel):
+    key: Literal["brand_name", "industry"]
     question: str
-    required: bool = True
 
 
 class RequiredFieldState(BaseModel):
@@ -340,7 +363,6 @@ class RequiredFieldState(BaseModel):
     ])
     missing_keys: List[str] = Field(default_factory=list)
     passed: bool = False
-    clarification_round: int = 0
 
 
 class DesignGuideline(BaseModel):
@@ -363,9 +385,13 @@ class SessionContextState(BaseModel):
 class LogoGenerateInput(BaseModel):
     session_id: str
     query: str
+    brand_name: Optional[str] = None
+    industry: Optional[str] = None
+    style_preference: List[str] = Field(default_factory=list)
+    color_preference: List[str] = Field(default_factory=list)
+    symbol_preference: List[str] = Field(default_factory=list)
     references: List[ReferenceImage] = Field(default_factory=list)
     use_session_context: bool = True
-    max_clarification_rounds: int = Field(default=3, ge=1, le=5)  # For brand_name + industry only
     variation_count: int = Field(default=4, ge=3, le=4)
     output_format: Literal["png"] = "png"
     output_size: Literal["1024x1024"] = "1024x1024"
@@ -396,7 +422,10 @@ class JobStatusResponse(BaseModel):
     status: Literal["queued", "processing", "completed", "failed"]
     progress_percent: Optional[int] = None  # 0-100 if processing
     result: Optional[LogoGenerateOutput] = None  # populated when completed
+    error_code: Optional[str] = None  # populated when failed (e.g., MISSING_REQUIRED_FIELDS)
     error: Optional[str] = None  # populated when failed
+    missing_fields: List[str] = Field(default_factory=list)  # populated when failed
+    suggested_questions: List[SuggestedQuestion] = Field(default_factory=list)  # populated when failed
     retry_after_seconds: Optional[int] = None  # populated when failed
 ```
 
@@ -405,8 +434,14 @@ Validation rules:
 - `query` is required and non-empty after trim.
 - `variation_count` must be 3 or 4.
 - Required-field gate: brand_name AND industry must both be present before guideline generation.
-- If `use_session_context=true`, backend merges request with stored context for same `session_id`.
-- If `max_clarification_rounds` is reached and brand_name or industry still missing, return error with missing field list.
+- Merge precedence is fixed: explicit fields in request > extracted fields from new query > stored context for same `session_id`.
+- Empty-value precedence policy:
+  - explicit empty string (e.g., `brand_name=""`) is treated as missing and does not override non-empty extracted/session value.
+  - explicit `null` is treated as "not provided" and falls through to lower-precedence sources.
+  - explicit empty optional lists (e.g., `style_preference=[]`) are valid explicit overrides.
+- If `use_session_context=true`, backend may use stored context as the last precedence layer.
+- If required fields are still missing after merge, return failed job with `error_code`, `missing_fields`, and `suggested_questions`.
+- On `status="failed"` with `error_code="MISSING_REQUIRED_FIELDS"`, `missing_fields` and `suggested_questions` must be populated.
 
 ### 4.2 External APIs and model selection
 
@@ -431,10 +466,14 @@ Reference docs:
   - Input:
     - `task_type` (required: `logo_generate`)
     - `session_id` (required)
-    - `query` (required: user request, will be analyzed for brand_name + industry)
+    - `query` (required: user request for extraction)
+    - `brand_name` (optional explicit override)
+    - `industry` (optional explicit override)
+    - `style_preference` (optional explicit override)
+    - `color_preference` (optional explicit override)
+    - `symbol_preference` (optional explicit override)
     - `references` (optional: list of ReferenceImage)
     - `use_session_context` (optional, default true)
-    - `max_clarification_rounds` (optional, default 3, applies to brand_name + industry clarification)
     - `variation_count` (optional, default 4, range 3-4)
     - `output_format` (optional, default "png")
     - `output_size` (optional, default "1024x1024")
@@ -448,7 +487,7 @@ Reference docs:
     ```
 
 - `GET /internal/v1/tasks/{task_id}/status` (check job status)
-  - Query params: `task_id`
+  - Path params: `task_id`
   - Output (JobStatusResponse, while processing):
     ```json
     {
@@ -474,13 +513,25 @@ Reference docs:
     {
       "task_id": "uuid",
       "status": "failed",
-      "error": "reason (e.g., 'Missing required fields: brand_name, industry after 3 rounds')",
+      "error_code": "MISSING_REQUIRED_FIELDS",
+      "error": "Missing required fields after merge precedence",
+      "missing_fields": ["brand_name", "industry"],
+      "suggested_questions": [
+        {
+          "key": "brand_name",
+          "question": "What is your company or product name?"
+        },
+        {
+          "key": "industry",
+          "question": "What industry is your business in?"
+        }
+      ],
       "retry_after_seconds": 60
     }
     ```
   - Context behavior:
-    - if `use_session_context=true`, system merges new query with stored context in same `session_id`
-    - clarification only for brand_name + industry; style/color inferred or defaulted
+    - merge precedence is fixed: explicit request fields > extracted query fields > stored context in same `session_id`
+    - fail-fast for required fields: if brand_name or industry is missing after merge, return failed job immediately
     - result metadata includes final `required_field_state`
 
 ### 4.4 Model benchmark by vendor (POC-oriented)
@@ -548,7 +599,7 @@ Why this combination:
 
 Risk:
 
-- Job completion may exceed p95 target depending on provider queue and clarification rounds.
+- Job completion may exceed p95 target depending on provider queue and image generation latency.
 
 Mitigation:
 
@@ -557,25 +608,24 @@ Mitigation:
 - Queue scaling policy when backlog grows.
 - Circuit breaker for provider outages.
 
-### 5.2 Clarification loop quality
+### 5.2 Required-field validation quality
 
 Risk:
 
-- User intent may not include brand_name or industry explicitly; clarification may take multiple rounds or fail.
+- User intent may not include brand_name or industry explicitly; fail-fast may increase first-attempt failure rate.
 
 Mitigation:
 
 - Extract brand_name and industry early (Step 2) with high-confidence NLP.
-- Ask only for missing brand_name and industry (not style/color which are optional).
-- Prioritize targeted questions (e.g., "What is your company name?" before "What industry?").
-- Cap rounds by `max_clarification_rounds` and return actionable error with missing fields.
+- Return structured failure payload (`error_code`, `missing_fields`, `suggested_questions`) for FE-guided resubmission.
+- Prioritize targeted suggested questions (e.g., "What is your company name?" before "What industry?").
 - Allow inference from context (e.g., "design a logo for a fintech startup" → industry=fintech).
 
 ### 5.3 Cost
 
 Risk:
 
-- Repeated clarification rounds and 3-4 image outputs increase cost per request.
+- Failed attempts (missing required fields) and 3-4 image outputs increase cost per successful request.
 
 Mitigation:
 
@@ -590,4 +640,4 @@ Mitigation:
 - Job result retention: how long to keep completed job results available.
 - Session context TTL and reset policy (auto expiry only vs manual reset endpoint).
 - Default guideline style when `style_preference` is not provided (infer from industry vs hardcoded default).
-- Fallback generation model if primary `gemini-3.1-flash-image-preview` fails mid-stream.
+- Fallback generation model if primary `gemini-3.1-flash-image-preview` fails mid-job.
