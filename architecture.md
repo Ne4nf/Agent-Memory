@@ -70,9 +70,10 @@ This architecture is designed for strict quality gating in POC with simple async
 Key reasons:
 
 1. Fail-fast required-field validation enforces required design inputs before generation begins.
-2. Async execution keeps FE simple: submit job, poll status, render output when ready.
+2. Hybrid execution improves UX: Stage A+B stream reasoning in real time, Stage C runs async for image generation.
 3. All processing happens server-side; FE does not hold the connection.
 4. Session context is explicit and propagated between tools for deterministic behavior.
+5. In POC, planner is simplified to rule-based routing inside a single worker process.
 
 #### 3.1.2 Diagram 1 - Agent pipeline (flowchart)
 
@@ -150,9 +151,11 @@ graph LR
   - All contracts validated by Pydantic.
   - Required-field gate is encoded as schema and validator rules.
 - Async job-based:
-  - `POST /internal/v1/tasks/submit` accepts complete input once.
-  - `GET /internal/v1/tasks/{task_id}/status` polls for result.
-  - FE receives deterministic JSON output when ready, no streaming chunks.
+  - Hybrid execution is used:
+    - Stage A+B: SSE streaming for visible process thinking.
+    - Stage C: async image task with polling.
+  - `POST /internal/v1/tasks/submit` creates task and returns `task_id`.
+  - `GET /internal/v1/tasks/{task_id}/status` is used primarily for Stage C result polling.
 - Context-first tool handoff:
   - Every step reads/writes the same session memory snapshot.
   - Tools return deltas only; worker merges and persists checkpoints.
@@ -178,6 +181,16 @@ This section defines memory behavior so the pipeline is deterministic and easy t
   - Every write validates expected `context_version`.
   - On version mismatch, worker reloads latest context and retries merge.
 
+#### 3.2.2 POC simplification notes
+
+This design is prepared for production scale but POC implementation can be simplified:
+
+- **Planner**: In POC, simplified to rule-based routing (no multi-model decision tree); planner logic is embedded in worker startup.
+- **Queue**: In POC, queue is used only for Stage C image generation; Stage A+B runs synchronously within the stream handler.
+- **Observer**: In POC, observer check is simple gate logic (required fields present?); no multi-path decision tree.
+
+These can be formalized and decoupled in subsequent phases as system scales.
+
 ### 3.3 Component breakdown (tool-level)
 
 | Component or Tool | Spec step | Role | Model Type | Notes |
@@ -185,7 +198,7 @@ This section defines memory behavior so the pipeline is deterministic and easy t
 | IntentDetectTool | Step 1 | Detect logo design intent and route flow | Low-latency text LLM | Deterministic classifier; if logo intent is detected, switch from generic image generation flow to Logo Design flow |
 | InputExtractionTool | Step 2 | Extract brand_name, industry, style, color, symbol from text | Text LLM with structured output | Returns structured JSON (style/color optional) |
 | ReferenceImageAnalyzeTool | Step 2 | Analyze reference image style/color/typography/iconography | Multimodal LLM | Optional when references provided |
-| ClarificationLoopTool | Step 3 | Generate targeted clarification questions for missing required fields | Text LLM for question generation | Fail-fast: return missing_fields + suggested_questions to FE; FE collects user answer and submits a new request |
+| ClarificationLoopTool | Step 3 | Generate targeted clarification questions for missing required fields | Text LLM for question generation | Interactive loop via streaming; FE collects user answer within same task/session and continues pipeline |
 | DesignInferenceTool | Step 4 | Infer final guideline from completed context | Text LLM for design reasoning | Returns guideline JSON |
 | LogoGenerationTool | Step 6 | Generate 3-4 logo options | Fast image generation model | Throughput-optimized |
 | StorageTool | Shared | Upload images and return URLs | Cloud storage API | Used by generation |
@@ -216,8 +229,10 @@ sequenceDiagram
     WORKER-->>S: stream extraction status / reasoning text
     S-->>FE: SSE chunks (visible process thinking)
     alt missing required fields
-      WORKER-->>S: final event with missing_fields + suggested_questions
-      S-->>FE: close stream (needs user answer)
+      WORKER-->>S: clarification event {missing_fields, suggested_questions}
+      FE->>API: POST /internal/v1/tasks/{task_id}/clarification
+      API->>WORKER: append clarification answer
+      WORKER-->>S: continue stream after merge
     else required fields complete
       WORKER-->>S: final event with guideline + generate_hq_task_id
       S-->>FE: close stream
@@ -260,8 +275,9 @@ sequenceDiagram
   else missing required fields
     W->>L: Generate suggested_questions for missing fields
     L-->>W: suggested_questions
-    W-->>FE: Fail-fast response {missing_fields, suggested_questions}
-    Note over FE,W: FE asks user and resubmits with missing fields filled
+    W-->>FE: Stream clarification event
+    FE->>W: Submit clarification answer in same task/session
+    W->>W: Merge answer and re-check required fields
   end
 ```
 
@@ -305,8 +321,8 @@ sequenceDiagram
 | :--- | :--- |
 | Input | `LogoGenerateInput` (query, optional explicit brand fields, references, session_id) |
 | Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationLoopTool |
-| Output | Either (a) merged fields with brand_name + industry guaranteed, or (b) immediate fail-fast payload with `error_code`, `missing_fields`, `suggested_questions` |
-| Gate | brand_name AND industry must both be present before Step 4; if missing, stop and return clarification questions to FE |
+| Output | Either (a) merged fields with brand_name + industry guaranteed, or (b) clarification event streamed to FE and resumed within same task |
+| Gate | brand_name AND industry must both be present before Step 4; if missing, ask clarification interactively via streaming |
 | Target | Complete within first 10s of job start |
 
 #### 3.4.3 Stage B - Request analysis and guideline inference (Step 4)
@@ -326,6 +342,7 @@ sequenceDiagram
 | Tools used | LogoGenerationTool, StorageTool |
 | Output | LogoGenerateOutput with 3-4 option URLs |
 | Target | 3-4 valid outputs >= 85%, generation <= 30s total per job |
+| Concurrency | SHOULD run in parallel when provider supports batching/multi-call concurrency |
 
 ### 3.5 Reuse and extensibility
 
@@ -447,6 +464,7 @@ Validation rules:
 - `query` is required and non-empty after trim.
 - `variation_count` must be 3 or 4.
 - Required-field gate: brand_name AND industry must both be present before guideline generation.
+- If extraction confidence is **below threshold** (e.g., < 70%), system SHOULD trigger clarification question instead of guessing; this avoids silent failures and improves UX transparency.
 - Merge precedence is fixed: explicit fields in request > extracted fields from new query > stored context for same `session_id`.
 - Empty-value precedence policy:
   - explicit empty string (e.g., `brand_name=""`) is treated as missing and does not override non-empty extracted/session value.
@@ -461,8 +479,23 @@ Validation rules:
 - `GET /internal/v1/tasks/{task_id}/stream` (SSE stream for Stage A + B)
   - Behavior:
     - stream incremental events while extraction and guideline inference are running.
-    - if required fields are missing, stream closes with fail-fast payload containing `missing_fields` and `suggested_questions`.
+    - if required fields are missing, emit `clarification` event with `missing_fields` and `suggested_questions`.
+    - FE sends clarification answer and pipeline continues in same task/session.
     - if guideline is ready, final event includes `generate_hq_task_id` for Stage C polling.
+  - Streaming event schema:
+    ```json
+    {
+      "type": "thinking | clarification | guideline_ready | error",
+      "step": "extraction | clarification | inference",
+      "content": "string",
+      "metadata": {
+        "task_id": "uuid",
+        "missing_fields": ["brand_name"],
+        "suggested_questions": [{"key": "brand_name", "question": "..."}],
+        "generate_hq_task_id": "uuid-stage-c"
+      }
+    }
+    ```
   - Example final SSE event (guideline ready):
     ```json
     {
@@ -470,6 +503,18 @@ Validation rules:
       "task_id": "uuid",
       "generate_hq_task_id": "uuid-stage-c",
       "guideline": { /* DesignGuideline */ }
+    }
+    ```
+
+- `POST /internal/v1/tasks/{task_id}/clarification` (submit clarification answer)
+  - Input:
+    - `answers` (required, key-value map for missing fields)
+  - Output:
+    ```json
+    {
+      "task_id": "uuid",
+      "status": "processing",
+      "message": "clarification accepted"
     }
     ```
 
@@ -507,6 +552,10 @@ Validation rules:
       "progress_percent": 45
     }
     ```
+  - Progress mapping:
+    - 0-20: extraction
+    - 20-40: guideline inference
+    - 40-100: image generation (increment per image completion)
   - Output (JobStatusResponse, when completed):
     ```json
     {
@@ -542,7 +591,7 @@ Validation rules:
     ```
   - Context behavior:
     - merge precedence is fixed: explicit request fields > extracted query fields > stored context in same `session_id`
-    - required-field gate uses fail-fast clarification: if required fields are missing, return `missing_fields` + `suggested_questions` immediately so FE can ask user and resubmit
+    - required-field gate uses interactive clarification: missing fields emit stream clarification event and continue in same task/session after FE sends answers
     - result metadata includes final `required_field_state`
 
 ### 4.4 Model benchmark and tracing result
