@@ -158,25 +158,25 @@ graph LR
   - Tools return deltas only; worker merges and persists checkpoints.
   - Tool swap must preserve context I/O contract.
 
-#### 3.2.1 Memory design principles (LangChain-style)
+#### 3.2.1 Memory flow contract (context engineering style)
 
-This doc follows the same core context-engineering idea used in LangChain-style multi-agent systems:
+This section defines memory behavior so the pipeline is deterministic and easy to reason about:
 
-1. **Planner and Observer hold full context**:
-  - Planner decides what tasks are needed based on full session state.
-  - Observer sees all task outputs and decides whether to continue, clarify, or finalize.
-2. **Tasks receive scoped context only**:
-  - Each task gets minimal instructions, required fields, and strict output format.
-  - Tasks do not manage global memory directly.
-3. **Only cleaned outputs are shared across tasks**:
-  - No raw intermediate reasoning handoff between tasks.
-  - Shared artifacts are structured outputs (extracted fields, guideline, image URLs).
-4. **Context Store is the single source of truth**:
-  - Persist checkpoint after Stage A, Stage B, and Stage C.
-  - Cross-job reuse always reads from stored context, not transient worker memory.
-5. **Merge by rule, not by guess**:
-  - Precedence is fixed: explicit request > extracted query > stored session context.
-  - Missing required fields trigger clarification loop until max rounds.
+1. **Worker keeps execution state**:
+  - Worker owns `task_id`, `current_step`, round counters, and status transitions.
+  - Task-local runtime state is not stored in tool adapters.
+2. **Tools are stateless and receive lightweight context**:
+  - Input to each tool is scoped to required fields only (`session_id`, required field state, relevant context slice).
+  - Tools do not own global session memory.
+3. **Tools return deltas, worker merges**:
+  - Each tool returns only changed fields (delta), not full state overwrite.
+  - Worker merges delta into current state using fixed precedence rules.
+4. **Persist checkpoints in SessionContextStore**:
+  - Save checkpoint after Stage A (required fields), Stage B (guideline), Stage C (final output URLs).
+  - Cross-job reuse always loads from SessionContextStore.
+5. **Use `context_version` for stale-write protection**:
+  - Every write validates expected `context_version`.
+  - On version mismatch, worker reloads latest context and retries merge.
 
 ### 3.3 Component breakdown (tool-level)
 
@@ -185,7 +185,7 @@ This doc follows the same core context-engineering idea used in LangChain-style 
 | IntentDetectTool | Step 1 | Detect logo design intent and route flow | Low-latency text LLM | Deterministic classifier; if logo intent is detected, switch from generic image generation flow to Logo Design flow |
 | InputExtractionTool | Step 2 | Extract brand_name, industry, style, color, symbol from text | Text LLM with structured output | Returns structured JSON (style/color optional) |
 | ReferenceImageAnalyzeTool | Step 2 | Analyze reference image style/color/typography/iconography | Multimodal LLM | Optional when references provided |
-| ClarificationLoopTool | Step 3 | Ask targeted clarification questions for missing required fields and update context | Text LLM for question generation | Loop until brand_name AND industry are complete, then continue to Step 4; if max rounds reached, fail with missing_fields + suggested_questions |
+| ClarificationLoopTool | Step 3 | Generate targeted clarification questions for missing required fields | Text LLM for question generation | Fail-fast: return missing_fields + suggested_questions to FE; FE collects user answer and submits a new request |
 | DesignInferenceTool | Step 4 | Infer final guideline from completed context | Text LLM for design reasoning | Returns guideline JSON |
 | LogoGenerationTool | Step 6 | Generate 3-4 logo options | Fast image generation model | Throughput-optimized |
 | StorageTool | Shared | Upload images and return URLs | Cloud storage API | Used by generation |
@@ -195,36 +195,48 @@ This doc follows the same core context-engineering idea used in LangChain-style 
 
 POC exposes one external task type: `logo_generate`.
 
-#### 3.4.1 Full sequence overview (Step 1 -> Step 6)
+#### 3.4.1 Full sequence overview (Streaming + Async)
 
 High-level flow:
 
 ```mermaid
 sequenceDiagram
   actor FE as Frontend
+  participant S as Stream API (SSE)
   participant API as Task API
-  participant QUEUE as Job Queue
+  participant Q as Job Queue
   participant WORKER as Worker
 
-  FE->>API: POST /submit (partial/full inputs)
-  API->>QUEUE: enqueue job
-  API-->>FE: {task_id, status: queued}
-    
-  par Background Processing
-    QUEUE->>WORKER: dequeue job
-    WORKER->>WORKER: Stage A: Extract + Clarify (Step 1-3)
-    WORKER->>WORKER: Stage B: Infer Guideline (Step 4)
-    WORKER->>WORKER: Stage C: Generate Options (Step 6)
+  rect rgb(235, 248, 255)
+    Note over FE,WORKER: Phase 1 - Streaming thinking (Stage A + B)
+    FE->>API: POST /internal/v1/tasks/submit (task_type=logo_generate)
+    API-->>FE: {task_id, status: queued}
+    FE->>S: Open /internal/v1/tasks/{task_id}/stream (SSE)
+    S->>WORKER: Start Stage A + Stage B
+    WORKER-->>S: stream extraction status / reasoning text
+    S-->>FE: SSE chunks (visible process thinking)
+    alt missing required fields
+      WORKER-->>S: final event with missing_fields + suggested_questions
+      S-->>FE: close stream (needs user answer)
+    else required fields complete
+      WORKER-->>S: final event with guideline + generate_hq_task_id
+      S-->>FE: close stream
+    end
   end
-    
-  loop Polling
-    FE->>API: GET /status/{task_id}
-    alt processing
-      API-->>FE: {status: processing, progress}
-    else completed
-      API-->>FE: {status: completed, result}
-    else failed
-      API-->>FE: {status: failed, error_code, missing_fields, suggested_questions}
+
+  rect rgb(245, 255, 245)
+    Note over FE,WORKER: Phase 2 - Async image generation (Stage C)
+    WORKER->>Q: enqueue generate_hq_task
+    Q->>WORKER: run Stage C in background
+    loop Polling image task
+      FE->>API: GET /internal/v1/tasks/{generate_hq_task_id}/status
+      alt processing
+        API-->>FE: {status: processing, progress}
+      else completed
+        API-->>FE: {status: completed, options}
+      else failed
+        API-->>FE: {status: failed, error_code}
+      end
     end
   end
 ```
@@ -232,41 +244,60 @@ sequenceDiagram
 #### 3.4.1a Stage A - Intake & clarification loop (Step 1-3)
 
 ```mermaid
-flowchart TD
-  A[Load session snapshot] --> B[Extract fields from query and references]
-  B --> C[Apply precedence\nexplicit > extracted > session]
-  C --> D{brand_name and industry ready?}
-  D -->|Yes| E[Persist required fields\nand move to Step 4]
-  D -->|No| F[Ask targeted clarification]
-  F --> G[Merge user answer into context]
-  G --> J{required fields ready now?}
-  J -->|Yes| E
-  J -->|No| H{max rounds reached?}
-  H -->|No| F
-  H -->|Yes| I[Fail job with\nmissing_fields + suggested_questions]
+sequenceDiagram
+  actor FE as Frontend
+  participant W as Worker
+  participant C as SessionContextStore
+  participant L as LLM
+
+  W->>C: Load session snapshot
+  W->>L: Extract fields from query/references
+  L-->>W: Extracted BrandContext delta
+  W->>W: Merge by precedence
+
+  alt required fields ready
+    W->>C: Persist required-field checkpoint
+  else missing required fields
+    W->>L: Generate suggested_questions for missing fields
+    L-->>W: suggested_questions
+    W-->>FE: Fail-fast response {missing_fields, suggested_questions}
+    Note over FE,W: FE asks user and resubmits with missing fields filled
+  end
 ```
 
 #### 3.4.1b Stage B - Guideline inference (Step 4)
 
 ```mermaid
-flowchart TD
-  A[Input from Stage A\nrequired fields ready] --> B[Load merged BrandContext from Context Store]
-  B --> C[Infer design guideline via Text LLM]
-  C --> D[Persist DesignGuideline to Context Store]
-  D --> E[Output\nguideline ready for Stage C]
+sequenceDiagram
+  participant W as Worker
+  participant C as SessionContextStore
+  participant L as LLM
+
+  W->>C: Load required-field checkpoint
+  W->>L: Infer DesignGuideline
+  L-->>W: Guideline delta
+  W->>C: Persist guideline checkpoint
 ```
 
 #### 3.4.1c Stage C - Logo generation (Step 6)
 
 ```mermaid
-flowchart TD
-  A[Input from Stage B\nguideline ready] --> B[Load DesignGuideline from Context Store]
-  B --> C{All 3-4 options generated?}
-  C -->|No| D[Generate image via Image API]
-  D --> E[Upload image to Storage]
-  E --> F[Append image_url to context]
-  F --> C
-  C -->|Yes| G[Persist final output\nand mark job completed]
+sequenceDiagram
+  participant W as Worker
+  participant C as SessionContextStore
+  participant I as ImageAPI
+  participant S as Storage
+
+  W->>C: Load guideline checkpoint
+  loop 3-4 options
+    W->>I: Generate image from guideline
+    I-->>W: Image bytes
+    W->>S: Upload image
+    S-->>W: image_url
+    W->>W: Append URL delta
+  end
+  W->>C: Persist final-output checkpoint
+  W->>W: Mark job completed
 ```
 #### 3.4.2 Stage A - Intake and clarification loop (Step 1-3)
 
@@ -274,8 +305,8 @@ flowchart TD
 | :--- | :--- |
 | Input | `LogoGenerateInput` (query, optional explicit brand fields, references, session_id) |
 | Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationLoopTool |
-| Output | Either (a) merged fields with brand_name + industry guaranteed, or (b) failed job payload with `error_code`, `missing_fields`, `suggested_questions` after max rounds |
-| Gate | brand_name AND industry must both be present before Step 4; otherwise continue clarification loop until max rounds |
+| Output | Either (a) merged fields with brand_name + industry guaranteed, or (b) immediate fail-fast payload with `error_code`, `missing_fields`, `suggested_questions` |
+| Gate | brand_name AND industry must both be present before Step 4; if missing, stop and return clarification questions to FE |
 | Target | Complete within first 10s of job start |
 
 #### 3.4.3 Stage B - Request analysis and guideline inference (Step 4)
@@ -427,6 +458,21 @@ Validation rules:
 
 ### 4.3 Concrete endpoint I/O
 
+- `GET /internal/v1/tasks/{task_id}/stream` (SSE stream for Stage A + B)
+  - Behavior:
+    - stream incremental events while extraction and guideline inference are running.
+    - if required fields are missing, stream closes with fail-fast payload containing `missing_fields` and `suggested_questions`.
+    - if guideline is ready, final event includes `generate_hq_task_id` for Stage C polling.
+  - Example final SSE event (guideline ready):
+    ```json
+    {
+      "type": "guideline_ready",
+      "task_id": "uuid",
+      "generate_hq_task_id": "uuid-stage-c",
+      "guideline": { /* DesignGuideline */ }
+    }
+    ```
+
 - `POST /internal/v1/tasks/submit` (submit job)
   - Input:
     - `task_type` (required: `logo_generate`)
@@ -496,7 +542,7 @@ Validation rules:
     ```
   - Context behavior:
     - merge precedence is fixed: explicit request fields > extracted query fields > stored context in same `session_id`
-    - required-field gate uses clarification loop: ask targeted questions until max rounds; fail only when required fields are still missing after max rounds
+    - required-field gate uses fail-fast clarification: if required fields are missing, return `missing_fields` + `suggested_questions` immediately so FE can ask user and resubmit
     - result metadata includes final `required_field_state`
 
 ### 4.4 Model benchmark and tracing result
@@ -581,7 +627,7 @@ Mitigation:
 
 ### 5.4 Open technical decisions
 
-- Polling mechanism: simple HTTP polling vs webhook vs Server-Sent Events (SSE) for result notification.
+- SSE transport policy: heartbeat interval, reconnect strategy, and stream timeout policy.
 - Signed URL TTL policy by asset type.
 - Job result retention: how long to keep completed job results available.
 - Session context TTL and reset policy (auto expiry only vs manual reset endpoint).
