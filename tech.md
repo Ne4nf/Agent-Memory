@@ -59,16 +59,14 @@ These are committed Phase 1 POC targets for Step 1 -> Step 6 only (2 required fi
 
 ### 2.1 Build vs Defer
 
-| Area | Build (POC) | Defer |
+| Area | Build (POC) | Defer (Next Phase) |
 | :--- | :--- | :--- |
-| Intent + input | Detect logo intent, parse text/references, extract brand context | Multi-domain intent classifier |
-| Clarification | Fail-fast required-field validation with suggested follow-up questions | Adaptive personalized questioning policy |
-| Reasoning | Internal reasoning for extraction and inference | Multi-agent self-critique loops |
-| Guideline | Generate structured design guideline before generation | Automatic guideline optimization loop |
-| Generation | Generate 3-4 PNG options from guideline | Auto model-routing and ranking |
-| Storage/session | Persist output URLs + session context per `session_id` | Project library, version history, long-term memory |
-| Editing | Deferred | Step 7 in next phase |
-| Follow-up suggestion | Deferred | Step 8 in next phase |
+| Intent + input | Logo intent detection, text/reference parsing, brand extraction | Multi-domain intent classifier |
+| Clarification | Required-field validation (brand_name, industry) with suggestions | Adaptive personalized questioning |
+| Guideline generation | Structured design guideline inference | Guideline optimization loop |
+| Logo generation | 3-4 PNG options from guideline | Auto model-routing and ranking |
+| Session management | Persist context and URLs per session_id | Project library, version history |
+| Editing & follow-up | Deferred | Steps 7-8 |
 
 ---
 
@@ -145,207 +143,119 @@ graph TB
   - Every step must access a consistent context state (by snapshot or context reference).
   - Tool swap must preserve context I/O contract, not implicit memory.
 
-### 3.3 Component breakdown (tool-level)
+### 3.3 Work orchestration pattern (Exa-inspired)
 
-| Component or Tool | Spec step | Role | Model Type | Notes |
+System follows a **Planner → Tasks → Observer** pattern for deterministic multi-step agent execution:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  TaskOrchestrator                        │
+│              (Planner + Task Distributor)               │
+│  - Accepts LogoGenerateInput once                        │
+│  - Distributes work to parallel extraction tasks         │
+│  - Manages state transitions and failures                │
+└────────────────┬────────────────────────────────────────┘
+                 │
+    ┌────────────┼────────────┐
+    ↓            ↓            ↓
+  Task 1       Task 2       Task 3
+(Intake)    (Validate)   (Guideline)
+    │            │            │
+    └────────────┼────────────┘
+                 ↓
+        ┌─────────────────┐
+        │   Observer      │
+        │  (SessionState) │
+        │  Maintains full │
+        │  context across │
+        │  all tasks      │
+        └────────┬────────┘
+                 ↓
+    ┌─────────────────────┐
+    │ Image Generation    │
+    │ Task (4 options)    │
+    └─────────────────────┘
+```
+
+**Work phases**:
+
+| Phase | Owner Task | Role | Parallel? | Output |
 | :--- | :--- | :--- | :--- | :--- |
-| IntentDetectTool | Step 1 | Detect logo design intent and route flow | Low-latency text LLM | Deterministic classifier; if logo intent is detected, switch from generic image generation flow to Logo Design flow |
-| InputExtractionTool | Step 2 | Extract brand_name, industry, style, color, symbol from text | Text LLM with structured output | Returns structured JSON (style/color optional) |
-| ReferenceImageAnalyzeTool | Step 2 | Analyze reference image style/color/typography/iconography | Multimodal LLM | Optional when references provided |
-| ClarificationLoopTool | Step 3 | Ask targeted clarification questions for missing required fields and update context | Text LLM for question generation | Loop until brand_name AND industry are complete, then continue to Step 4; if max rounds reached, fail with missing_fields + suggested_questions |
-| DesignInferenceTool | Step 4 | Infer final guideline from completed context | Text LLM for design reasoning | Returns guideline JSON |
-| LogoGenerationTool | Step 6 | Generate 3-4 logo options | Fast image generation model | Throughput-optimized |
-| StorageTool | Shared | Upload images and return URLs | Cloud storage API | Used by generation |
-| SessionContextTool | Shared | Read/update context snapshot per session and key job checkpoints | Context adapter over cache or DB | Required for deterministic tool swap |
+| **Task 1: Intake** | IntentDetectTool + InputExtractionTool + ReferenceImageAnalyzeTool | Detect intent, parse inputs, extract brand context | ✓ Can extract in parallel | `BrandContext` (partial or complete) |
+| **Task 2: Validate** | ClarificationLoopTool | If brand_name or industry missing, clarify until complete or max rounds | ✗ Sequential | `BrandContext` (complete) OR fail with suggested_questions |
+| **Task 3: Guideline** | DesignInferenceTool | Infer design rules from complete context | ✗ After validate | `DesignGuideline` |
+| **Generation** | LogoGenerationTool + StorageTool | Generate 3-4 PNG options from guideline | ✓ Parallel per image | List of image URLs |
+
+**Observer role** (SessionContextTool):
+
+- Maintains full `SessionContextState` visible to all tasks
+- Does NOT pass detailed reasoning state between tasks; only final outputs
+- Tasks read context snapshot once; return delta updates
+- Observer merges deltas and advances task state
+- Uses `context_version` to prevent stale writes in concurrent scenarios
 
 ### 3.4 End-to-end pipeline
 
 POC exposes one external task type: `logo_generate`.
 
-#### 3.4.1 Full sequence (Step 1 -> Step 6, async)
+#### 3.4.1 Async job execution flow (simplified)
 
 ```mermaid
 sequenceDiagram
     actor FE as Frontend
     participant API as Task API
-    participant QUEUE as Job Queue
     participant WORKER as Background Worker
-    participant CTX as Session Context Store
-    participant LLM as Text or multimodal LLM
-    participant IMG as Image API
-    participant STO as Storage or CDN
+    participant LLM as Text/Image LLM APIs
 
-    FE->>API: POST /submit (task_type=logo_generate, partial or full inputs)
-    API->>QUEUE: enqueue job
-    QUEUE-->>API: return task_id
+    FE->>API: POST /submit (task_type=logo_generate, inputs)
     API-->>FE: {task_id, status: "queued"}
 
-    loop polling (every 2-5s)
-        FE->>API: GET /internal/v1/tasks/{task_id}/status
-        alt job still processing
-            API-->>FE: {status: "processing", progress: 30}
-        else job completed
-            API-->>FE: {status: "completed", result: {...}}
-        else job failed
-            API-->>FE: {status: "failed", error_code, missing_fields, suggested_questions}
+    par Worker (background)
+        WORKER->>LLM: Task 1: Extract brand context
+        LLM-->>WORKER: Extracted fields
+        
+        alt missing required fields
+            WORKER->>LLM: Task 2: Clarify until complete or max rounds
+            LLM-->>WORKER: Clarified fields OR timeout
+            alt still missing after max rounds
+                WORKER-->>API: Failed {error_code, missing_fields, suggested_questions}
+            else fields complete
+                WORKER->>LLM: Task 3: Infer guideline
+                WORKER->>LLM: Task 4: Generate 3-4 images
+                WORKER-->>API: Completed {guideline, options}
+            end
+        else fields already present
+            WORKER->>LLM: Task 3: Infer guideline
+            WORKER->>LLM: Task 4: Generate 3-4 images
+            WORKER-->>API: Completed {guideline, options}
         end
     end
 
-    par Background Worker Processing
-        Note over WORKER,LLM: Step 1-6 executes serially in background
-        WORKER->>CTX: load context by session_id
-        
-        WORKER->>LLM: intent detect + extraction + image analysis
-        LLM-->>WORKER: structured brand context fields
-
-        WORKER->>WORKER: apply precedence (explicit request > extracted query > session context)
-
-        alt missing brand_name or industry
-          loop clarification loop (max rounds)
-            WORKER->>LLM: generate clarification question for missing field(s)
-            LLM-->>WORKER: clarification question
-            WORKER->>WORKER: apply clarification answer + re-evaluate missing fields
-          end
-          alt still missing after max rounds
-            WORKER->>QUEUE: mark job failed with error_code + missing_fields + suggested_questions
-          else required fields complete
-            WORKER->>CTX: persist completed required fields
-            WORKER->>LLM: generate design guideline from completed context
-            LLM-->>WORKER: reasoning + guideline JSON
-
-            loop 3-4 image options
-              WORKER->>IMG: generate image from guideline
-              IMG-->>WORKER: image bytes
-              WORKER->>STO: upload to storage
-              STO-->>WORKER: image_url
-            end
-
-            WORKER->>CTX: persist guideline + generated option URLs
-            WORKER->>QUEUE: mark job completed with LogoGenerateOutput
-          end
-        else brand_name AND industry present
-          WORKER->>CTX: persist completed required fields
-          WORKER->>LLM: generate design guideline from completed context
-          LLM-->>WORKER: reasoning + guideline JSON
-
-          loop 3-4 image options
-            WORKER->>IMG: generate image from guideline
-            IMG-->>WORKER: image bytes
-            WORKER->>STO: upload to storage
-            STO-->>WORKER: image_url
-          end
-
-          WORKER->>CTX: persist guideline + generated option URLs
-          WORKER->>QUEUE: mark job completed with LogoGenerateOutput
+    loop polling (every 2-5s)
+        FE->>API: GET /status/{task_id}
+        alt queued or processing
+            API-->>FE: {status, progress_percent}
+        else completed or failed
+            API-->>FE: {status, result or error}
         end
     end
 ```
 
-    #### 3.4.2 Stage A - Intake and clarification loop (Step 1-3)
+#### 3.4.2 Pipeline stages and targets
 
-| Item | Detail |
-| :--- | :--- |
-| Input | `LogoGenerateInput` (query, optional explicit brand fields, references, session_id) |
-| Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationLoopTool |
-| Output | Either (a) merged fields with brand_name + industry guaranteed, or (b) failed job payload with `error_code`, `missing_fields`, `suggested_questions` after max rounds |
-| Gate | brand_name AND industry must both be present before Step 4; otherwise continue clarification loop until max rounds |
-| Target | Complete within first 10s of job start |
+| Stage | Input | Tools | Output | Target |
+| :--- | :--- | :--- | :--- | :--- |
+| Intake + Clarification | User query ± explicit fields ± references | Intent, Extract, Analyze, Clarify | brand_name + industry (merged) OR error | 10s, >=90% extraction |
+| Guideline Inference | Merged required fields + context | DesignInferenceTool | DesignGuideline JSON | >=90% guideline coverage |
+| Logo Generation | Guideline + variation_count | LogoGenerationTool, StorageTool | 3-4 PNG option URLs | <=30s, >=85% valid output |
 
-#### 3.4.3 Stage B - Request analysis and guideline inference (Step 4)
+#### 3.4.3 Context handoff contract
 
-| Item | Detail |
-| :--- | :--- |
-| Input | Completed required fields + optional context |
-| Tools used | DesignInferenceTool |
-| Output | DesignGuideline JSON |
-| Target | Guideline coverage >= 90% |
-
-#### 3.4.4 Stage C - Logo generation (Step 6)
-
-| Item | Detail |
-| :--- | :--- |
-| Input | guideline + variation_count |
-| Tools used | LogoGenerationTool, StorageTool |
-| Output | LogoGenerateOutput with 3-4 option URLs |
-| Target | 3-4 valid outputs >= 85%, generation <= 30s total per job |
-
-#### 3.4.5 Async job execution strategy
-
-POC uses pure async (simple input-output model):
-
-- Submit once: `POST /internal/v1/tasks/submit` with single request per job (input may be partial when `use_session_context=true`).
-- Poll for result: `GET /internal/v1/tasks/{task_id}/status` (simple short-polling recommended for POC).
-- Single output: result contains full guideline + option URLs when job completes.
-
-Why this is simple for POC:
-
-1. No streaming protocol complexity on FE (no NDJSON or gRPC streaming).
-2. Required-field validation runs server-side with fail-fast behavior; if brand_name or industry is missing after merge, return failed job with machine-readable hints.
-3. FE logic is straightforward: submit, poll, render.
-4. Perfect for learning: output contract is deterministic JSON, not chunk-by-chunk parsing.
-
-Note on fail-fast validation in async mode:
-
-- Required fields are resolved using fixed precedence: explicit request > extracted query > stored session context.
-- If brand_name or industry is missing after merge, job fails immediately.
-- Failed response includes `error_code`, `missing_fields`, and `suggested_questions` so FE can submit a new job.
-- Optional fields (style_preference, color_preference) are inferred from query or defaults; they do not block generation.
-
-#### 3.4.6 Session context and tool swap contract
-
-Design rule:
-
-- Tool swap is allowed only if input/output context contract is unchanged.
-
-Clarification:
-
-- "Context handoff" means each step can read a consistent context and write delta updates.
-- It does not require passing full serialized `SessionContextState` payload on every internal call.
-- Recommended approach: pass lightweight execution context + context reference/version, fetch full state from SessionContextTool when needed.
-
-Mandatory context handoff on every tool call:
-
-- `session_id`
-- `required_field_state` (brand_name, industry, passed/not)
-- latest extracted `BrandContext`
-- latest approved `DesignGuideline` (if available)
-- `sequence` counter
-- `context_version` (for optimistic concurrency)
-
-Context model split:
-
-- Execution context (per `task_id`):
-  - `task_id`, `session_id`, `sequence`, `current_step`, `required_field_state`, trace metadata.
-  - Used to keep one async job deterministic from Step 1 -> Step 6.
-- Session context (per `session_id`):
-  - latest `BrandContext`, latest `DesignGuideline`, generated option history, optional confirmed preferences.
-  - Used for cross-job reuse (for example, after one completed generation, user asks to generate more options).
-
-Implementation notes:
-
-- Worker owns task execution state for single job.
-- SessionContextTool persists snapshot at key checkpoints (after gate passes, after guideline generated, after options generated).
-- Each tool reads required context fields and returns delta updates (not full-state overwrite).
-- Worker merges deltas and advances task state.
-- Use `context_version` (or ETag-like revision) to prevent stale writes when multiple jobs share one session.
-
-Precedence rule (fixed and mandatory):
-
-1. explicit fields in request
-2. extracted fields from new query
-3. stored session context
-
-### 3.5 Reuse and extensibility
-
-- Add fields in extraction or guideline:
-  - Extend schema and prompt templates only.
-  - API contract stays unchanged.
-- Add edit phase in next release:
-  - Register `logo_edit` task type and add Stage D for Step 7.
-  - Reuse same context and job semantics.
-- Add provider:
-  - Replace generation adapter only.
-  - No change in worker state machine.
+- Field merge precedence: explicit request > extracted query > stored session context.
+- Tool swap allowed only if input/output context contract unchanged.
+- SessionContextTool maintains consistent state; tools read snapshot, return delta updates.
+- Use `context_version` to prevent stale writes in concurrent scenarios.
+- Required fields: `session_id`, `required_field_state`, `BrandContext`, `DesignGuideline` (if available), `context_version`.
 
 ---
 
@@ -466,20 +376,10 @@ Validation rules:
 
 ### 4.2 External APIs and model selection
 
-Model selection strategy:
-
-- Text models: choose by latency, reasoning quality, and cost.
-- Image models: choose by generation speed, quality fidelity, and throughput.
-- Fallback path: maintain secondary provider to reduce lock-in and improve reliability.
-
-Reference docs:
-
-- Google Gemini API docs: https://ai.google.dev/gemini-api/docs
-- Google Imagen docs: https://ai.google.dev/gemini-api/docs/imagen
-- Google Nano Banana docs: https://ai.google.dev/gemini-api/docs/image-generation
-- Google pricing docs: https://ai.google.dev/gemini-api/docs/pricing
-- OpenAI pricing docs: https://openai.com/api/pricing/
-- OpenAI models docs: https://platform.openai.com/docs/models
+Criteria:
+- Text models: latency, reasoning quality, cost
+- Image models: generation speed, quality, throughput
+- Fallback path: secondary provider for reliability and resilience
 
 ### 4.3 Concrete endpoint I/O
 
@@ -593,24 +493,36 @@ Image Models
 | :--- | :--- | :--- | :--- | :--- |
 | `gpt-image-1.5` | Output tokens | $32 per 1M tokens | 10-25s | Fallback image provider |
 
-#### 4.4.3 POC model selection rationale
+#### 4.4.3 POC model selection rationale and benchmark validation
 
-Recommended primary path:
+**Actual POC benchmark results** (NovaStack AI startup, image_count=3, March 2026):
 
-- Text: `gemini-2.5-flash`
-- Image generation: `gemini-3.1-flash-image-preview`
+| Provider | Model | Latency (3 images) | Status | Recommendation |
+| :--- | :--- | :--- | :--- | :--- |
+| Google | imagen-4.0-fast-generate-001 | 3.96s | ✓ Success | **PRIMARY** - Fastest, cost-effective ($0.02/image) |
+| Google | imagen-4.0-generate-001 | 19.67s | ✓ Success | Fallback - Higher quality, slower |
+| Google | gemini-2.5-flash-image | 20.49s | ✓ Success | Reliable multimodal option |
+| Google | gemini-3.1-flash-image-preview | 47.04s | ✓ Success | Slower, higher reasoning |
+| Google | gemini-3-pro-image-preview | 122.66s | ✓ Success | Slowest, deferred to next phase |
+| OpenAI | gpt-image-1.5 | 30.12s | ✓ Success | Backup provider for resilience |
 
-Recommended fallback path:
+**Recommended primary path (validated by benchmark)**:
 
-- Text: `gpt-5.4-mini`
-- Image generation: `gpt-image-1.5`
+- Text: `gemini-2.5-flash` (proven: 2.9s for extraction + clarification)
+- Image generation: `imagen-4.0-fast-generate-001` (proven: 3.96s for 3 images)
 
-Why this combination:
+**Recommended fallback path**:
 
-1. Async + low-latency text model supports fast initial clarification processing.
-2. Main image model balances speed and quality for 3-4 options.
-3. Fallback path provides resilience and reduces vendor lock-in.
-4. This path aligns with p95 timing targets in Section 1.2.
+- Text: `gpt-5.4-mini` (proven: fastest OpenAI at 2.1s)
+- Image generation: `imagen-4.0-generate-001` or `gpt-image-1.5`
+
+**Key findings**:
+
+1. imagen-4.0-fast-generate-001 **exceeds p95 target** (3.96s << 30s total) with 5-10x faster generation than alternatives.
+2. Gemini text models validated for fast extraction; image models are secondary option.
+3. OpenAI fallback path available and tested; no single-vendor lock-in.
+4. Session-based caching (Step 2) can reuse extracted context, further reducing latency on retry.
+5. *Note: Imagen multi-image behavior (n=3) generates contact sheet; recommended fix: call separately n=1 × 3 or update prompt to singular "one logo concept" for next iteration.
 
 ---
 
@@ -618,47 +530,30 @@ Why this combination:
 
 ### 5.1 Latency
 
-Risk:
-
-- Job completion may exceed p95 target depending on provider queue and image generation latency.
+Risk: Job completion may exceed p95 target depending on provider queue.
 
 Mitigation:
-
+- Primary path (imagen-4.0-fast-generate-001) validated at 3.96s for 3 images; well below 30s target.
 - Parallel image generation where provider permits.
 - Timeout + retry for transient provider failures.
-- Queue scaling policy when backlog grows.
-- Circuit breaker for provider outages.
 
 ### 5.2 Required-field validation quality
 
-Risk:
-
-- User intent may not include brand_name or industry explicitly; fail-fast may increase first-attempt failure rate.
+Risk: User intent may not include brand_name or industry; clarification loop may add latency or fail.
 
 Mitigation:
-
-- Extract brand_name and industry early (Step 2) with high-confidence NLP.
-- Return structured failure payload (`error_code`, `missing_fields`, `suggested_questions`) for FE-guided resubmission.
-- Prioritize targeted suggested questions (e.g., "What is your company name?" before "What industry?").
-- Allow inference from context (e.g., "design a logo for a fintech startup" → industry=fintech).
+- Extract early with high-confidence NLP; return structured failure for FE-guided resubmission.
+- Prioritize targeted questions (e.g., "What is your company name?").
+- Allow inference from context (e.g., "fintech startup" → industry=fintech).
 
 ### 5.3 Cost
 
-Risk:
+Risk: Failed attempts and 3-4 image outputs increase cost per request.
 
-- Failed attempts (missing required fields) and 3-4 image outputs increase cost per successful request.
+Mitigation: Track cost per task_id and session_id; cache extracted context to avoid redundant re-analysis on retry.
 
-Mitigation:
-
-- Track cost per `task_id` and `session_id`.
-- Cache extracted context in session and avoid redundant re-analysis.
-- Keep benchmark table refreshed each milestone.
-
-### 5.4 Open technical decisions
+### 5.4 Open technical decisions (for next phase)
 
 - Polling mechanism: simple HTTP polling vs webhook vs Server-Sent Events (SSE) for result notification.
-- Signed URL TTL policy by asset type.
-- Job result retention: how long to keep completed job results available.
-- Session context TTL and reset policy (auto expiry only vs manual reset endpoint).
-- Default guideline style when `style_preference` is not provided (infer from industry vs hardcoded default).
-- Fallback generation model if primary `gemini-3.1-flash-image-preview` fails mid-job.
+- Fallback generation model if primary `imagen-4.0-fast-generate-001` fails mid-job (recommend: `imagen-4.0-generate-001`).
+- Image URL TTL and expiration policy; session context TTL.
