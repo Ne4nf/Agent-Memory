@@ -158,6 +158,26 @@ graph LR
   - Tools return deltas only; worker merges and persists checkpoints.
   - Tool swap must preserve context I/O contract.
 
+#### 3.2.1 Memory design principles (LangChain-style)
+
+This doc follows the same core context-engineering idea used in LangChain-style multi-agent systems:
+
+1. **Planner and Observer hold full context**:
+  - Planner decides what tasks are needed based on full session state.
+  - Observer sees all task outputs and decides whether to continue, clarify, or finalize.
+2. **Tasks receive scoped context only**:
+  - Each task gets minimal instructions, required fields, and strict output format.
+  - Tasks do not manage global memory directly.
+3. **Only cleaned outputs are shared across tasks**:
+  - No raw intermediate reasoning handoff between tasks.
+  - Shared artifacts are structured outputs (extracted fields, guideline, image URLs).
+4. **Context Store is the single source of truth**:
+  - Persist checkpoint after Stage A, Stage B, and Stage C.
+  - Cross-job reuse always reads from stored context, not transient worker memory.
+5. **Merge by rule, not by guess**:
+  - Precedence is fixed: explicit request > extracted query > stored session context.
+  - Missing required fields trigger clarification loop until max rounds.
+
 ### 3.3 Component breakdown (tool-level)
 
 | Component or Tool | Spec step | Role | Model Type | Notes |
@@ -229,37 +249,24 @@ flowchart TD
 #### 3.4.1b Stage B - Guideline inference (Step 4)
 
 ```mermaid
-sequenceDiagram
-  participant WORKER as Worker
-  participant CTX as Context Store
-  participant LLM as Text LLM
-    
-  WORKER->>CTX: load completed BrandContext
-  WORKER->>LLM: infer design guideline (visual direction)
-  LLM-->>WORKER: DesignGuideline JSON
-  WORKER->>CTX: persist guideline ready
+flowchart TD
+  A[Input from Stage A\nrequired fields ready] --> B[Load merged BrandContext from Context Store]
+  B --> C[Infer design guideline via Text LLM]
+  C --> D[Persist DesignGuideline to Context Store]
+  D --> E[Output\nguideline ready for Stage C]
 ```
 
 #### 3.4.1c Stage C - Logo generation (Step 6)
 
 ```mermaid
-sequenceDiagram
-  participant WORKER as Worker
-  participant CTX as Context Store
-  participant IMG as Image API
-  participant STO as Storage
-    
-  WORKER->>CTX: load DesignGuideline
-    
-  loop 3-4 image options
-    WORKER->>IMG: generate image from guideline + seed/variation
-    IMG-->>WORKER: image bytes
-    WORKER->>STO: upload image
-    STO-->>WORKER: image_url
-  end
-    
-  WORKER->>CTX: persist final result (guideline + URLs)
-  WORKER->>WORKER: mark job completed
+flowchart TD
+  A[Input from Stage B\nguideline ready] --> B[Load DesignGuideline from Context Store]
+  B --> C{All 3-4 options generated?}
+  C -->|No| D[Generate image via Image API]
+  D --> E[Upload image to Storage]
+  E --> F[Append image_url to context]
+  F --> C
+  C -->|Yes| G[Persist final output\nand mark job completed]
 ```
 #### 3.4.2 Stage A - Intake and clarification loop (Step 1-3)
 
