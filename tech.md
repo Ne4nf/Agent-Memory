@@ -94,7 +94,9 @@ flowchart TD
   A[User Submit Job] --> B[Step 1: IntentDetectTool]
   B --> C[Step 2: InputExtractionTool + ReferenceImageAnalyzeTool]
   C -->|brand_name AND industry both present?| F[Step 4: DesignInferenceTool]
-  C -->|Missing brand_name or industry| E[Fail with missing_fields + suggested_questions]
+  C -->|Missing brand_name or industry| E[Step 3: ClarificationLoopTool]
+  E -->|Fields completed| F
+  E -->|Max rounds exceeded| J[Fail with missing_fields + suggested_questions]
   F --> G[Step 6: LogoGenerationTool]
   G --> H[StorageTool]
   H --> I[Job Result Ready]
@@ -147,10 +149,10 @@ graph TB
 
 | Component or Tool | Spec step | Role | Model Type | Notes |
 | :--- | :--- | :--- | :--- | :--- |
-| IntentDetectTool | Step 1 | Detect logo design intent and route flow | Low-latency text LLM | Deterministic classifier |
+| IntentDetectTool | Step 1 | Detect logo design intent and route flow | Low-latency text LLM | Deterministic classifier; if logo intent is detected, switch from generic image generation flow to Logo Design flow |
 | InputExtractionTool | Step 2 | Extract brand_name, industry, style, color, symbol from text | Text LLM with structured output | Returns structured JSON (style/color optional) |
 | ReferenceImageAnalyzeTool | Step 2 | Analyze reference image style/color/typography/iconography | Multimodal LLM | Optional when references provided |
-| ClarificationHintTool | Step 3 | Validate required fields and generate suggested follow-up questions for missing fields | Text LLM for question generation | Fail-fast: return error payload immediately if brand_name or industry is missing |
+| ClarificationLoopTool | Step 3 | Ask targeted clarification questions for missing required fields and update context | Text LLM for question generation | Loop until brand_name AND industry are complete, then continue to Step 4; if max rounds reached, fail with missing_fields + suggested_questions |
 | DesignInferenceTool | Step 4 | Infer final guideline from completed context | Text LLM for design reasoning | Returns guideline JSON |
 | LogoGenerationTool | Step 6 | Generate 3-4 logo options | Fast image generation model | Throughput-optimized |
 | StorageTool | Shared | Upload images and return URLs | Cloud storage API | Used by generation |
@@ -199,19 +201,38 @@ sequenceDiagram
         WORKER->>WORKER: apply precedence (explicit request > extracted query > session context)
 
         alt missing brand_name or industry
-          WORKER->>LLM: generate suggested_questions for missing required fields
-          LLM-->>WORKER: suggested_questions
-          WORKER->>QUEUE: mark job failed with error_code + missing_fields + suggested_questions
+          loop clarification loop (max rounds)
+            WORKER->>LLM: generate clarification question for missing field(s)
+            LLM-->>WORKER: clarification question
+            WORKER->>WORKER: apply clarification answer + re-evaluate missing fields
+          end
+          alt still missing after max rounds
+            WORKER->>QUEUE: mark job failed with error_code + missing_fields + suggested_questions
+          else required fields complete
+            WORKER->>CTX: persist completed required fields
+            WORKER->>LLM: generate design guideline from completed context
+            LLM-->>WORKER: reasoning + guideline JSON
+
+            loop 3-4 image options
+              WORKER->>IMG: generate image from guideline
+              IMG-->>WORKER: image bytes
+              WORKER->>STO: upload to storage
+              STO-->>WORKER: image_url
+            end
+
+            WORKER->>CTX: persist guideline + generated option URLs
+            WORKER->>QUEUE: mark job completed with LogoGenerateOutput
+          end
         else brand_name AND industry present
           WORKER->>CTX: persist completed required fields
           WORKER->>LLM: generate design guideline from completed context
           LLM-->>WORKER: reasoning + guideline JSON
 
           loop 3-4 image options
-              WORKER->>IMG: generate image from guideline
-              IMG-->>WORKER: image bytes
-              WORKER->>STO: upload to storage
-              STO-->>WORKER: image_url
+            WORKER->>IMG: generate image from guideline
+            IMG-->>WORKER: image bytes
+            WORKER->>STO: upload to storage
+            STO-->>WORKER: image_url
           end
 
           WORKER->>CTX: persist guideline + generated option URLs
@@ -220,14 +241,14 @@ sequenceDiagram
     end
 ```
 
-#### 3.4.2 Stage A - Intake and fail-fast required-field validation (Step 1-3)
+    #### 3.4.2 Stage A - Intake and clarification loop (Step 1-3)
 
 | Item | Detail |
 | :--- | :--- |
 | Input | `LogoGenerateInput` (query, optional explicit brand fields, references, session_id) |
-| Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationHintTool |
-| Output | Either (a) merged fields with brand_name + industry guaranteed, or (b) failed job payload with `error_code`, `missing_fields`, `suggested_questions` |
-| Gate | brand_name AND industry must both be present; otherwise fail-fast |
+| Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationLoopTool |
+| Output | Either (a) merged fields with brand_name + industry guaranteed, or (b) failed job payload with `error_code`, `missing_fields`, `suggested_questions` after max rounds |
+| Gate | brand_name AND industry must both be present before Step 4; otherwise continue clarification loop until max rounds |
 | Target | Complete within first 10s of job start |
 
 #### 3.4.3 Stage B - Request analysis and guideline inference (Step 4)
