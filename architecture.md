@@ -4,53 +4,40 @@
 
 ### 1.1 POC objective
 
-This POC builds a backend-driven Logo Design Service using an async job-based workflow and only covers Step 1 -> Step 6 from spec.
+Build an async backend Logo Design Service for Step 1 -> Step 6 only.
 
-POC in-scope flow:
+In-scope:
 
-- Step 1: Detect logo design intent.
-- Step 2: Extract and analyze user inputs (text/reference image).
-- Step 3: Validate required fields with fail-fast clarification hints.
-- Step 4: Analyze request and infer design guideline.
-- Step 6: Generate 3-4 logo options.
+- Step 1: intent detect
+- Step 2: input extraction + reference analysis
+- Step 3: required-field validation and clarification
+- Step 4: design guideline inference
+- Step 6: generate 3-4 logo options
 
-Out of scope for this POC:
+Out-of-scope:
 
-- Step 7: Prompt-based logo editing.
-- Step 8: Follow-up suggestions.
-
-Business validation goals:
-
-- Prove users can submit a request and receive complete output (guideline + options) in one async job.
-- Prove fail-fast required-field validation improves output quality consistency.
-- Prove async execution provides simple input-output contract for FE integration.
+- Step 7: prompt-based editing
+- Step 8: follow-up suggestions
 
 ### 1.2 Success metrics (POC acceptance targets)
-
-These are committed Phase 1 POC targets for Step 1 -> Step 6 only (2 required fields: brand_name, industry).
 
 - >= 90% requests extract brand_name and industry from user query.
 - >= 90% requests that pass required-field gate produce valid `guideline` before image generation starts.
 - >= 85% requests return 3-4 valid logo options.
 - p95 job completion time <= 30s (from submit to completed).
 - p95 time to first status transition (queued -> processing) <= 5s.
-- On failure, actionable error and retry hint returned <= 5s.
+- On failure, return actionable error + retry hint <= 5s.
 
 ### 1.3 Technical constraints
 
 - Primary endpoints: async `POST /internal/v1/tasks/submit` and `GET /internal/v1/tasks/{task_id}/status`.
 - Primary task type for this POC: `logo_generate`.
-- Fail-fast validation is strict: generation must not run until required fields are complete.
 - Required fields (mandatory before generation):
   - `brand_name` (company/product name)
   - `industry` (business category or context)
-- Optional fields (non-blocking if not provided):
-  - `style_preference` (e.g., minimalist, modern, playful)
-  - `color_preference` (e.g., blue, grayscale, vibrant)
 - Single request per job; input may be partial when `use_session_context` is enabled.
 - Required-field precedence is fixed: explicit fields in request > extracted fields from new query > stored session context.
-- Session scope is per `session_id` with optional short-term memory reuse across multiple job submissions.
-- No separate rule engine; behavior is schema-driven + prompt-driven + tool-adapter driven.
+- Session scope is per `session_id` with short-term memory reuse across jobs.
 - Provider switching must not change task semantics or output contract.
 
 ---
@@ -92,13 +79,18 @@ Key reasons:
 ```mermaid
 flowchart TD
   A[User Submit Job] --> B[Step 1: IntentDetectTool]
+  M[(Session Memory Store)] --> C
   B --> C[Step 2: InputExtractionTool + ReferenceImageAnalyzeTool]
   C -->|brand_name AND industry both present?| F[Step 4: DesignInferenceTool]
   C -->|Missing brand_name or industry| E[Step 3: ClarificationLoopTool]
   E -->|Fields completed| F
   E -->|Max rounds exceeded| J[Fail with missing_fields + suggested_questions]
+  C --> M
+  E --> M
   F --> G[Step 6: LogoGenerationTool]
+  F --> M
   G --> H[StorageTool]
+  G --> M
   H --> I[Job Result Ready]
 ```
 
@@ -119,11 +111,12 @@ graph TB
     FE -->|submit job| API
     API -->|enqueue| QUEUE
     QUEUE -->|dequeue| WORKER
-    WORKER <-->|read/write| CTX
+    WORKER <-->|load/merge/persist memory| CTX
     WORKER -->|call| TOOLBOX
     TOOLBOX -->|call| LLM
     TOOLBOX -->|call| IMG
     TOOLBOX -->|upload| STO
+    TOOLBOX -->|checkpoint deltas| CTX
     WORKER -->|result| API
     API -->|poll status| FE
     STO -->|serve URLs| FE
@@ -142,63 +135,9 @@ graph TB
   - `GET /internal/v1/tasks/{task_id}/status` polls for result.
   - FE receives deterministic JSON output when ready, no streaming chunks.
 - Context-first tool handoff:
-  - Every step must access a consistent context state (by snapshot or context reference).
-  - Tool swap must preserve context I/O contract, not implicit memory.
-
-#### 3.2.1 Memory and context flow (context engineering pattern)
-
-The system uses explicit context handoff (inspired by Exa's multi-agent architecture) to make memory flow visible and deterministic:
-
-```mermaid
-graph TB
-  WKR["Orchestrator / Worker\nOwns task execution state (task_id, sequence, current_step)"]
-
-  CTX["SessionContextStore\nPersists snapshot at checkpoints\n(BrandContext, Guideline, options history)"]
-
-  T1["Tool 1: IntentDetect\nInput: task context\nOutput: delta (intent flag)"]
-  T2["Tool 2: Extract\nInput: task context + query\nOutput: delta (BrandContext fields)"]
-  T3["Tool 3: Clarify\nInput: task context + missing fields\nOutput: delta (clarified field updates)"]
-  T4["Tool 4: Infer\nInput: task context + required fields\nOutput: delta (DesignGuideline)"]
-  T5["Tool 6: Generate\nInput: task context + guideline\nOutput: delta (image URLs)"]
-
-  WKR -->|1. Load execution\ncontext + session snapshot| CTX
-  WKR -->|2. Pass lightweight\ncontext (not full state)| T1
-  T1 -->|Return delta| WKR
-
-  WKR -->|Merge delta +\nadvance sequence| WKR
-  WKR -->|3. Pass updated\ncontext| T2
-  T2 -->|Return delta| WKR
-
-  WKR -->|Merge delta +\ncheck precedence| WKR
-  WKR -->|4. Pass context if\nmissing fields| T3
-  T3 -->|Return delta| WKR
-
-  WKR -->|Persist checkpoint:\nrequired fields complete| CTX
-  WKR -->|5. Pass context| T4
-  T4 -->|Return delta| WKR
-
-  WKR -->|Persist checkpoint:\nguideline ready| CTX
-  WKR -->|6. Pass context| T5
-  T5 -->|Return delta| WKR
-
-  WKR -->|Persist final:\nresult ready| CTX
-
-style WKR fill:#e1f5ff
-style CTX fill:#fff3e0
-style T1 fill:#f3e5f5
-style T2 fill:#f3e5f5
-style T3 fill:#f3e5f5
-style T4 fill:#f3e5f5
-style T5 fill:#f3e5f5
-```
-
-Key principles:
-
-- **Tools are stateless**: Each tool receives only cleaned input context, does not manage task state.
-- **Context is lightweight**: Pass `task_id`, `session_id`, `required_field_state`, latest `BrandContext` and `DesignGuideline`; do not pass full execution state.
-- **Deltas are merged**: Each tool returns only changed fields; worker merges and advances state.
-- **Checkpoints persist**: After required-field gate passes, after guideline ready, after generation complete -> persist snapshot to SessionContextStore.
-- **Optimistic concurrency**: Use `context_version` to prevent stale writes when multiple jobs share one session.
+  - Every step reads/writes the same session memory snapshot.
+  - Tools return deltas only; worker merges and persists checkpoints.
+  - Tool swap must preserve context I/O contract.
 
 ### 3.3 Component breakdown (tool-level)
 
@@ -271,17 +210,14 @@ sequenceDiagram
     loop max clarification rounds
       WORKER->>LLM: generate clarification question for missing field
       LLM-->>WORKER: question
-            
-      alt fields now complete
-        WORKER->>CTX: persist required fields ready
-        break exit loop
-      else still missing
-        Note over WORKER: next iteration
-      end
+      WORKER->>WORKER: collect answer and re-check required fields
     end
-        
+
+    WORKER->>WORKER: evaluate required fields after loop
     alt still missing after max rounds
       WORKER->>WORKER: return failed job with missing_fields + suggested_questions
+    else fields complete
+      WORKER->>CTX: persist required fields ready
     end
   end
 ```
@@ -321,7 +257,7 @@ sequenceDiagram
   WORKER->>CTX: persist final result (guideline + URLs)
   WORKER->>WORKER: mark job completed
 ```
-  #### 3.4.2 Stage A - Intake and clarification loop (Step 1-3)
+#### 3.4.2 Stage A - Intake and clarification loop (Step 1-3)
 
 | Item | Detail |
 | :--- | :--- |
@@ -348,72 +284,6 @@ sequenceDiagram
 | Tools used | LogoGenerationTool, StorageTool |
 | Output | LogoGenerateOutput with 3-4 option URLs |
 | Target | 3-4 valid outputs >= 85%, generation <= 30s total per job |
-
-#### 3.4.5 Async job execution strategy
-
-POC uses pure async (simple input-output model):
-
-- Submit once: `POST /internal/v1/tasks/submit` with single request per job (input may be partial when `use_session_context=true`).
-- Poll for result: `GET /internal/v1/tasks/{task_id}/status` (simple short-polling recommended for POC).
-- Single output: result contains full guideline + option URLs when job completes.
-
-Why this is simple for POC:
-
-1. No streaming protocol complexity on FE (no NDJSON or gRPC streaming).
-2. Required-field validation runs server-side with fail-fast behavior; if brand_name or industry is missing after merge, return failed job with machine-readable hints.
-3. FE logic is straightforward: submit, poll, render.
-4. Perfect for learning: output contract is deterministic JSON, not chunk-by-chunk parsing.
-
-Note on fail-fast validation in async mode:
-
-- Required fields are resolved using fixed precedence: explicit request > extracted query > stored session context.
-- If brand_name or industry is missing after merge, job fails immediately.
-- Failed response includes `error_code`, `missing_fields`, and `suggested_questions` so FE can submit a new job.
-- Optional fields (style_preference, color_preference) are inferred from query or defaults; they do not block generation.
-
-#### 3.4.6 Session context and tool swap contract
-
-Design rule:
-
-- Tool swap is allowed only if input/output context contract is unchanged.
-
-Clarification:
-
-- "Context handoff" means each step can read a consistent context and write delta updates.
-- It does not require passing full serialized `SessionContextState` payload on every internal call.
-- Recommended approach: pass lightweight execution context + context reference/version, fetch full state from SessionContextTool when needed.
-
-Mandatory context handoff on every tool call:
-
-- `session_id`
-- `required_field_state` (brand_name, industry, passed/not)
-- latest extracted `BrandContext`
-- latest approved `DesignGuideline` (if available)
-- `sequence` counter
-- `context_version` (for optimistic concurrency)
-
-Context model split:
-
-- Execution context (per `task_id`):
-  - `task_id`, `session_id`, `sequence`, `current_step`, `required_field_state`, trace metadata.
-  - Used to keep one async job deterministic from Step 1 -> Step 6.
-- Session context (per `session_id`):
-  - latest `BrandContext`, latest `DesignGuideline`, generated option history, optional confirmed preferences.
-  - Used for cross-job reuse (for example, after one completed generation, user asks to generate more options).
-
-Implementation notes:
-
-- Worker owns task execution state for single job.
-- SessionContextTool persists snapshot at key checkpoints (after gate passes, after guideline generated, after options generated).
-- Each tool reads required context fields and returns delta updates (not full-state overwrite).
-- Worker merges deltas and advances task state.
-- Use `context_version` (or ETag-like revision) to prevent stale writes when multiple jobs share one session.
-
-Precedence rule (fixed and mandatory):
-
-1. explicit fields in request
-2. extracted fields from new query
-3. stored session context
 
 ### 3.5 Reuse and extensibility
 
@@ -544,23 +414,6 @@ Validation rules:
 - If required fields are still missing after merge, return failed job with `error_code`, `missing_fields`, and `suggested_questions`.
 - On `status="failed"` with `error_code="MISSING_REQUIRED_FIELDS"`, `missing_fields` and `suggested_questions` must be populated.
 
-### 4.2 External APIs and model selection
-
-Model selection strategy:
-
-- Text models: choose by latency, reasoning quality, and cost.
-- Image models: choose by generation speed, quality fidelity, and throughput.
-- Fallback path: maintain secondary provider to reduce lock-in and improve reliability.
-
-Reference docs:
-
-- Google Gemini API docs: https://ai.google.dev/gemini-api/docs
-- Google Imagen docs: https://ai.google.dev/gemini-api/docs/imagen
-- Google Nano Banana docs: https://ai.google.dev/gemini-api/docs/image-generation
-- Google pricing docs: https://ai.google.dev/gemini-api/docs/pricing
-- OpenAI pricing docs: https://openai.com/api/pricing/
-- OpenAI models docs: https://platform.openai.com/docs/models
-
 ### 4.3 Concrete endpoint I/O
 
 - `POST /internal/v1/tasks/submit` (submit job)
@@ -635,185 +488,11 @@ Reference docs:
     - fail-fast for required fields: if brand_name or industry is missing after merge, return failed job immediately
     - result metadata includes final `required_field_state`
 
-### 4.4 Model benchmark by vendor (POC-oriented)
+### 4.4 Benchmark and tracing result
 
-Important: prices and latency below are for planning and must be re-checked before release.
+Source: `logs/model_traces_benchmark_image_v4_tech_startup.json`
 
-#### 4.4.1 Google models
-
-Text Models
-
-| Model | Input ($/ 1M tokens) | Output ($/ 1M tokens) | TTFB (typical) | Full response (typical) | Best for |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| `gemini-2.5-flash` | $0.30 | $2.50 | 0.5-1.2s | 2-6s | POC default for extraction, clarification, inference |
-| `gemini-2.5-pro` | $1.25 (<=200k) | $10.00 (<=200k) | 1.0-2.5s | 4-12s | Higher-depth reasoning fallback |
-
-Image Models
-
-| Model | Pricing type | Unit price | Latency (per image) | Best for |
-| :--- | :--- | :--- | :--- | :--- |
-| `gemini-2.5-flash-image` | Per 1M tokens | $0.039 per 1024x1024 | 8-18s | Baseline fast generation |
-| `gemini-3.1-flash-image-preview` | Per 1M tokens | ~$0.067 per 1024x1024 | 6-14s | POC primary for 3-4 option generation |
-| `imagen-4.0-fast-generate-001` | Per image | $0.02 | 7-15s | Alternative fast path |
-| `imagen-4.0-generate-001` | Per image | $0.04 | 10-20s | Alternative quality path |
-
-#### 4.4.2 OpenAI models
-
-Text Models
-
-| Model | Input ($/ 1M tokens) | Output ($/ 1M tokens) | TTFB (typical) | Full response (typical) | Best for |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| `gpt-5.4-nano` | $0.20 | $1.25 | 0.3-0.9s | 1.5-5s | Cost-sensitive extraction |
-| `gpt-5.4-mini` | $0.750 | $4.500 | 0.6-1.5s | 2-7s | POC fallback with strong structured output |
-| `gpt-5.4` | $2.50 | $15.00 | 1.0-3.0s | 4-14s | High quality, high cost |
-
-Image Models
-
-| Model | Pricing type | Unit price | Latency (per image) | Best for |
-| :--- | :--- | :--- | :--- | :--- |
-| `gpt-image-1.5` | Output tokens | $32 per 1M tokens | 10-25s | Fallback image provider |
-
-#### 4.4.3 POC model selection rationale
-
-Recommended primary path:
-
-- Text: `gemini-2.5-flash`
-- Image generation: `gemini-3.1-flash-image-preview`
-
-Recommended fallback path:
-
-- Text: `gpt-5.4-mini`
-- Image generation: `gpt-image-1.5`
-
-Why this combination:
-
-1. Async + low-latency text model supports fast initial clarification processing.
-2. Main image model balances speed and quality for 3-4 options.
-3. Fallback path provides resilience and reduces vendor lock-in.
-4. This path aligns with p95 timing targets in Section 1.2.
-
-### 4.5 Tracing and observability
-
-Every step logs trace information for debugging, cost tracking, and performance analysis.
-
-#### 4.5.1 TraceRecord schema
-
-```python
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
-
-@dataclass
-class TraceRecord:
-    """Internal trace log for one tool invocation or API call."""
-    timestamp_utc: str  # ISO8601 timestamp
-    trace_id: str  # Unique identifier per tool call (uuid format)
-    session_id: str  # Session scope
-    provider: str  # "google" or "openai"
-    model: str  # Model name (e.g., "gemini-2.5-flash", "imagen-4.0-fast-generate-001")
-    mode: str  # "text" or "image"
-    status: str  # "success" or "failed"
-    latency_ms: int  # Total time from request to response (milliseconds)
-    request_summary: Dict[str, Any]  # {prompt_chars, image_count, size, ...}
-    usage: Dict[str, Any]  # {prompt_token_count, candidates_token_count, total_token_count} (optional for image APIs)
-    output_summary: Dict[str, Any]  # {image_count, saved_files, ...}
-    error: Optional[str] = None  # Error message if failed
-```
-
-#### 4.5.2 Tracing points
-
-| Tool/Step | Traces | Metrics |
-| :--- | :--- | :--- |
-| IntentDetectTool | 1 trace | latency, token usage |
-| InputExtractionTool | 1 trace | latency, token usage, extracted fields |
-| ReferenceImageAnalyzeTool | 1 trace (if references provided) | latency, token usage |
-| ClarificationLoopTool | N traces (1 per clarification round) | latency per round, total rounds, token usage |
-| DesignInferenceTool | 1 trace | latency, token usage, guideline complexity |
-| LogoGenerationTool | 1 trace (all image requests batched) | latency per image, total latency, image count, provider |
-| StorageTool | N traces (1 per image upload) | upload latency per image |
-
-#### 4.5.3 Example trace outputs
-
-Text model trace (ExtractionTool):
-
-```json
-{
-  "timestamp_utc": "2026-03-25T02:47:29.972152+00:00",
-  "trace_id": "trace-abc123def456",
-  "session_id": "session-xyz789",
-  "provider": "google",
-  "model": "gemini-2.5-flash",
-  "mode": "text",
-  "status": "success",
-  "latency_ms": 3250,
-  "request_summary": {
-    "prompt_chars": 487,
-    "task_type": "logo_generate"
-  },
-  "usage": {
-    "prompt_token_count": 95,
-    "candidates_token_count": 156,
-    "total_token_count": 251
-  },
-  "output_summary": {
-    "extracted_brand_name": "TechCorp",
-    "extracted_industry": "software",
-    "extraction_confidence": 0.95
-  },
-  "error": null
-}
-```
-
-Image model trace (GenerationTool):
-
-```json
-{
-  "timestamp_utc": "2026-03-25T02:50:25.089089+00:00",
-  "trace_id": "trace-abc123def456",
-  "session_id": "session-xyz789",
-  "provider": "google",
-  "model": "imagen-4.0-fast-generate-001",
-  "mode": "image",
-  "status": "success",
-  "latency_ms": 3961,
-  "request_summary": {
-    "prompt_chars": 427,
-    "size": "1024x1024",
-    "image_count_requested": 3
-  },
-  "usage": {
-    "prompt_token_count": null,
-    "candidates_token_count": null,
-    "total_token_count": null
-  },
-  "output_summary": {
-    "image_count": 3,
-    "saved_files": [
-      "logos/google_imagen-4-0-fast-generate-001_trace-abc123_0.png",
-      "logos/google_imagen-4-0-fast-generate-001_trace-abc123_1.png",
-      "logos/google_imagen-4-0-fast-generate-001_trace-abc123_2.png"
-    ]
-  },
-  "error": null
-}
-```
-
-#### 4.5.4 Trace output formats
-
-Two output modes recommended for different use cases:
-
-- **JSONL** (streaming): One trace per line, useful for real-time log aggregation and cost tracking.
-  - File: `logs/traces.jsonl`
-  - Use: Parse cost per provider, latency percentiles, error rates.
-
-- **JSON array** (batch): All traces in one array, useful for benchmark reports and retrospective analysis.
-  - File: `logs/benchmark_model_traces_v{N}.json`
-  - Use: Compare provider latencies, token efficiency, output quality across model versions.
-
-#### 4.5.5 Latest benchmark snapshot (image mode)
-
-Source trace file: `logs/model_traces_benchmark_image_v4_tech_startup.json`
-
-| Provider | Model | Status | Latency (ms) | Image count requested | Image count returned |
+| Provider | Model | Status | Latency (ms) | Images requested | Images returned |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | google | gemini-2.5-flash-image | success | 20488 | 3 | 3 |
 | google | gemini-3.1-flash-image-preview | success | 47039 | 3 | 3 |
@@ -821,30 +500,6 @@ Source trace file: `logs/model_traces_benchmark_image_v4_tech_startup.json`
 | google | imagen-4.0-fast-generate-001 | success | 3961 | 3 | 3 |
 | google | imagen-4.0-generate-001 | success | 19674 | 3 | 3 |
 | openai | gpt-image-1.5 | success | 30120 | 3 | 3 |
-
-Observed from this trace snapshot:
-
-- Fastest model: `imagen-4.0-fast-generate-001` (3961 ms).
-- Slowest model: `gemini-3-pro-image-preview` (122664 ms).
-- All tested models returned `image_count=3` successfully in this run.
-
-#### 4.5.6 Cost tracking from traces
-
-Aggregate traces by `provider` and `model` to compute per-job costs:
-
-```
-Cost per job = (prompt_token_count * input_rate) + (candidates_token_count * output_rate)
-             + (fallback_provider_calls * fallback_cost)
-
-Example for gemini-2.5-flash (text):
-  Input: $0.30 / 1M tokens
-  Output: $2.50 / 1M tokens
-  Cost = (95 * 0.30 / 1e6) + (156 * 2.50 / 1e6) = $0.00039 per trace
-
-Example for imagen-4.0-fast-generate-001:
-  $0.02 per image
-  Cost = 3 images * $0.02 = $0.06 per trace
-```
 
 ---
 
