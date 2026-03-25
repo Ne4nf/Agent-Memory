@@ -77,49 +77,68 @@ Key reasons:
 #### 3.1.2 Diagram 1 - Agent pipeline (flowchart)
 
 ```mermaid
-flowchart TD
-  A[User Submit Job] --> B[Step 1: IntentDetectTool]
-  M[(Session Memory Store)] --> C
-  B --> C[Step 2: InputExtractionTool + ReferenceImageAnalyzeTool]
-  C -->|brand_name AND industry both present?| F[Step 4: DesignInferenceTool]
-  C -->|Missing brand_name or industry| E[Step 3: ClarificationLoopTool]
-  E -->|Fields completed| F
-  E -->|Max rounds exceeded| J[Fail with missing_fields + suggested_questions]
-  C --> M
-  E --> M
-  F --> G[Step 6: LogoGenerationTool]
-  F --> M
-  G --> H[StorageTool]
-  G --> M
-  H --> I[Job Result Ready]
+flowchart LR
+  U[User Submit Job] --> P[Planner\nStep 1: Intent + route\nStep 2: extraction plan]
+
+  subgraph EXEC[Task Execution]
+    direction TB
+    T1[Task A\nInputExtractionTool]
+    T2[Task B\nReferenceImageAnalyzeTool]
+    O[Observer/Gate\nmerge fields + check required]
+    C[ClarificationLoopTool]
+    D[DesignInferenceTool]
+    G[LogoGenerationTool]
+    S[StorageTool]
+  end
+
+  X[(Context Store)]
+
+  P --> T1
+  P --> T2
+  T1 --> O
+  T2 --> O
+  O -->|missing required fields| C
+  C --> O
+  O -->|required fields ready| D
+  D --> G --> S --> R[Job Result Ready]
+
+  P <-. read/write .-> X
+  O <-. read/write .-> X
+  C <-. read/write .-> X
+  D <-. checkpoint .-> X
+  G <-. checkpoint .-> X
 ```
 
 #### 3.1.3 Diagram 2 - System components (layered)
 
 ```mermaid
-graph TB
-    FE[Frontend Chat or Canvas]
-    API["API Layer\nPOST /submit, GET /status"]
-    QUEUE[Job Queue]
-    WORKER[Background Worker\nTask Orchestrator]
-    CTX["Session Context Store\nrequired fields + guideline"]
-    TOOLBOX["Tool Layer\nintent extract validate infer generate"]
-    LLM["Text or multimodal LLM APIs"]
-    IMG["Image generation APIs"]
-    STO["Storage or CDN"]
+graph LR
+    FE[Frontend]
+    API[Task API\nsubmit + status]
+    Q[Job Queue]
 
-    FE -->|submit job| API
-    API -->|enqueue| QUEUE
-    QUEUE -->|dequeue| WORKER
-    WORKER <-->|load/merge/persist memory| CTX
-    WORKER -->|call| TOOLBOX
-    TOOLBOX -->|call| LLM
-    TOOLBOX -->|call| IMG
-    TOOLBOX -->|upload| STO
-    TOOLBOX -->|checkpoint deltas| CTX
-    WORKER -->|result| API
-    API -->|poll status| FE
-    STO -->|serve URLs| FE
+    subgraph ORCH[Orchestrator]
+      P[Planner]
+      TS[Task Workers]
+      O[Observer]
+    end
+
+    CTX[(Context Store)]
+    LLM[Text/Multimodal LLM]
+    IMG[Image API]
+    STO[Storage/CDN]
+
+    FE --> API --> Q --> P
+    P --> TS --> O
+    O --> API --> FE
+
+    TS --> LLM
+    TS --> IMG
+    TS --> STO
+
+    P <-. full context .-> CTX
+    O <-. full context .-> CTX
+    TS -. task output only .-> O
 ```
 
 ### 3.2 Architecture principles
@@ -193,33 +212,18 @@ sequenceDiagram
 #### 3.4.1a Stage A - Intake & clarification loop (Step 1-3)
 
 ```mermaid
-sequenceDiagram
-  participant WORKER as Worker
-  participant CTX as Context Store
-  participant LLM as Text LLM
-    
-  WORKER->>CTX: load session snapshot
-  WORKER->>LLM: extract brand_name, industry, style, color from query
-  LLM-->>WORKER: structured BrandContext
-    
-  WORKER->>WORKER: apply precedence: explicit > extracted > session context
-    
-  alt brand_name AND industry complete
-    WORKER->>CTX: persist required fields ready
-  else missing fields
-    loop max clarification rounds
-      WORKER->>LLM: generate clarification question for missing field
-      LLM-->>WORKER: question
-      WORKER->>WORKER: collect answer and re-check required fields
-    end
-
-    WORKER->>WORKER: evaluate required fields after loop
-    alt still missing after max rounds
-      WORKER->>WORKER: return failed job with missing_fields + suggested_questions
-    else fields complete
-      WORKER->>CTX: persist required fields ready
-    end
-  end
+flowchart TD
+  A[Load session snapshot] --> B[Extract fields from query and references]
+  B --> C[Apply precedence\nexplicit > extracted > session]
+  C --> D{brand_name and industry ready?}
+  D -->|Yes| E[Persist required fields\nand move to Step 4]
+  D -->|No| F[Ask targeted clarification]
+  F --> G[Merge user answer into context]
+  G --> J{required fields ready now?}
+  J -->|Yes| E
+  J -->|No| H{max rounds reached?}
+  H -->|No| F
+  H -->|Yes| I[Fail job with\nmissing_fields + suggested_questions]
 ```
 
 #### 3.4.1b Stage B - Guideline inference (Step 4)
@@ -485,21 +489,46 @@ Validation rules:
     ```
   - Context behavior:
     - merge precedence is fixed: explicit request fields > extracted query fields > stored context in same `session_id`
-    - fail-fast for required fields: if brand_name or industry is missing after merge, return failed job immediately
+    - required-field gate uses clarification loop: ask targeted questions until max rounds; fail only when required fields are still missing after max rounds
     - result metadata includes final `required_field_state`
 
-### 4.4 Benchmark and tracing result
+### 4.4 Model benchmark and tracing result
 
-Source: `logs/model_traces_benchmark_image_v4_tech_startup.json`
+#### 4.4.1 Text models (planning baseline)
 
-| Provider | Model | Status | Latency (ms) | Images requested | Images returned |
+| Provider | Model | Input ($/1M) | Output ($/1M) | Typical latency | Role |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| google | gemini-2.5-flash-image | success | 20488 | 3 | 3 |
-| google | gemini-3.1-flash-image-preview | success | 47039 | 3 | 3 |
-| google | gemini-3-pro-image-preview | success | 122664 | 3 | 3 |
-| google | imagen-4.0-fast-generate-001 | success | 3961 | 3 | 3 |
-| google | imagen-4.0-generate-001 | success | 19674 | 3 | 3 |
-| openai | gpt-image-1.5 | success | 30120 | 3 | 3 |
+| google | gemini-2.5-flash | 0.30 | 2.50 | 2-6s | Primary extraction, clarification, inference |
+| google | gemini-2.5-pro | 1.25 | 10.00 | 4-12s | Higher-depth reasoning fallback |
+| openai | gpt-5.4-nano | 0.20 | 1.25 | 1.5-5s | Cost-sensitive fallback |
+| openai | gpt-5.4-mini | 0.75 | 4.50 | 2-7s | Structured-output fallback |
+| openai | gpt-5.4 | 2.50 | 15.00 | 4-14s | Quality-first fallback |
+
+#### 4.4.2 Image models (tracing result)
+
+Source trace: `logs/model_traces_benchmark_image_v4_tech_startup.json`
+
+| Provider | Model | Status | Latency (ms) | Images requested | Images returned | Notes |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| google | gemini-2.5-flash-image | success | 20488 | 3 | 3 | Balanced baseline |
+| google | gemini-3.1-flash-image-preview | success | 47039 | 3 | 3 | Slower preview model |
+| google | gemini-3-pro-image-preview | success | 122664 | 3 | 3 | Slowest in this run |
+| google | imagen-4.0-fast-generate-001 | success | 3961 | 3 | 3 | Fastest in this run |
+| google | imagen-4.0-generate-001 | success | 19674 | 3 | 3 | Quality-oriented alternative |
+| openai | gpt-image-1.5 | success | 30120 | 3 | 3 | Cross-vendor fallback |
+
+#### 4.4.3 Best choice (POC)
+
+- Text primary: `gemini-2.5-flash`
+- Image primary: `imagen-4.0-fast-generate-001`
+- Text fallback: `gpt-5.4-mini`
+- Image fallback: `gpt-image-1.5`
+
+Why this choice:
+
+1. `imagen-4.0-fast-generate-001` is clearly fastest in current tracing run.
+2. `gemini-2.5-flash` gives strong speed/cost balance for extraction and clarification.
+3. OpenAI fallback keeps multi-provider resilience for production incidents.
 
 ---
 
