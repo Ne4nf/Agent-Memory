@@ -25,12 +25,31 @@ Out-of-scope:
 - >= 90% requests that pass required-field gate produce valid `guideline` before image generation starts.
 - >= 85% requests return 3-4 valid logo options.
 - p95 job completion time <= 30s (from submit to completed).
-- p95 time to first status transition (queued -> processing) <= 5s.
+- p95 time to first status transition (pending -> processing) <= 5s.
 - On failure, return actionable error + retry hint <= 5s.
 
-### 1.3 Technical constraints
+### 1.3 User Journey (5-step POC flow)
 
-- Primary endpoints: async `POST /internal/v1/tasks/submit` and `GET /internal/v1/tasks/{task_id}/status`.
+1. **User enters logo request** → Submit query with optional brand details
+2. **System shows thinking** → Frontend shows "Processing..." with streaming reasoning visible
+3. **If missing info** → System asks clarification question (e.g., "What is your brand name?"), user answers in chat
+4. **System generates guideline** → Design guideline created, user sees it via stream
+5. **System generates logo options** → 3-4 logo options generated and displayed
+6. **User sees results** → Complete logos with brand context
+
+Key UX point: User sees real-time reasoning via Stream and may re-call Stream with updated input when clarification is needed.
+
+### 1.4 Technical constraints
+
+- AI Hub SDK APIs are fixed by framework and must be used as-is:
+  - `AIHubAsyncService.SubmitTask`
+  - `AIHubAsyncService.GetTaskStatus`
+  - `AIHubStreamService.Stream`
+- HTTP gateway mapping follows SDK default routes:
+  - `POST /internal/v1/tasks/submit`
+  - `GET /internal/v1/tasks/{task_id}/status`
+  - `POST /internal/v1/tasks/stream`
+- Frontend should communicate through a Backend-for-Frontend (BFF), which manages NDJSON/gRPC stream connections and forwards UI-friendly events.
 - Primary task type for this POC: `logo_generate`.
 - Required fields (mandatory before generation):
   - `brand_name` (company/product name)
@@ -65,14 +84,18 @@ Out-of-scope:
 
 #### 3.1.1 Why this solution
 
-This architecture is designed for strict quality gating in POC with simple async job semantics: submit once, get complete output.
+This architecture is designed for strict quality gating in POC with AI Hub native execution: Stream for real-time reasoning and clarification, then async SubmitTask/GetTaskStatus for long-running image generation.
+
+This system behaves like a chat-based design assistant: users interact via streaming responses, and the system dynamically asks for missing information before completing the task.
 
 Key reasons:
 
 1. Fail-fast required-field validation enforces required design inputs before generation begins.
-2. Async execution keeps FE simple: submit job, poll status, render output when ready.
+2. Hybrid execution improves UX: Stage A+B stream reasoning in real time, Stage C runs async for image generation.
 3. All processing happens server-side; FE does not hold the connection.
 4. Session context is explicit and propagated between tools for deterministic behavior.
+5. In POC, planner is simplified to rule-based routing inside a single worker process.
+6. Stream ends when guideline is ready; image generation always runs asynchronously.
 
 #### 3.1.2 Diagram 1 - Agent pipeline (flowchart)
 
@@ -141,6 +164,8 @@ graph LR
     TS -. task output only .-> O
 ```
 
+**Note for POC:** Planner, Observer, and Task Workers are logically separated but implemented as a single worker service to keep implementation simple. They can be decoupled into separate microservices in production.
+
 ### 3.2 Architecture principles
 
 - Task-first:
@@ -150,9 +175,11 @@ graph LR
   - All contracts validated by Pydantic.
   - Required-field gate is encoded as schema and validator rules.
 - Async job-based:
-  - `POST /internal/v1/tasks/submit` accepts complete input once.
-  - `GET /internal/v1/tasks/{task_id}/status` polls for result.
-  - FE receives deterministic JSON output when ready, no streaming chunks.
+  - Hybrid execution is used with AI Hub service modes:
+    - Stage A+B: `AIHubStreamService.Stream` for visible process thinking and clarification.
+    - Stage C: `AIHubAsyncService.SubmitTask` + `AIHubAsyncService.GetTaskStatus` for background image generation.
+  - In HTTP gateway form, Stage A+B uses `POST /internal/v1/tasks/stream` (NDJSON stream), not SSE.
+  - Stage C uses `POST /internal/v1/tasks/submit` and `GET /internal/v1/tasks/{task_id}/status`.
 - Context-first tool handoff:
   - Every step reads/writes the same session memory snapshot.
   - Tools return deltas only; worker merges and persists checkpoints.
@@ -178,6 +205,16 @@ This section defines memory behavior so the pipeline is deterministic and easy t
   - Every write validates expected `context_version`.
   - On version mismatch, worker reloads latest context and retries merge.
 
+#### 3.2.2 POC simplification notes
+
+This design is prepared for production scale but POC implementation can be simplified:
+
+- **Planner**: In POC, simplified to rule-based routing (no multi-model decision tree); planner logic is embedded in worker startup.
+- **Queue**: In POC, queue is used only for Stage C image generation; Stage A+B runs synchronously within the stream handler.
+- **Observer**: In POC, observer check is simple gate logic (required fields present?); no multi-path decision tree.
+
+These can be formalized and decoupled in subsequent phases as system scales.
+
 ### 3.3 Component breakdown (tool-level)
 
 | Component or Tool | Spec step | Role | Model Type | Notes |
@@ -185,7 +222,7 @@ This section defines memory behavior so the pipeline is deterministic and easy t
 | IntentDetectTool | Step 1 | Detect logo design intent and route flow | Low-latency text LLM | Deterministic classifier; if logo intent is detected, switch from generic image generation flow to Logo Design flow |
 | InputExtractionTool | Step 2 | Extract brand_name, industry, style, color, symbol from text | Text LLM with structured output | Returns structured JSON (style/color optional) |
 | ReferenceImageAnalyzeTool | Step 2 | Analyze reference image style/color/typography/iconography | Multimodal LLM | Optional when references provided |
-| ClarificationLoopTool | Step 3 | Ask targeted clarification questions for missing required fields and update context | Text LLM for question generation | Loop until brand_name AND industry are complete, then continue to Step 4; if max rounds reached, fail with missing_fields + suggested_questions |
+| ClarificationLoopTool | Step 3 | Generate targeted clarification questions for missing required fields | Text LLM for question generation | If required fields are missing: worker emits clarification chunk in Stream response; client collects user answer and re-calls Stream with updated input/session context |
 | DesignInferenceTool | Step 4 | Infer final guideline from completed context | Text LLM for design reasoning | Returns guideline JSON |
 | LogoGenerationTool | Step 6 | Generate 3-4 logo options | Fast image generation model | Throughput-optimized |
 | StorageTool | Shared | Upload images and return URLs | Cloud storage API | Used by generation |
@@ -195,36 +232,51 @@ This section defines memory behavior so the pipeline is deterministic and easy t
 
 POC exposes one external task type: `logo_generate`.
 
-#### 3.4.1 Full sequence overview (Step 1 -> Step 6)
+#### 3.4.1 Full sequence overview (Streaming + Async)
 
 High-level flow:
 
 ```mermaid
 sequenceDiagram
   actor FE as Frontend
+  participant S as Stream API (POST /tasks/stream)
   participant API as Task API
-  participant QUEUE as Job Queue
+  participant Q as Job Queue
   participant WORKER as Worker
 
-  FE->>API: POST /submit (partial/full inputs)
-  API->>QUEUE: enqueue job
-  API-->>FE: {task_id, status: queued}
-    
-  par Background Processing
-    QUEUE->>WORKER: dequeue job
-    WORKER->>WORKER: Stage A: Extract + Clarify (Step 1-3)
-    WORKER->>WORKER: Stage B: Infer Guideline (Step 4)
-    WORKER->>WORKER: Stage C: Generate Options (Step 6)
+  rect rgb(235, 248, 255)
+    Note over FE,WORKER: Phase 1 - Streaming thinking (Stage A + B)
+    FE->>S: POST /internal/v1/tasks/stream (task_type=logo_generate)
+    S->>WORKER: Run Stage A + Stage B in stream mode
+    WORKER-->>S: processing chunks (reasoning / extraction)
+    S-->>FE: NDJSON chunks (visible process thinking)
+    alt missing required fields
+      WORKER-->>S: clarification chunk {missing_fields, suggested_questions}
+      S-->>FE: final clarification-needed chunk
+      FE->>S: Re-call POST /internal/v1/tasks/stream with updated answers + same session_id
+      S->>WORKER: resume from updated session context
+    else required fields complete
+      WORKER-->>S: final guideline chunk
+      S-->>FE: stream completed
+    end
   end
-    
-  loop Polling
-    FE->>API: GET /status/{task_id}
-    alt processing
-      API-->>FE: {status: processing, progress}
-    else completed
-      API-->>FE: {status: completed, result}
-    else failed
-      API-->>FE: {status: failed, error_code, missing_fields, suggested_questions}
+
+  rect rgb(245, 255, 245)
+    Note over FE,WORKER: Phase 2 - Async image generation (Stage C)
+    WORKER->>API: Enqueue Stage C as new async task via AIHubAsyncService.SubmitTask
+    API->>Q: enqueue generation task
+    API-->>WORKER: {task_id, status: pending}
+    WORKER-->>FE: stream chunk includes generation task_id
+    Q->>WORKER: run Stage C in background
+    loop Polling image task
+      FE->>API: GET /internal/v1/tasks/{task_id}/status
+      alt processing
+        API-->>FE: {status: processing, progress}
+      else completed
+        API-->>FE: {status: completed, options}
+      else failed
+        API-->>FE: {status: failed, error_code}
+      end
     end
   end
 ```
@@ -233,6 +285,7 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
+  actor FE as Frontend
   participant W as Worker
   participant C as SessionContextStore
   participant L as LLM
@@ -245,16 +298,12 @@ sequenceDiagram
   alt required fields ready
     W->>C: Persist required-field checkpoint
   else missing required fields
-    loop until ready or max rounds
-      W->>L: Ask clarification question
-      L-->>W: Clarification delta
-      W->>W: Merge delta and re-check gate
-    end
-    alt still missing after max rounds
-      W->>W: Fail with missing_fields + suggested_questions
-    else fields ready
-      W->>C: Persist required-field checkpoint
-    end
+    W->>L: Generate suggested_questions for missing fields
+    L-->>W: suggested_questions
+    W-->>FE: Stream clarification-needed chunk
+    Note over FE: Ask user in chat and collect answers
+    FE->>W: Re-call Stream with updated input + same session_id
+    W->>W: Merge new input and re-check required fields
   end
 ```
 
@@ -298,8 +347,8 @@ sequenceDiagram
 | :--- | :--- |
 | Input | `LogoGenerateInput` (query, optional explicit brand fields, references, session_id) |
 | Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationLoopTool |
-| Output | Either (a) merged fields with brand_name + industry guaranteed, or (b) failed job payload with `error_code`, `missing_fields`, `suggested_questions` after max rounds |
-| Gate | brand_name AND industry must both be present before Step 4; otherwise continue clarification loop until max rounds |
+| Output | Either (a) merged fields with brand_name + industry guaranteed, or (b) clarification-needed stream chunk so FE can re-call Stream with updated input |
+| Gate | brand_name AND industry must both be present before Step 4; if missing, ask clarification via Stream chunk and continue on next Stream call |
 | Target | Complete within first 10s of job start |
 
 #### 3.4.3 Stage B - Request analysis and guideline inference (Step 4)
@@ -319,6 +368,7 @@ sequenceDiagram
 | Tools used | LogoGenerationTool, StorageTool |
 | Output | LogoGenerateOutput with 3-4 option URLs |
 | Target | 3-4 valid outputs >= 85%, generation <= 30s total per job |
+| Concurrency | SHOULD run in parallel when provider supports batching/multi-call concurrency |
 
 ### 3.5 Reuse and extensibility
 
@@ -419,17 +469,19 @@ class LogoGenerateOutput(BaseModel):
 
 class JobSubmitResponse(BaseModel):
     task_id: str
-    status: Literal["queued"]
-    created_at: str  # ISO8601
+    status: Literal["pending"]
+    task_type: str
 
 
 class JobStatusResponse(BaseModel):
     task_id: str
-    status: Literal["queued", "processing", "completed", "failed"]
+    status: Literal["pending", "processing", "completed", "failed"]
+    task_type: str
     progress_percent: Optional[int] = None  # 0-100 if processing
     result: Optional[LogoGenerateOutput] = None  # populated when completed
+    metadata: Optional[Dict[str, Any]] = None
     error_code: Optional[str] = None  # populated when failed (e.g., MISSING_REQUIRED_FIELDS)
-    error: Optional[str] = None  # populated when failed
+    error_message: Optional[str] = None  # populated when failed
     missing_fields: List[str] = Field(default_factory=list)  # populated when failed
     suggested_questions: List[SuggestedQuestion] = Field(default_factory=list)  # populated when failed
     retry_after_seconds: Optional[int] = None  # populated when failed
@@ -440,7 +492,12 @@ Validation rules:
 - `query` is required and non-empty after trim.
 - `variation_count` must be 3 or 4.
 - Required-field gate: brand_name AND industry must both be present before guideline generation.
+- If extraction confidence is **below threshold** (e.g., < 70%), system SHOULD trigger clarification question instead of guessing; this avoids silent failures and improves UX transparency.
 - Merge precedence is fixed: explicit fields in request > extracted fields from new query > stored context for same `session_id`.
+  - **Example:**
+    - User provides `brand_name` explicitly in request → use it
+    - Else, extract `brand_name` from query via LLM
+    - Else, reuse `brand_name` from previous session
 - Empty-value precedence policy:
   - explicit empty string (e.g., `brand_name=""`) is treated as missing and does not override non-empty extracted/session value.
   - explicit `null` is treated as "not provided" and falls through to lower-precedence sources.
@@ -449,47 +506,76 @@ Validation rules:
 - If required fields are still missing after merge, return failed job with `error_code`, `missing_fields`, and `suggested_questions`.
 - On `status="failed"` with `error_code="MISSING_REQUIRED_FIELDS"`, `missing_fields` and `suggested_questions` must be populated.
 
-### 4.3 Concrete endpoint I/O
+### 4.3 Concrete endpoint I/O (AI Hub SDK native)
 
-- `POST /internal/v1/tasks/submit` (submit job)
-  - Input:
-    - `task_type` (required: `logo_generate`)
-    - `session_id` (required)
-    - `query` (required: user request for extraction)
-    - `brand_name` (optional explicit override)
-    - `industry` (optional explicit override)
-    - `style_preference` (optional explicit override)
-    - `color_preference` (optional explicit override)
-    - `symbol_preference` (optional explicit override)
-    - `references` (optional: list of ReferenceImage)
-    - `use_session_context` (optional, default true)
-    - `variation_count` (optional, default 4, range 3-4)
-    - `output_format` (optional, default "png")
-    - `output_size` (optional, default "1024x1024")
-  - Output (JobSubmitResponse):
+This section follows AI Hub SDK fixed APIs. The design maps into existing async and stream services, and does not introduce custom REST endpoints.
+
+- Stream reasoning and clarification (Stage A + B)
+  - gRPC: `AIHubStreamService.Stream(TaskRequest) -> stream TaskStatus`
+  - HTTP gateway: `POST /internal/v1/tasks/stream`
+  - Media type: `application/x-ndjson` (JSON Lines), not SSE.
+  - FE integration recommendation: browser UI talks to BFF; BFF owns stream connection and pushes normalized events to UI.
+  - Request body pattern:
+    ```json
+    {
+      "task_type": "logo_generate",
+      "input_args": {
+        "session_id": "sess-123",
+        "query": "Design a logo for Nova",
+        "brand_name": null,
+        "industry": null,
+        "use_session_context": true,
+        "variation_count": 4
+      },
+      "priority": "high"
+    }
+    ```
+  - Streaming chunks are used to render:
+    - "Thinking..." messages
+    - Step-by-step reasoning (input understanding, style inference, field validation)
+    - Clarification question prompts
+  - Clarification handling in AI Hub pattern:
+    - Worker emits a `processing` chunk with `metadata.event_type = clarification_needed`, `missing_fields`, and `suggested_questions`.
+    - FE asks user and collects answer.
+    - FE re-calls `Stream` with updated `input_args` and same `session_id`.
+    - On re-call, only updated fields are required in `input_args`; worker merges new input with session context by precedence (explicit > extracted > session).
+    - Worker continues pipeline from merged context.
+
+- Async generation and polling (Stage C)
+  - gRPC submit: `AIHubAsyncService.SubmitTask(TaskRequest) -> SubmitTaskResponse`
+  - HTTP gateway submit: `POST /internal/v1/tasks/submit`
+  - Submit response example:
     ```json
     {
       "task_id": "uuid",
-      "status": "queued",
-      "created_at": "2026-03-24T12:00:00Z"
+      "status": "pending",
+      "task_type": "logo_generate"
     }
     ```
-
-- `GET /internal/v1/tasks/{task_id}/status` (check job status)
-  - Path params: `task_id`
-  - Output (JobStatusResponse, while processing):
+  - gRPC poll: `AIHubAsyncService.GetTaskStatus(GetTaskStatusRequest) -> TaskStatus`
+  - HTTP gateway poll: `GET /internal/v1/tasks/{task_id}/status`
+  - Stream/async boundary: Stream ends when guideline is ready; image generation always proceeds in async mode.
+  - Processing response example:
     ```json
     {
       "task_id": "uuid",
       "status": "processing",
-      "progress_percent": 45
+      "task_type": "logo_generate",
+      "metadata": {
+        "progress_percent": 45
+      }
     }
     ```
-  - Output (JobStatusResponse, when completed):
+  - Progress mapping (for UI progress bar only, not exposed as detailed user-facing steps):
+    - 0-20: extraction
+    - 20-40: guideline inference
+    - 40-100: image generation (increment per image completion)
+  - Completed response example:
     ```json
     {
       "task_id": "uuid",
       "status": "completed",
+      "task_type": "logo_generate",
       "result": {
         "guideline": { /* DesignGuideline */ },
         "required_field_state": { /* RequiredFieldState */ },
@@ -497,31 +583,35 @@ Validation rules:
       }
     }
     ```
-  - Output (JobStatusResponse, if failed):
+  - Failed response example:
     ```json
     {
       "task_id": "uuid",
       "status": "failed",
+      "task_type": "logo_generate",
       "error_code": "MISSING_REQUIRED_FIELDS",
-      "error": "Missing required fields after merge precedence",
-      "missing_fields": ["brand_name", "industry"],
-      "suggested_questions": [
-        {
-          "key": "brand_name",
-          "question": "What is your company or product name?"
-        },
-        {
-          "key": "industry",
-          "question": "What industry is your business in?"
-        }
-      ],
-      "retry_after_seconds": 60
+      "error_message": "Missing required fields after merge precedence",
+      "metadata": {
+        "missing_fields": ["brand_name", "industry"],
+        "suggested_questions": [
+          {
+            "key": "brand_name",
+            "question": "What is your company or product name?"
+          },
+          {
+            "key": "industry",
+            "question": "What industry is your business in?"
+          }
+        ],
+        "retry_after_seconds": 60
+      }
     }
     ```
-  - Context behavior:
-    - merge precedence is fixed: explicit request fields > extracted query fields > stored context in same `session_id`
-    - required-field gate uses clarification loop: ask targeted questions until max rounds; fail only when required fields are still missing after max rounds
-    - result metadata includes final `required_field_state`
+
+- Context behavior
+  - Merge precedence is fixed: explicit request fields > extracted query fields > stored context in same `session_id`.
+  - Clarification is handled via Stream re-call with updated input, not via a dedicated clarification endpoint.
+  - Final `result` must include `required_field_state` for explainability.
 
 ### 4.4 Model benchmark and tracing result
 
@@ -541,7 +631,7 @@ Source trace: `logs/model_traces_benchmark_image_v4_tech_startup.json`
 
 | Provider | Model | Status | Latency (ms) | Images requested | Images returned | Notes |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| google | gemini-2.5-flash-image | success | 20488 | 3 | 3 | Balanced baseline |
+| google | gemini-2.5-flash-image | success | 20488 | 3 | 3 | Primary image model (nano banana), strong style consistency with Gemini text stack |
 | google | gemini-3.1-flash-image-preview | success | 47039 | 3 | 3 | Slower preview model |
 | google | gemini-3-pro-image-preview | success | 122664 | 3 | 3 | Slowest in this run |
 | google | imagen-4.0-fast-generate-001 | success | 3961 | 3 | 3 | Fastest in this run |
@@ -551,15 +641,16 @@ Source trace: `logs/model_traces_benchmark_image_v4_tech_startup.json`
 #### 4.4.3 Best choice (POC)
 
 - Text primary: `gemini-2.5-flash`
-- Image primary: `imagen-4.0-fast-generate-001`
+- Image primary: `gemini-2.5-flash-image` (nano banana)
 - Text fallback: `gpt-5.4-mini`
-- Image fallback: `gpt-image-1.5`
+- Image fallback: `imagen-4.0-fast-generate-001` (speed fallback), then `gpt-image-1.5` (cross-vendor fallback)
 
 Why this choice:
 
-1. `imagen-4.0-fast-generate-001` is clearly fastest in current tracing run.
-2. `gemini-2.5-flash` gives strong speed/cost balance for extraction and clarification.
-3. OpenAI fallback keeps multi-provider resilience for production incidents.
+1. `gemini-2.5-flash` gives strong speed/cost balance for extraction and clarification.
+2. `gemini-2.5-flash-image` (nano banana) keeps text+image stack in one provider family, improving style continuity between inferred guideline and generated logo options.
+3. In benchmark v4, `gemini-2.5-flash-image` succeeded for 3 images; implementation should still support per-image fallback because some runs can return `INVALID_ARGUMENT` for multi-candidate requests depending on provider settings.
+4. `imagen-4.0-fast-generate-001` remains the fastest latency fallback, while `gpt-image-1.5` preserves multi-provider resilience.
 
 ---
 
@@ -605,9 +696,9 @@ Mitigation:
 
 ### 5.4 Open technical decisions
 
-- Polling mechanism: simple HTTP polling vs webhook vs Server-Sent Events (SSE) for result notification.
+- Stream transport policy: gRPC stream timeout, HTTP NDJSON idle timeout, reconnect strategy, and chunk flush interval.
 - Signed URL TTL policy by asset type.
 - Job result retention: how long to keep completed job results available.
 - Session context TTL and reset policy (auto expiry only vs manual reset endpoint).
 - Default guideline style when `style_preference` is not provided (infer from industry vs hardcoded default).
-- Fallback generation model if primary `gemini-3.1-flash-image-preview` fails mid-job.
+- Fallback generation model chain if primary `gemini-2.5-flash-image` fails mid-job (`imagen-4.0-fast-generate-001` -> `gpt-image-1.5`).
