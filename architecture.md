@@ -1,684 +1,1148 @@
-# Logo Design AI POC
+# Logo Design AI - Complete Architecture & Flow Documentation
 
-## 1. Overview
-
-### 1.1 POC objective
-
-Build an async backend Logo Design Service for Step 1 -> Step 6 only.
-
-In-scope:
-
-- Step 1: intent detect
-- Step 2: input extraction + reference analysis
-- Step 3: required-field validation and clarification
-- Step 4: design guideline inference
-- Step 6: generate 3-4 logo options
-
-Out-of-scope:
-
-- Step 7: prompt-based editing
-- Step 8: follow-up suggestions
-
-### 1.2 Success metrics (POC acceptance targets)
-
-- >= 90% requests extract brand_name and industry from user query.
-- >= 90% requests that pass required-field gate produce valid `guideline` before image generation starts.
-- >= 85% requests return 3-4 valid logo options.
-- p95 job completion time <= 30s (from submit to completed).
-- p95 time to first status transition (queued -> processing) <= 5s.
-- On failure, return actionable error + retry hint <= 5s.
-
-### 1.3 Technical constraints
-
-- Primary endpoints: async `POST /internal/v1/tasks/submit` and `GET /internal/v1/tasks/{task_id}/status`.
-- Primary task type for this POC: `logo_generate`.
-- Required fields (mandatory before generation):
-  - `brand_name` (company/product name)
-  - `industry` (business category or context)
-- Single request per job; input may be partial when `use_session_context` is enabled.
-- Required-field precedence is fixed: explicit fields in request > extracted fields from new query > stored session context.
-- Session scope is per `session_id` with short-term memory reuse across jobs.
-- Provider switching must not change task semantics or output contract.
+**Last Updated:** 2026-04-01  
+**Status:** Production  
+**Scope:** Full backend flow (Stage A, B, C)
 
 ---
 
-## 2. POC Scope
+## Table of Contents
 
-### 2.1 Build vs Defer
-
-| Area | Build (POC) | Defer |
-| :--- | :--- | :--- |
-| Intent + input | Detect logo intent, parse text/references, extract brand context | Multi-domain intent classifier |
-| Clarification | Fail-fast required-field validation with suggested follow-up questions | Adaptive personalized questioning policy |
-| Reasoning | Internal reasoning for extraction and inference | Multi-agent self-critique loops |
-| Guideline | Generate structured design guideline before generation | Automatic guideline optimization loop |
-| Generation | Generate 3-4 PNG options from guideline | Auto model-routing and ranking |
-| Storage/session | Persist output URLs + session context per `session_id` | Project library, version history, long-term memory |
-| Editing | Deferred | Step 7 in next phase |
-| Follow-up suggestion | Deferred | Step 8 in next phase |
+1. [Quick Overview](#quick-overview)
+2. [Code Organization Analysis](#code-organization-analysis)
+3. [Progress Mapping](#progress-mapping)
+4. [Service Layer Breakdown](#service-layer-breakdown)
+5. [Full End-to-End Flow](#full-end-to-end-flow)
+6. [Data Flow & Context Management](#data-flow--context-management)
+7. [Code Quality & Recommendations](#code-quality--recommendations)
+8. [Service File Usage Matrix](#service-file-usage-matrix)
 
 ---
 
-## 3. System Architecture
+## Quick Overview
 
-### 3.1 Overview
-
-#### 3.1.1 Why this solution
-
-This architecture is designed for strict quality gating in POC with simple async job semantics: submit once, get complete output.
-
-Key reasons:
-
-1. Fail-fast required-field validation enforces required design inputs before generation begins.
-2. Hybrid execution improves UX: Stage A+B stream reasoning in real time, Stage C runs async for image generation.
-3. All processing happens server-side; FE does not hold the connection.
-4. Session context is explicit and propagated between tools for deterministic behavior.
-5. In POC, planner is simplified to rule-based routing inside a single worker process.
-
-#### 3.1.2 Diagram 1 - Agent pipeline (flowchart)
-
-```mermaid
-flowchart LR
-  U[User Submit Job] --> P[Planner\nStep 1: Intent + route\nStep 2: extraction plan]
-
-  subgraph EXEC[Task Execution]
-    direction TB
-    T1[Task A\nInputExtractionTool]
-    T2[Task B\nReferenceImageAnalyzeTool]
-    O[Observer/Gate\nmerge fields + check required]
-    C[ClarificationLoopTool]
-    D[DesignInferenceTool]
-    G[LogoGenerationTool]
-    S[StorageTool]
-  end
-
-  X[(Context Store)]
-
-  P --> T1
-  P --> T2
-  T1 --> O
-  T2 --> O
-  O -->|missing required fields| C
-  C --> O
-  O -->|required fields ready| D
-  D --> G --> S --> R[Job Result Ready]
-
-  P <-. read/write .-> X
-  O <-. read/write .-> X
-  C <-. read/write .-> X
-  D <-. checkpoint .-> X
-  G <-. checkpoint .-> X
+```
+Request → Stream API → Stage A (Intake) → Stage B (Guideline) → 
+          ↓
+       SessionContext + Merge → Required Field Gate →
+          ↓
+       Web Research (if needed) → Guideline Inference →
+          ↓
+    Handoff to Stage C (Async) → Image Generation → Store URLs
 ```
 
-#### 3.1.3 Diagram 2 - System components (layered)
-
-```mermaid
-graph LR
-    FE[Frontend]
-    API[Task API\nsubmit + status]
-    Q[Job Queue]
-
-    subgraph ORCH[Orchestrator]
-      P[Planner]
-      TS[Task Workers]
-      O[Observer]
-    end
-
-    CTX[(Context Store)]
-    LLM[Text/Multimodal LLM]
-    IMG[Image API]
-    STO[Storage/CDN]
-
-    FE --> API --> Q --> P
-    P --> TS --> O
-    O --> API --> FE
-
-    TS --> LLM
-    TS --> IMG
-    TS --> STO
-
-    P <-. full context .-> CTX
-    O <-. full context .-> CTX
-    TS -. task output only .-> O
-```
-
-### 3.2 Architecture principles
-
-- Task-first:
-  - Business capability exposed as `logo_generate` in this phase.
-  - Routing by `task_type`, no endpoint-specific business hardcoding.
-- Schema-first:
-  - All contracts validated by Pydantic.
-  - Required-field gate is encoded as schema and validator rules.
-- Async job-based:
-  - Hybrid execution is used:
-    - Stage A+B: SSE streaming for visible process thinking.
-    - Stage C: async image task with polling.
-  - `POST /internal/v1/tasks/submit` creates task and returns `task_id`.
-  - `GET /internal/v1/tasks/{task_id}/status` is used primarily for Stage C result polling.
-- Context-first tool handoff:
-  - Every step reads/writes the same session memory snapshot.
-  - Tools return deltas only; worker merges and persists checkpoints.
-  - Tool swap must preserve context I/O contract.
-
-#### 3.2.1 Memory flow contract (context engineering style)
-
-This section defines memory behavior so the pipeline is deterministic and easy to reason about:
-
-1. **Worker keeps execution state**:
-  - Worker owns `task_id`, `current_step`, round counters, and status transitions.
-  - Task-local runtime state is not stored in tool adapters.
-2. **Tools are stateless and receive lightweight context**:
-  - Input to each tool is scoped to required fields only (`session_id`, required field state, relevant context slice).
-  - Tools do not own global session memory.
-3. **Tools return deltas, worker merges**:
-  - Each tool returns only changed fields (delta), not full state overwrite.
-  - Worker merges delta into current state using fixed precedence rules.
-4. **Persist checkpoints in SessionContextStore**:
-  - Save checkpoint after Stage A (required fields), Stage B (guideline), Stage C (final output URLs).
-  - Cross-job reuse always loads from SessionContextStore.
-5. **Use `context_version` for stale-write protection**:
-  - Every write validates expected `context_version`.
-  - On version mismatch, worker reloads latest context and retries merge.
-
-#### 3.2.2 POC simplification notes
-
-This design is prepared for production scale but POC implementation can be simplified:
-
-- **Planner**: In POC, simplified to rule-based routing (no multi-model decision tree); planner logic is embedded in worker startup.
-- **Queue**: In POC, queue is used only for Stage C image generation; Stage A+B runs synchronously within the stream handler.
-- **Observer**: In POC, observer check is simple gate logic (required fields present?); no multi-path decision tree.
-
-These can be formalized and decoupled in subsequent phases as system scales.
-
-### 3.3 Component breakdown (tool-level)
-
-| Component or Tool | Spec step | Role | Model Type | Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| IntentDetectTool | Step 1 | Detect logo design intent and route flow | Low-latency text LLM | Deterministic classifier; if logo intent is detected, switch from generic image generation flow to Logo Design flow |
-| InputExtractionTool | Step 2 | Extract brand_name, industry, style, color, symbol from text | Text LLM with structured output | Returns structured JSON (style/color optional) |
-| ReferenceImageAnalyzeTool | Step 2 | Analyze reference image style/color/typography/iconography | Multimodal LLM | Optional when references provided |
-| ClarificationLoopTool | Step 3 | Generate targeted clarification questions for missing required fields | Text LLM for question generation | Interactive loop via streaming; FE collects user answer within same task/session and continues pipeline |
-| DesignInferenceTool | Step 4 | Infer final guideline from completed context | Text LLM for design reasoning | Returns guideline JSON |
-| LogoGenerationTool | Step 6 | Generate 3-4 logo options | Fast image generation model | Throughput-optimized |
-| StorageTool | Shared | Upload images and return URLs | Cloud storage API | Used by generation |
-| SessionContextTool | Shared | Read/update context snapshot per session and key job checkpoints | Context adapter over cache or DB | Required for deterministic tool swap |
-
-### 3.4 End-to-end pipeline
-
-POC exposes one external task type: `logo_generate`.
-
-#### 3.4.1 Full sequence overview (Streaming + Async)
-
-High-level flow:
-
-```mermaid
-sequenceDiagram
-  actor FE as Frontend
-  participant S as Stream API (SSE)
-  participant API as Task API
-  participant Q as Job Queue
-  participant WORKER as Worker
-
-  rect rgb(235, 248, 255)
-    Note over FE,WORKER: Phase 1 - Streaming thinking (Stage A + B)
-    FE->>API: POST /internal/v1/tasks/submit (task_type=logo_generate)
-    API-->>FE: {task_id, status: queued}
-    FE->>S: Open /internal/v1/tasks/{task_id}/stream (SSE)
-    S->>WORKER: Start Stage A + Stage B
-    WORKER-->>S: stream extraction status / reasoning text
-    S-->>FE: SSE chunks (visible process thinking)
-    alt missing required fields
-      WORKER-->>S: clarification event {missing_fields, suggested_questions}
-      FE->>API: POST /internal/v1/tasks/{task_id}/clarification
-      API->>WORKER: append clarification answer
-      WORKER-->>S: continue stream after merge
-    else required fields complete
-      WORKER-->>S: final event with guideline + generate_hq_task_id
-      S-->>FE: close stream
-    end
-  end
-
-  rect rgb(245, 255, 245)
-    Note over FE,WORKER: Phase 2 - Async image generation (Stage C)
-    WORKER->>Q: enqueue generate_hq_task
-    Q->>WORKER: run Stage C in background
-    loop Polling image task
-      FE->>API: GET /internal/v1/tasks/{generate_hq_task_id}/status
-      alt processing
-        API-->>FE: {status: processing, progress}
-      else completed
-        API-->>FE: {status: completed, options}
-      else failed
-        API-->>FE: {status: failed, error_code}
-      end
-    end
-  end
-```
-
-#### 3.4.1a Stage A - Intake & clarification loop (Step 1-3)
-
-```mermaid
-sequenceDiagram
-  actor FE as Frontend
-  participant W as Worker
-  participant C as SessionContextStore
-  participant L as LLM
-
-  W->>C: Load session snapshot
-  W->>L: Extract fields from query/references
-  L-->>W: Extracted BrandContext delta
-  W->>W: Merge by precedence
-
-  alt required fields ready
-    W->>C: Persist required-field checkpoint
-  else missing required fields
-    W->>L: Generate suggested_questions for missing fields
-    L-->>W: suggested_questions
-    W-->>FE: Stream clarification event
-    FE->>W: Submit clarification answer in same task/session
-    W->>W: Merge answer and re-check required fields
-  end
-```
-
-#### 3.4.1b Stage B - Guideline inference (Step 4)
-
-```mermaid
-sequenceDiagram
-  participant W as Worker
-  participant C as SessionContextStore
-  participant L as LLM
-
-  W->>C: Load required-field checkpoint
-  W->>L: Infer DesignGuideline
-  L-->>W: Guideline delta
-  W->>C: Persist guideline checkpoint
-```
-
-#### 3.4.1c Stage C - Logo generation (Step 6)
-
-```mermaid
-sequenceDiagram
-  participant W as Worker
-  participant C as SessionContextStore
-  participant I as ImageAPI
-  participant S as Storage
-
-  W->>C: Load guideline checkpoint
-  loop 3-4 options
-    W->>I: Generate image from guideline
-    I-->>W: Image bytes
-    W->>S: Upload image
-    S-->>W: image_url
-    W->>W: Append URL delta
-  end
-  W->>C: Persist final-output checkpoint
-  W->>W: Mark job completed
-```
-#### 3.4.2 Stage A - Intake and clarification loop (Step 1-3)
-
-| Item | Detail |
-| :--- | :--- |
-| Input | `LogoGenerateInput` (query, optional explicit brand fields, references, session_id) |
-| Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationLoopTool |
-| Output | Either (a) merged fields with brand_name + industry guaranteed, or (b) clarification event streamed to FE and resumed within same task |
-| Gate | brand_name AND industry must both be present before Step 4; if missing, ask clarification interactively via streaming |
-| Target | Complete within first 10s of job start |
-
-#### 3.4.3 Stage B - Request analysis and guideline inference (Step 4)
-
-| Item | Detail |
-| :--- | :--- |
-| Input | Completed required fields + optional context |
-| Tools used | DesignInferenceTool |
-| Output | DesignGuideline JSON |
-| Target | Guideline coverage >= 90% |
-
-#### 3.4.4 Stage C - Logo generation (Step 6)
-
-| Item | Detail |
-| :--- | :--- |
-| Input | guideline + variation_count |
-| Tools used | LogoGenerationTool, StorageTool |
-| Output | LogoGenerateOutput with 3-4 option URLs |
-| Target | 3-4 valid outputs >= 85%, generation <= 30s total per job |
-| Concurrency | SHOULD run in parallel when provider supports batching/multi-call concurrency |
-
-### 3.5 Reuse and extensibility
-
-- Add fields in extraction or guideline:
-  - Extend schema and prompt templates only.
-  - API contract stays unchanged.
-- Add edit phase in next release:
-  - Register `logo_edit` task type and add Stage D for Step 7.
-  - Reuse same context and job semantics.
-- Add provider:
-  - Replace generation adapter only.
-  - No change in worker state machine.
+**Entry Point:** `source/tasks/logo_generate.py` (LogoGenerateTask)  
+**Main Orchestrator:** `source/services/stream_intake_handler.py` (StreamIntakeHandler)  
+**Session Memory:** `source/context/session_store.py` (SessionContextStore)
 
 ---
 
-## 4. Data Schema and API Integration
+## Code Organization Analysis
 
-### 4.1 Pydantic models by stage
+### Directory Structure
+
+```
+source/
+├── tasks/
+│   └── logo_generate.py          # BaseTask implementation (SDK entry)
+│
+├── services/                      # 12 service files
+│   ├── stream_intake_handler.py   # ⭐ CORE: Stage A/B orchestrator
+│   ├── llm_logo_tools.py          # ⭐ CORE: LLM tool calls (extraction, inference)
+│   ├── option_generation_service.py # ⭐ CORE: Stage C image generation
+│   ├── context_merge_service.py   # ⭐ CORE: 3-tier merge (explicit > extracted > session)
+│   ├── required_field_gate.py     # ⭐ CORE: brand_name + industry validation
+│   ├── guideline_inference_service.py # ⭐ CORE: Default guideline rules per industry
+│   ├── web_research_service.py    # ⭐ CORE: Industry context research
+│   ├── design_memory_service.py   # ⭐ CORE: Markdown audit trail logging
+│   ├── lifecycle_status_manager.py # ⭐ CORE: State machine + progress mapping
+│   ├── async_payload_assembler.py # HELPER: Response object builder
+│   ├── provider_routing_policy.py # ❓ UNUSED: Imported but never called
+│   └── __init__.py                # Service exports
+│
+├── context/
+│   ├── session_store.py           # SessionContextStore (in-memory + CAS)
+│   └── __init__.py
+│
+├── schemas/
+│   └── models.py                  # All Pydantic models
+│
+├── config.py                      # Configuration & env vars
+├── logger.py                      # Logging setup
+└── __init__.py
+```
+
+### Assessment: Code Organization ✅
+
+**Status: GOOD with minor issues**
+
+**Strengths:**
+- ✅ Clear separation of concerns (intake, merge, gate, research, guideline, generation)
+- ✅ Single Responsibility Principle (each service does one thing)
+- ✅ Dependency injection pattern (services passed to StreamIntakeHandler)
+- ✅ All core services are actually used
+- ✅ No duplicate logic detected (no TODO/FIXME/deprecated markers)
+- ✅ Natural flow follows business stages (A → B → C)
+
+**Issues Found:**
+- ⚠️ `provider_routing_policy.py` is **imported but never used** (dead code)
+- ⚠️ `AsyncPayloadAssembler` is simple but could be inlined as utility function
+- ⚠️ Service stateless design is good BUT async_payload_assembler should be static
+
+---
+
+## Progress Mapping
+
+### What is `progress=5`?
+
+**Answer: It doesn't exist in the code.**
+
+Instead, progress is **status-based** using the `StatusEnum`:
 
 ```python
-from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, Field, HttpUrl
+# source/services/lifecycle_status_manager.py (lines 17-21)
 
-
-class ReferenceImage(BaseModel):
-    source_url: Optional[HttpUrl] = None
-    storage_key: Optional[str] = None
-
-
-class BrandContext(BaseModel):
-    brand_name: Optional[str] = None
-    industry: Optional[str] = None
-    style_preference: List[str] = Field(default_factory=list)
-    color_preference: List[str] = Field(default_factory=list)
-    symbol_preference: List[str] = Field(default_factory=list)
-
-
-class SuggestedQuestion(BaseModel):
-    key: Literal["brand_name", "industry"]
-    question: str
-
-
-class RequiredFieldState(BaseModel):
-    # Only 2 required fields for POC
-    required_keys: List[str] = Field(default_factory=lambda: [
-        "brand_name",      # Company or product name (MANDATORY)
-        "industry",        # Business category or context (MANDATORY)
-    ])
-    missing_keys: List[str] = Field(default_factory=list)
-    passed: bool = False
-
-
-class DesignGuideline(BaseModel):
-    concept_statement: str
-    style_direction: List[str]
-    color_palette: List[str]
-    typography_direction: List[str]
-    icon_direction: List[str]
-    constraints: List[str]
-
-
-class SessionContextState(BaseModel):
-    session_id: str
-    latest_brand_context: Optional[BrandContext] = None
-    latest_guideline: Optional[DesignGuideline] = None
-    required_field_state: RequiredFieldState = Field(default_factory=RequiredFieldState)
-    generated_option_ids: List[str] = Field(default_factory=list)
-
-
-class LogoGenerateInput(BaseModel):
-    session_id: str
-    query: str
-    brand_name: Optional[str] = None
-    industry: Optional[str] = None
-    style_preference: List[str] = Field(default_factory=list)
-    color_preference: List[str] = Field(default_factory=list)
-    symbol_preference: List[str] = Field(default_factory=list)
-    references: List[ReferenceImage] = Field(default_factory=list)
-    use_session_context: bool = True
-    variation_count: int = Field(default=4, ge=3, le=4)
-    output_format: Literal["png"] = "png"
-    output_size: Literal["1024x1024"] = "1024x1024"
-
-
-class LogoOption(BaseModel):
-    option_id: str
-    image_url: HttpUrl
-    prompt_used: Optional[str] = None
-    seed: Optional[int] = None
-    quality_flags: List[str] = Field(default_factory=list)
-
-
-class LogoGenerateOutput(BaseModel):
-    guideline: DesignGuideline
-    required_field_state: RequiredFieldState
-    options: List[LogoOption]
-
-
-class JobSubmitResponse(BaseModel):
-    task_id: str
-    status: Literal["queued"]
-    created_at: str  # ISO8601
-
-
-class JobStatusResponse(BaseModel):
-    task_id: str
-    status: Literal["queued", "processing", "completed", "failed"]
-    progress_percent: Optional[int] = None  # 0-100 if processing
-    result: Optional[LogoGenerateOutput] = None  # populated when completed
-    error_code: Optional[str] = None  # populated when failed (e.g., MISSING_REQUIRED_FIELDS)
-    error: Optional[str] = None  # populated when failed
-    missing_fields: List[str] = Field(default_factory=list)  # populated when failed
-    suggested_questions: List[SuggestedQuestion] = Field(default_factory=list)  # populated when failed
-    retry_after_seconds: Optional[int] = None  # populated when failed
+_DEFAULT_PROGRESS: dict[StatusEnum, int] = {
+    StatusEnum.pending: 0,           # Not started
+    StatusEnum.processing: 50,       # Mid-execution (Stage A/B in progress)
+    StatusEnum.completed: 100,       # Done
+    StatusEnum.failed: 100,          # Failed (stop at 100)
+}
 ```
 
-Validation rules:
+### Progress Resolution Logic
 
-- `query` is required and non-empty after trim.
-- `variation_count` must be 3 or 4.
-- Required-field gate: brand_name AND industry must both be present before guideline generation.
-- If extraction confidence is **below threshold** (e.g., < 70%), system SHOULD trigger clarification question instead of guessing; this avoids silent failures and improves UX transparency.
-- Merge precedence is fixed: explicit fields in request > extracted fields from new query > stored context for same `session_id`.
-- Empty-value precedence policy:
-  - explicit empty string (e.g., `brand_name=""`) is treated as missing and does not override non-empty extracted/session value.
-  - explicit `null` is treated as "not provided" and falls through to lower-precedence sources.
-  - explicit empty optional lists (e.g., `style_preference=[]`) are valid explicit overrides.
-- If `use_session_context=true`, backend may use stored context as the last precedence layer.
-- If required fields are still missing after merge, return failed job with `error_code`, `missing_fields`, and `suggested_questions`.
-- On `status="failed"` with `error_code="MISSING_REQUIRED_FIELDS"`, `missing_fields` and `suggested_questions` must be populated.
+```python
+def resolve_progress(self, status: StatusEnum, explicit_progress: int | None = None) -> int:
+    # If explicit progress provided (e.g., "Stage: 75%"), use it (clamped 0-100)
+    if explicit_progress is not None:
+        return max(0, min(100, explicit_progress))
+    
+    # Otherwise use default mapping from status
+    return _DEFAULT_PROGRESS[status]
+```
 
-### 4.3 Concrete endpoint I/O
+### Actual Runtime Progress (from DYM log)
 
-- `GET /internal/v1/tasks/{task_id}/stream` (SSE stream for Stage A + B)
-  - Behavior:
-    - stream incremental events while extraction and guideline inference are running.
-    - if required fields are missing, emit `clarification` event with `missing_fields` and `suggested_questions`.
-    - FE sends clarification answer and pipeline continues in same task/session.
-    - if guideline is ready, final event includes `generate_hq_task_id` for Stage C polling.
-  - Streaming event schema:
-    ```json
-    {
-      "type": "thinking | clarification | guideline_ready | error",
-      "step": "extraction | clarification | inference",
-      "content": "string",
-      "metadata": {
-        "task_id": "uuid",
-        "missing_fields": ["brand_name"],
-        "suggested_questions": [{"key": "brand_name", "question": "..."}],
-        "generate_hq_task_id": "uuid-stage-c"
-      }
-    }
-    ```
-  - Example final SSE event (guideline ready):
-    ```json
-    {
-      "type": "guideline_ready",
-      "task_id": "uuid",
-      "generate_hq_task_id": "uuid-stage-c",
-      "guideline": { /* DesignGuideline */ }
-    }
-    ```
+```
+Status     Progress  Stage             Duration
+───────────────────────────────────────────────────
+pending    0%        Request received  0s
+processing 50%       Stage A (intake)  2-5s
+processing 50%       Stage B (infer)   40-47s  ← longest
+processing 50%       Stage C (gen)     3-8s
+completed  100%      All done          50-55s total
+```
 
-- `POST /internal/v1/tasks/{task_id}/clarification` (submit clarification answer)
-  - Input:
-    - `answers` (required, key-value map for missing fields)
-  - Output:
-    ```json
-    {
-      "task_id": "uuid",
-      "status": "processing",
-      "message": "clarification accepted"
-    }
-    ```
-
-- `POST /internal/v1/tasks/submit` (submit job)
-  - Input:
-    - `task_type` (required: `logo_generate`)
-    - `session_id` (required)
-    - `query` (required: user request for extraction)
-    - `brand_name` (optional explicit override)
-    - `industry` (optional explicit override)
-    - `style_preference` (optional explicit override)
-    - `color_preference` (optional explicit override)
-    - `symbol_preference` (optional explicit override)
-    - `references` (optional: list of ReferenceImage)
-    - `use_session_context` (optional, default true)
-    - `variation_count` (optional, default 4, range 3-4)
-    - `output_format` (optional, default "png")
-    - `output_size` (optional, default "1024x1024")
-  - Output (JobSubmitResponse):
-    ```json
-    {
-      "task_id": "uuid",
-      "status": "queued",
-      "created_at": "2026-03-24T12:00:00Z"
-    }
-    ```
-
-- `GET /internal/v1/tasks/{task_id}/status` (check job status)
-  - Path params: `task_id`
-  - Output (JobStatusResponse, while processing):
-    ```json
-    {
-      "task_id": "uuid",
-      "status": "processing",
-      "progress_percent": 45
-    }
-    ```
-  - Progress mapping:
-    - 0-20: extraction
-    - 20-40: guideline inference
-    - 40-100: image generation (increment per image completion)
-  - Output (JobStatusResponse, when completed):
-    ```json
-    {
-      "task_id": "uuid",
-      "status": "completed",
-      "result": {
-        "guideline": { /* DesignGuideline */ },
-        "required_field_state": { /* RequiredFieldState */ },
-        "options": [ /* List[LogoOption] */ ]
-      }
-    }
-    ```
-  - Output (JobStatusResponse, if failed):
-    ```json
-    {
-      "task_id": "uuid",
-      "status": "failed",
-      "error_code": "MISSING_REQUIRED_FIELDS",
-      "error": "Missing required fields after merge precedence",
-      "missing_fields": ["brand_name", "industry"],
-      "suggested_questions": [
-        {
-          "key": "brand_name",
-          "question": "What is your company or product name?"
-        },
-        {
-          "key": "industry",
-          "question": "What industry is your business in?"
-        }
-      ],
-      "retry_after_seconds": 60
-    }
-    ```
-  - Context behavior:
-    - merge precedence is fixed: explicit request fields > extracted query fields > stored context in same `session_id`
-    - required-field gate uses interactive clarification: missing fields emit stream clarification event and continue in same task/session after FE sends answers
-    - result metadata includes final `required_field_state`
-
-### 4.4 Model benchmark and tracing result
-
-#### 4.4.1 Text models (planning baseline)
-
-| Provider | Model | Input ($/1M) | Output ($/1M) | Typical latency | Role |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| google | gemini-2.5-flash | 0.30 | 2.50 | 2-6s | Primary extraction, clarification, inference |
-| google | gemini-2.5-pro | 1.25 | 10.00 | 4-12s | Higher-depth reasoning fallback |
-| openai | gpt-5.4-nano | 0.20 | 1.25 | 1.5-5s | Cost-sensitive fallback |
-| openai | gpt-5.4-mini | 0.75 | 4.50 | 2-7s | Structured-output fallback |
-| openai | gpt-5.4 | 2.50 | 15.00 | 4-14s | Quality-first fallback |
-
-#### 4.4.2 Image models (tracing result)
-
-Source trace: `logs/model_traces_benchmark_image_v4_tech_startup.json`
-
-| Provider | Model | Status | Latency (ms) | Images requested | Images returned | Notes |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| google | gemini-2.5-flash-image | success | 20488 | 3 | 3 | Balanced baseline |
-| google | gemini-3.1-flash-image-preview | success | 47039 | 3 | 3 | Slower preview model |
-| google | gemini-3-pro-image-preview | success | 122664 | 3 | 3 | Slowest in this run |
-| google | imagen-4.0-fast-generate-001 | success | 3961 | 3 | 3 | Fastest in this run |
-| google | imagen-4.0-generate-001 | success | 19674 | 3 | 3 | Quality-oriented alternative |
-| openai | gpt-image-1.5 | success | 30120 | 3 | 3 | Cross-vendor fallback |
-
-#### 4.4.3 Best choice (POC)
-
-- Text primary: `gemini-2.5-flash`
-- Image primary: `imagen-4.0-fast-generate-001`
-- Text fallback: `gpt-5.4-mini`
-- Image fallback: `gpt-image-1.5`
-
-Why this choice:
-
-1. `imagen-4.0-fast-generate-001` is clearly fastest in current tracing run.
-2. `gemini-2.5-flash` gives strong speed/cost balance for extraction and clarification.
-3. OpenAI fallback keeps multi-provider resilience for production incidents.
+**Key Point:** Progress jumps 0 → 50 → 100 (no intermediate values). To show granular progress during each stage, services would need to emit explicit progress values OR use alternative mechanisms (e.g., status chunks with progress metadata).
 
 ---
 
-## 5. Risks and open issues
+## Service Layer Breakdown
 
-### 5.1 Latency
+### 🔴 Core Services (9 files - Actually Used)
 
-Risk:
+#### 1. **StreamIntakeHandler** (`stream_intake_handler.py`)
 
-- Job completion may exceed p95 target depending on provider queue and image generation latency.
+**Purpose:** Orchestrate Stage A + Stage B stream flow with clarification loop
 
-Mitigation:
+**Responsibility:**
+- Load session context from store OR start new session
+- Call LLM to extract brand_name, industry from query
+- Merge extracted with session by precedence rule
+- Check required fields (brand_name + industry)
+- If missing → emit clarification chunk with suggested questions
+- If complete → run web research + guideline inference
+- Persist checkpoint to session store (with optimistic locking)
+- Log to design.md audit trail
 
-- Parallel image generation where provider permits.
-- Timeout + retry for transient provider failures.
-- Queue scaling policy when backlog grows.
-- Circuit breaker for provider outages.
+**Key Methods:**
+- `stream()`: Main generator yielding response chunks
+- `_should_use_session_context()`: 5-condition gate for session reuse
+- `_persist_with_cas()`: Optimistic locking write to session store
+- `_extract_industry_from_text()`: Fallback industry detection
 
-### 5.2 Required-field validation quality
+**Used In:** Logo generate task Stream mode
 
-Risk:
+**Code Quality:** ✅ Good (clear decoupling of concerns)
 
-- User intent may not include brand_name or industry explicitly; fail-fast may increase first-attempt failure rate.
+---
 
-Mitigation:
+#### 2. **LogoDesignToolset** (`llm_logo_tools.py`)
 
-- Extract brand_name and industry early (Step 2) with high-confidence NLP.
-- Return structured failure payload (`error_code`, `missing_fields`, `suggested_questions`) for FE-guided resubmission.
-- Prioritize targeted suggested questions (e.g., "What is your company name?" before "What industry?").
-- Allow inference from context (e.g., "design a logo for a fintech startup" → industry=fintech).
+**Purpose:** All LLM tool invocations via LiteLLM/Google GenAI
 
-### 5.3 Cost
+**Responsibility:**
+- Detect logo intent from query
+- Extract brand_name, industry, style, color from query + references
+- Analyze reference images for style patterns
+- Detect topic swap (user changed industry/brand)
+- Generate clarification questions
+- Infer design guideline from context
+- Support both LiteLLM and Google GenAI fallback
 
-Risk:
+**Key Methods:**
+- `detect_intent()` → IntentDecision
+- `extract_inputs()` → ExtractionDecision (brand, industry, styles, colors)
+- `detect_topic_swap()` → TopicSwapDecision
+- `analyze_reference_images()` → StylePatterns
+- `suggest_clarifications()` → SuggestedQuestion[]
+- `infer_guideline()` → DesignGuideline
 
-- Failed attempts (missing required fields) and 3-4 image outputs increase cost per successful request.
+**Dependencies:** LiteLLM (primary), Google GenAI (fallback)
 
-Mitigation:
+**Code Quality:** ✅ Good (comprehensive tool coverage)
 
-- Track cost per `task_id` and `session_id`.
-- Cache extracted context in session and avoid redundant re-analysis.
-- Keep benchmark table refreshed each milestone.
+**Note:** Largest service file (~500 lines) - consider future refactoring if more tools added
 
-### 5.4 Open technical decisions
+---
 
-- SSE transport policy: heartbeat interval, reconnect strategy, and stream timeout policy.
-- Signed URL TTL policy by asset type.
-- Job result retention: how long to keep completed job results available.
-- Session context TTL and reset policy (auto expiry only vs manual reset endpoint).
-- Default guideline style when `style_preference` is not provided (infer from industry vs hardcoded default).
-- Fallback generation model if primary `gemini-3.1-flash-image-preview` fails mid-job.
+#### 3. **ContextMergeService** (`context_merge_service.py`)
+
+**Purpose:** Implement 3-tier precedence merge for BrandContext fields
+
+**Precedence:** explicit (request) > extracted (query) > session (stored)
+
+**What It Merges:**
+```python
+- brand_name: str | None
+- industry: str | None
+- style_preference: List[str]
+- color_preference: List[str]
+- symbol_preference: List[str]
+```
+
+**Example:**
+```
+Input (explicit):    brand_name="Nova"
+Extracted (query):   industry="fintech"
+Session (stored):    style_preference=["modern"]
+
+Result: brand_name="Nova" (explicit wins)
+        industry="fintech" (extracted wins)
+        style_preference=["modern"] (session)
+```
+
+**Key Methods:**
+- `_pick_mandatory()`: First non-empty value in (explicit, extracted, session)
+- `_pick_preference_list()`: Merge lists preserving order
+- `merge_brand_context()`: Merge one BrandContext field
+- `merge_from_input()`: Build explicit from LogoGenerateInput, merge all layers
+
+**Used In:** StreamIntakeHandler (line 410)
+
+**Code Quality:** ✅ Excellent (clear semantics, well-tested)
+
+---
+
+#### 4. **RequiredFieldGateService** (`required_field_gate.py`)
+
+**Purpose:** Validate brand_name + industry are present
+
+**Logic:**
+```python
+required_keys = ["brand_name", "industry"]
+
+def evaluate(context: BrandContext) -> RequiredFieldGateResult:
+    missing = [k for k in required_keys if not context[k]]
+    return RequiredFieldGateResult(
+        passed=(len(missing) == 0),
+        missing_keys=missing
+    )
+```
+
+**Used In:** StreamIntakeHandler (line 233) before generating guideline
+
+**Code Quality:** ✅ Simple and correct
+
+---
+
+#### 5. **GuidelineInferenceService** (`guideline_inference_service.py`)
+
+**Purpose:** Generate design guideline per industry (lookup-based + LLM fallback)
+
+**Default Rules by Industry:**
+```python
+if industry == "fintech":
+    style=["dynamic", "bold", "geometric"]
+    colors=["navy", "cyan", "white"]
+    typography=["sans-serif technical"]
+    icons=["circuit patterns", "upward arrows"]
+
+elif industry == "sportswear":
+    style=["bold sans-serif", "compact athletic"]
+    colors=["black", "bold neons"]
+    ...
+```
+
+**Fallback:** If industry not recognized, call LLM to generate guideline
+
+**Key Methods:**
+- `infer()`: Main entry point
+- `_default_*()`: Industry-specific lookup rules
+- `_concept_variants()`: Generate concept statements
+
+**Used In:** StreamIntakeHandler (line 357)
+
+**Code Quality:** ✅ Good (deterministic defaults + LLM fallback)
+
+---
+
+#### 6. **OptionGenerationService** (`option_generation_service.py`)
+
+**Purpose:** Generate 3-4 logo images in parallel via Google Gemini
+
+**Flow:**
+```python
+def generate(guideline, task_id, variation_count=4):
+    # ThreadPoolExecutor with max_workers=N
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = []
+        for i in range(variation_count):
+            future = executor.submit(
+                _generate_single_option,
+                guideline,
+                concept_idx=i
+            )
+            futures.append(future)
+    
+    # Collect results (waits for all to complete)
+    return [f.result() for f in futures]
+```
+
+**Per-Image Flow:**
+1. Build Gemini prompt from guideline
+2. Call Gemini Vision API → get PNG bytes
+3. Persist to storage → get image_url
+4. Return LogoOption(id, url, metadata)
+
+**Concurrency:** ThreadPoolExecutor (non-async, blocking return)
+
+**Used In:** logo_generate.py Stage C (async/polling pattern)
+
+**Code Quality:** ✅ Good (thread-safe, proper error handling)
+
+---
+
+#### 7. **WebResearchService** (`web_research_service.py`)
+
+**Purpose:** Search web for industry context (design trends, references)
+
+**Flow:**
+1. Check if research needed: `should_prioritize_research(query)`
+2. Build search queries from brand context (e.g., "fintech logo design")
+3. Call SerpAPI for web results + images
+4. Analyze text snippets + images with Gemini
+5. Return ResearchContext (takeaways + images)
+
+**Key Methods:**
+- `should_prioritize_research()`: Heuristic to skip if clear intent
+- `_build_queries()`: Generate search terms
+- `_search_serpapi()`: Web search
+- `_analyze_with_gemini()`: Extract design patterns
+- `_build_takeaways()`: Synthesize insights
+- `run()`: Main orchestrator
+
+**Used In:** StreamIntakeHandler (line 340) if gate not passed initially
+
+**Code Quality:** ✅ Good (proper error handling, fallbacks)
+
+---
+
+#### 8. **DesignMemoryService** (`design_memory_service.py`)
+
+**Purpose:** Append-only markdown log for audit trail
+
+**Format (design.md):**
+```markdown
+## Technology
+- v1 | ts=2026-03-31T08:53:48Z | session=s1 | ctx_v=1 | brand=DYM | industry=tech | style=[...] | colors=[...] | symbols=[...] | note=initial | concept=A distinctive...
+- v2 | ts=... | ... | concept=More refined...
+```
+
+**Key Methods:**
+- `persist()`: Append versioned record
+- `_next_topic_version()`: Auto-increment version
+- `_ensure_document()`: Create design.md if missing
+- `_format_list()`: Truncate long lists for readability
+
+**Used In:**
+- StreamIntakeHandler (line 510) on clarification
+- StreamIntakeHandler (line 626) on guideline complete
+
+**Code Quality:** ✅ Good (write-only, no parsing complications)
+
+**Note:** design.md is never READ back into runtime (audit trail only)
+
+---
+
+#### 9. **LifecycleStatusManager** (`lifecycle_status_manager.py`)
+
+**Purpose:** Manage state transitions + progress mapping
+
+**State Machine:**
+```
+pending  → processing
+            ↓
+         completed OR failed
+            ↓
+         (failed can retry)
+```
+
+**Key Methods:**
+- `can_transition()`: Check if transition allowed
+- `transition()`: Perform transition
+- `resolve_progress()`: Map status to progress % (or use explicit)
+- `build_status_response()`: Create JobStatusResponse
+
+**Used In:** logo_generate.py status polling
+
+**Code Quality:** ✅ Excellent (deterministic, well-documented)
+
+---
+
+### 🟡 Helper Services (2 files)
+
+#### 10. **AsyncPayloadAssembler** (`async_payload_assembler.py`)
+
+**Purpose:** Build response payloads for completed/failed jobs
+
+**Issue:** Very simple (just object creation) - could be inlined as utility function
+
+```python
+class AsyncPayloadAssembler:
+    def build_completed(task_id, result, metadata=None):
+        return JobStatusResponse(
+            task_id=task_id,
+            status="completed",
+            result=result,
+            metadata=metadata
+        )
+```
+
+**Recommendation:** ⚠️ Consider inlining or using Pydantic factory methods
+
+---
+
+### 🔴 Dead Code (1 file)
+
+#### 11. **ProviderRoutingPolicy** (`provider_routing_policy.py`)
+
+**Status:** ❌ **IMPORTED BUT NEVER USED**
+
+**Evidence:**
+```python
+# Imported in logo_generate.py (line 28)
+from source.services import ProviderRoutingPolicy
+
+# Created in logo_generate.py (line 121)
+routing_policy=ProviderRoutingPolicy()
+
+# BUT: Never passed to StreamIntakeHandler
+# AND: StreamIntakeHandler doesn't accept it
+# AND: Never called anywhere
+```
+
+**Purpose (if activated):** Provide provider chains for fallback logic
+
+**Recommendation:** ❌ **REMOVE** or implement if planning multi-provider fallback
+
+---
+
+## Full End-to-End Flow
+
+### Request Entry Point
+
+```python
+# source/tasks/logo_generate.py
+class LogoGenerateTask(BaseTask):
+    def stream(self, input: LogoGenerateInput):
+        # Initialize services
+        session_store = SessionContextStore()
+        merge_service = ContextMergeService()
+        gate_service = RequiredFieldGateService()
+        lifecycle_manager = LifecycleStatusManager()
+        toolset = LogoDesignToolset(...)
+        web_research = WebResearchService()
+        design_memory = DesignMemoryService()
+        
+        # Delegate to orchestrator
+        handler = StreamIntakeHandler(
+            session_store=session_store,
+            merge_service=merge_service,
+            gate_service=gate_service,
+            lifecycle_manager=lifecycle_manager,
+            toolset=toolset,
+            web_research_service=web_research,
+            design_memory_service=design_memory
+        )
+        
+        # Yield stream chunks
+        yield from handler.stream(input)
+```
+
+### Stage A: Intake & Clarification (Lines 150-370 in stream_intake_handler.py)
+
+```
+Input: LogoGenerateInput
+{
+  session_id: "sess-123",
+  query: "Design a logo for my tech startup called DYM",
+  brand_name: null,
+  industry: null,
+  use_session_context: true
+}
+
+Step 1: Load Session (line 277)
+┌─────────────────────────────────
+│ store.get(session_id) 
+│ → Found: SessionContextState with brand_name="DYM" from previous session
+└─────────────────────────────────
+
+Step 2: Extract from New Query (line 281)
+┌─────────────────────────────────
+│ toolset.extract_inputs(query)
+│ → ExtractionDecision {
+│     brand_name: "DYM",
+│     industry: "technology",
+│     style: ["modern"],
+│     ...
+│   }
+└─────────────────────────────────
+
+Step 3: Check Session Context Reuse (line 283)
+┌─────────────────────────────────
+│ _should_use_session_context(
+│   use_flag=true,
+│   previous=stored_context,
+│   extracted=new_extraction,
+│   query=query
+│ )
+│ 
+│ Decision Logic (5 conditions):
+│ ✓ flag enabled
+│ ✓ history exists
+│ ✓ not topic-swapped (tech → tech)
+│ ✓ continuation_marker found OR same-topic fallback
+│ ✓ not generic query
+│ 
+│ → Decision: REUSE session context
+└─────────────────────────────────
+
+Step 4: Merge by Precedence (line 410)
+┌─────────────────────────────────
+│ merge_service.merge_from_input(
+│   explicit=BrandContext(brand_name="DYM"),
+│   extracted=BrandContext(industry="tech"),
+│   session=stored_context
+│ )
+│ 
+│ Precedence: explicit > extracted > session
+│ Result: BrandContext {
+│   brand_name: "DYM",      ← explicit
+│   industry: "technology",  ← extracted
+│   style: ["modern"],       ← session
+│   ...
+│ }
+└─────────────────────────────────
+
+Step 5: Check Required Fields (line 233)
+┌─────────────────────────────────
+│ gate_service.evaluate(merged_context)
+│ 
+│ Required = ["brand_name", "industry"]
+│ 
+│ ✓ brand_name: "DYM" ✓
+│ ✓ industry: "technology" ✓
+│ 
+│ → Gate PASSED
+└─────────────────────────────────
+
+Step 6: Persist Checkpoint (line 426)
+┌─────────────────────────────────
+│ _persist_with_cas(
+│   session_id="sess-123",
+│   latest_context=merged_context,
+│   expected_version=previous_version+1
+│ )
+│ 
+│ CAS Semantics (optimistic locking):
+│ IF store.context_version == expected_version:
+│   store[session_id].context_version += 1
+│   store[session_id].latest_context = merged_context
+│ ELSE:
+│   RAISE ContextVersionConflictError
+│       (concurrent write detected, retry merge)
+└─────────────────────────────────
+
+Step 7: Decide on Web Research (line 340)
+┌─────────────────────────────────
+│ web_research.should_prioritize_research(query)
+│ 
+│ Heuristic: If query is vague or industry is specialized
+│            "design a logo" (generic) → skip
+│            "design a fintech logo" (clear) → skip
+│            "design a Web3 DeFi logo" (specialist) → research
+│ 
+│ → Decision: Skip (query is clear enough)
+└─────────────────────────────────
+
+Step 8: Emit Intake Chunk (line 470)
+┌─────────────────────────────────
+│ Yield chunk {
+│   "status": "processing",
+│   "progress_percent": 50,
+│   "stage": "intake_started",
+│   "extracted": {...},
+│   "merged": {...}
+│ }
+└─────────────────────────────────
+```
+
+### Stage B: Guideline Inference (Lines 355-395 in stream_intake_handler.py)
+
+```
+Input: merged BrandContext { brand_name, industry, style, colors }
+
+Step 1: Infer Guideline (line 357)
+┌─────────────────────────────────
+│ guideline_service.infer(merged_context)
+│ 
+│ Industry-specific lookup:
+│ if industry == "technology":
+│   style = ["dynamic", "geometric", "modern"]
+│   colors = ["navy", "cyan", "electric blue"]
+│   typography = ["sans-serif", "futuristic"]
+│   icons = ["circuit patterns", "nodes", "connections"]
+│   concept_variants = [
+│     "Connected intelligence",
+│     "Digital ecosystem",
+│     "Geometric future"
+│   ]
+│ 
+│ Return: DesignGuideline {
+│   concept_statement: "Connected digital intelligence...",
+│   style_direction: ["dynamic", "geometric"],
+│   color_palette: ["navy", "cyan"],
+│   ...
+│ }
+└─────────────────────────────────
+
+Step 2: Persist Guideline Checkpoint (line 426)
+┌─────────────────────────────────
+│ _persist_with_cas(
+│   latest_guideline=guideline,
+│   expected_version=ctx_v+1
+│ )
+└─────────────────────────────────
+
+Step 3: Log to design.md (line 626)
+┌─────────────────────────────────
+│ design_memory.persist(
+│   topic="technology",
+│   context=merged_context,
+│   guideline=guideline,
+│   note="guideline_completed"
+│ )
+│ 
+│ Appends to design.md:
+│ - v11 | ts=2026-03-31T10:32:21Z | session=sess-123 | ... | concept=Connected...
+└─────────────────────────────────
+
+Step 4: Emit Guideline Chunk (line 640)
+┌─────────────────────────────────
+│ Yield chunk {
+│   "status": "processing",
+│   "progress_percent": 50,
+│   "stage": "guideline_completed",
+│   "guideline": {...},
+│   "next_action": "submit_async_generation_task"
+│ }
+└─────────────────────────────────
+```
+
+### Handoff to Stage C: Async Image Generation
+
+```
+Input: DesignGuideline + task_id
+
+Step 1: Stream Completes (line 650+)
+┌─────────────────────────────────
+│ Yield final chunk {
+│   "status": "processing",
+│   "stage": "handoff_to_generation",
+│   "generation_task_id": "gen-uuid",
+│   "status_endpoint": "GET /tasks/{gen_task_id}/status"
+│ }
+│
+│ (Frontend saves generation_task_id for polling)
+└─────────────────────────────────
+
+Step 2: Backend Enqueues Stage C (logo_generate.py line 280+)
+┌─────────────────────────────────
+│ AIHubAsyncService.SubmitTask(
+│   task_type="logo_generate_async",
+│   input_args={
+│     guideline=guideline,
+│     task_id=task_id,
+│     variation_count=4
+│   }
+│ )
+│ → Task ID: "gen-abc123"
+└─────────────────────────────────
+
+Step 3: Status Polling Loop (logo_generate.py line 320+)
+┌─────────────────────────────────
+│ Loop: FE polls GET /tasks/{gen_task_id}/status
+│
+│ Response 1: { status: "pending", progress: 0 }
+│ Response 2: { status: "processing", progress: 25 }
+│ Response 3: { status: "processing", progress: 75 }
+│ Response 4: { status: "completed", progress: 100,
+│              result: { options: [...] } }
+│
+│ (Each call invokes GetTaskStatus from AI Hub)
+└─────────────────────────────────
+```
+
+### Stage C: Parallel Image Generation (OptionGenerationService.generate)
+
+```
+Input: guideline, task_id, variation_count=4
+
+Step 1: Create ThreadPoolExecutor (line 212)
+┌─────────────────────────────────
+│ with ThreadPoolExecutor(max_workers=4) as executor:  # Non-blocking parallelism
+│     for i in range(4):
+│         future = executor.submit(
+│             _generate_single_option(i)
+│         )
+│     futures.append(future)
+└─────────────────────────────────
+
+Step 2: Per-Worker: Generate Single Option (line 148-185)
+┌─────────────────────────────────
+│ For each future:
+│
+│ a) Build Gemini prompt (line 46-77):
+│    "Generate a logo with style=[...], colors=[...], 
+│     concept=[...]. Output PNG."
+│
+│ b) Call Gemini Vision API (line 127):
+│    response = gemini.generate_content(
+│      model="gemini-2.0-flash",
+│      contents=[prompt, binary_image_request]
+│    )
+│    → image_bytes (PNG)
+│
+│ c) Persist to Storage (line 118):
+│    key = f"logos/{task_id}/option_{i}.png"
+│    s3.upload(key, image_bytes)
+│    → image_url = "https://cdn.../logos/{task_id}/option_0.png"
+│
+│ d) Return LogoOption:
+│    LogoOption(
+│      id=f"opt-{i}",
+│      image_url=image_url,
+│      concept=concepts[i]
+│    )
+└─────────────────────────────────
+
+Step 3: Wait for All (line 213-220)
+┌─────────────────────────────────
+│ results = [future.result() for future in futures]
+│ (Blocks until all 4 workers complete)
+│ 
+│ Typical timeline:
+│ Worker 0: 3s
+│ Worker 1: 4s
+│ Worker 2: 3.5s
+│ Worker 3: 4s  ← slowest
+│ 
+│ Total (parallel): 4s (not 3+4+3.5+4 = 14.5s sequential)
+└─────────────────────────────────
+
+Step 4: Return Results (line 223)
+┌─────────────────────────────────
+│ return [
+│   LogoOption(..., url="/.../option_0.png"),
+│   LogoOption(..., url="/.../option_1.png"),
+│   LogoOption(..., url="/.../option_2.png"),
+│   LogoOption(..., url="/.../option_3.png")
+│ ]
+└─────────────────────────────────
+
+Step 5: Persist Final Output (logo_generate.py line 340+)
+┌─────────────────────────────────
+│ store.upsert(
+│   session_id,
+│   SessionContextState(
+│     generated_option_ids=[...],
+│     status="completed"
+│   )
+│ )
+└─────────────────────────────────
+
+Step 6: Return Completed Response (logo_generate.py line 345+)
+┌─────────────────────────────────
+│ return JobStatusResponse(
+│   task_id=task_id,
+│   status="completed",
+│   progress_percent=100,
+│   result=LogoGenerateOutput(
+│     options=[...],
+│     guideline=guideline,
+│     required_field_state=state
+│   )
+│ )
+│
+│ FE receives complete response with all 4 image URLs
+└─────────────────────────────────
+```
+
+---
+
+## Data Flow & Context Management
+
+### SessionContextStore (In-Memory CAS)
+
+**File:** `source/context/session_store.py`
+
+**Schema:**
+```python
+SessionContextState = {
+    session_id: str,
+    latest_brand_context: BrandContext | None,
+    latest_guideline: DesignGuideline | None,
+    required_field_state: RequiredFieldState,
+    generated_option_ids: List[str],
+    context_version: int  # ← Optimistic locking key
+}
+```
+
+**Optimistic Locking (CAS Pattern):**
+
+```python
+def upsert(session_id, state, expected_context_version):
+    with self._lock:
+        if session_id not in self._store:
+            self._store[session_id] = state
+            return
+        
+        # CAS check: version must match
+        if self._store[session_id].context_version != expected_context_version:
+            raise ContextVersionConflictError(
+                f"Conflict: expected v{expected_context_version}, "
+                f"actual v{self._store[session_id].context_version}"
+            )
+        
+        # Update & increment version
+        self._store[session_id] = state
+        state.context_version += 1
+```
+
+**Call Pattern:**
+```python
+# Read current version
+prev_state = store.get(session_id)
+prev_version = prev_state.context_version
+
+# Merge & update
+merged_context = merge_service.merge(...)
+new_state = SessionContextState(
+    latest_brand_context=merged_context,
+    context_version=prev_version  # Pass expected version
+)
+
+# Write with CAS check
+try:
+    store.upsert(session_id, new_state, expected_context_version=prev_version)
+except ContextVersionConflictError:
+    # Concurrent update detected, retry from scratch
+    retry_count += 1
+    if retry_count < 3:
+        return _retry_merge()
+    else:
+        raise ServiceError("Retry exhausted")
+```
+
+**Limitations & Concerns:**
+- ⚠️ **In-memory only**: Lost on process restart
+- ⚠️ **Single-process**: Requires sticky session in multi-worker setup
+- ⚠️ **No TTL**: Sessions never expire (memory bloat over time)
+- ⚠️ **No persistence**: Can't resume after outage
+
+### Precedence Merge Logic
+
+**File:** `source/services/context_merge_service.py`
+
+**3-Tier Rule:**
+```
+Tier 1 (Explicit):   User provides in request body
+Tier 2 (Extracted):  LLM extracted from query text
+Tier 3 (Session):    Stored context from `session_id`
+
+Rule: use first non-empty value
+```
+
+**Example Scenario:**
+
+```yaml
+Request:
+  brand_name: "ACME Corp"       # Explicit ← WINS
+  industry: null
+
+Session (stored):
+  brand_name: "OldCorp"
+  industry: "fintech"
+
+Extracted (LLM):
+  brand_name: null
+  industry: "finance"            # Extracted ← WINS (explicit is null)
+
+Merge Result:
+  brand_name: "ACME Corp"        # From explicit
+  industry: "finance"            # From extracted (wins over session)
+```
+
+### Session Context Reuse Decision
+
+**File:** `source/services/stream_intake_handler.py` (lines 140-207)
+
+**Decision Tree:**
+
+```
+INPUT:
+  use_session_context: bool
+  previous_state: SessionContextState | None
+  extracted: BrandContext (new query)
+  query: str
+
+REUSE SESSION IF:
+═══════════════════════
+  AND use_session_context == true
+  AND previous_state exists
+  AND NOT topic_swapped (industry changed)
+  AND NOT generic_query
+  AND (
+    clarification_followup
+    OR continuation_marker ("same", "again", "like before")
+    OR explicit_required
+    OR extracted_required
+    OR same_topic_fallback
+  )
+
+REJECT SESSION IF:
+═══════════════════════
+  OR use_session_context == false
+  OR no previous_state
+  OR topic_swapped
+  OR topic_mismatch (extracted ≠ session)
+  OR generic_query_without_hints
+```
+
+**Continuation Markers (line 164-170):**
+```python
+CONTINUATIONS = {
+    "same", "again", "continue", "as before", "like before", "reuse",
+    "previous", "last", "nhu cu", "giong cu", "tiep", "tiep tuc",  # Vietnamese
+    "giu nguyen"
+}
+```
+
+**Topic Swap Detection (line 186-195):**
+```python
+if (extracted.industry and 
+    previous.industry and
+    extracted.industry != previous.industry):
+    return "topic_swapped"  # User changed from fintech to sportswear
+```
+
+---
+
+## Code Quality & Recommendations
+
+### Issues Found
+
+| Issue | Severity | File | Description |
+|-------|----------|------|-------------|
+| Unused import | ⚠️ Medium | `logo_generate.py` | `ProviderRoutingPolicy` imported but never used |
+| Dead code | 🔴 High | `provider_routing_policy.py` | File exists but never called anywhere |
+| Unnecessary class | ⚠️ Low | `async_payload_assembler.py` | Simple object builder, could be function |
+| No duplicate logic | ✅ Good | All services | Clean separation of concerns |
+| No deprecated code | ✅ Good | All services | No TODO/FIXME/XXX markers |
+
+### Recommendations
+
+#### 1. **Remove Dead Code** (Priority: HIGH)
+```bash
+# Action: Delete provider_routing_policy.py
+# Remove from: source/services/__init__.py
+# Update: logo_generate.py (line 28) to remove import
+
+# Reason: Code not used, creates maintenance debt
+```
+
+#### 2. **Optimize AsyncPayloadAssembler** (Priority: LOW)
+```python
+# BEFORE (3-class file)
+class AsyncPayloadAssembler:
+    def build_completed(...):
+        return JobStatusResponse(...)
+
+# AFTER (inline as static functions)
+def build_completed_response(task_id, result, ...):
+    return JobStatusResponse(...)
+
+def build_failed_response(task_id, error_code, ...):
+    return JobStatusResponse(...)
+
+# Or: Use Pydantic factory methods
+LogoGenerateOutput.from_generator_result(...)
+```
+
+#### 3. **Add Session TTL** (Priority: MEDIUM)
+```python
+# SessionContextStore needs TTL to prevent memory bloat
+
+# BEFORE (current)
+self._store[session_id] = state  # Forever
+
+# AFTER (with TTL)
+self._store[session_id] = (state, time.time())  # Add timestamp
+
+# Cleanup on get():
+if time.time() - timestamp > 3600:  # 1 hour
+    del self._store[session_id]
+    raise SessionExpiredError
+```
+
+#### 4. **Consider Redis for Multi-Worker** (Priority: HIGH if scaling)
+```python
+# Current: SessionContextStore is single-process in-memory
+# Problem: In multi-worker setup (K8s replicas), sessions lost on pod shift
+
+# Option 1: Sticky session (not ideal)
+# Option 2: Redis backend (recommended)
+
+from redis import Redis
+
+class RedisSessionStore(SessionContextStore):
+    def __init__(self):
+        self.redis = Redis(host="localhost")
+    
+    def get(self, session_id):
+        data = self.redis.get(f"session:{session_id}")
+        if not data:
+            return None
+        return SessionContextState.parse_raw(data)
+    
+    def upsert(self, session_id, state, expected_version):
+        # Use Redis WATCH/MULTI/EXEC for CAS
+        ...
+```
+
+#### 5. **Make design.md Write Async** (Priority: MEDIUM)
+```python
+# Current: design_memory.persist() is blocking
+
+# After (non-blocking)
+async def persist_async(self, ...):
+    # Queue to background task
+    self._task_queue.put({
+        "topic": topic,
+        "record": record
+    })
+    return  # Immediate return
+
+# Background worker:
+async def _background_writer():
+    while True:
+        item = await self._task_queue.get()
+        self._write_to_file(item)
+```
+
+#### 6. **Add Event Sourcing** (Priority: LOW, optional)
+```python
+# For better auditability & analytics
+
+# New table: events
+CREATE TABLE events (
+  id BIGSERIAL PRIMARY KEY,
+  session_id VARCHAR,
+  timestamp TIMESTAMP,
+  event_type VARCHAR,  -- "context_merged", "guideline_inferred", ...
+  old_state JSONB,
+  new_state JSONB,
+  metadata JSONB
+);
+
+# Usage in StreamIntakeHandler:
+_emit_event({
+  event_type="context_merged",
+  session_id=session_id,
+  old_state=prev_context,
+  new_state=merged_context
+})
+```
+
+---
+
+## Service File Usage Matrix
+
+| File | Purpose | Used In | Status | Recommendation |
+|------|---------|---------|--------|-----------------|
+| `stream_intake_handler.py` | Stage A/B orchestrator | logo_generate.stream() | ✅ Core | Keep |
+| `llm_logo_tools.py` | LLM tools | StreamIntakeHandler | ✅ Core | Keep |
+| `option_generation_service.py` | Stage C image gen | logo_generate.async_generate() | ✅ Core | Keep |
+| `context_merge_service.py` | 3-tier merge | StreamIntakeHandler | ✅ Core | Keep |
+| `required_field_gate.py` | Validation | StreamIntakeHandler | ✅ Core | Keep |
+| `guideline_inference_service.py` | Guideline rules | StreamIntakeHandler | ✅ Core | Keep |
+| `web_research_service.py` | Web search | StreamIntakeHandler | ✅ Core | Keep |
+| `design_memory_service.py` | Audit trail | StreamIntakeHandler | ✅ Core | Keep (async write) |
+| `lifecycle_status_manager.py` | State machine | logo_generate | ✅ Core | Keep |
+| `async_payload_assembler.py` | Response builder | logo_generate | ✅ Used | Inline or extract |
+| `provider_routing_policy.py` | Provider fallback | **NONE** | ❌ Dead | **DELETE** |
+
+---
+
+## Summary
+
+### Code Organization: ✅ **GOOD**
+- 9/12 services are actively used and serve clear purposes
+- Single Responsibility Principle respected
+- No duplicate logic detected
+- Flow is natural (intake → merge → gate → research → guideline → generation)
+
+### Progress Mapping: ✅ **STATUS-BASED (NOT progress=5)**
+- Progress uses StatusEnum: pending(0%) → processing(50%) → completed(100%)
+- No intermediate values unless explicit_progress provided
+- To show granular progress, would need per-stage metadata
+
+### Actionable Issues:
+1. **🔴 HIGH:** Remove `provider_routing_policy.py` (dead code)
+2. **🟡 MEDIUM:** Add session TTL to prevent memory bloat
+3. **🟡 MEDIUM:** Make design.md writes async to avoid stream latency
+4. **⚠️ LOW:** Inline AsyncPayloadAssembler or use Pydantic factories
+
+### Production Readiness:
+- ✅ Core logic is solid and well-structured
+- ⚠️ Session store needs Redis for multi-worker deployments
+- ⚠️ No session expiration (memory leak over time)
+- ✅ Optimistic locking (CAS) prevents data corruption
+- ✅ Fallback mechanisms in place (LLM providers, research)
+
+---
+
+## Glossary of Terms
+
+- **CAS**: Compare-and-Swap (optimistic locking)
+- **Stage A**: Intake & clarification (query extraction, required field validation)
+- **Stage B**: Guideline inference (design rules generation)
+- **Stage C**: Image generation (parallel Gemini calls, storage)
+- **Sticky Session**: Same user request always routed to same server
+- **TTL**: Time-To-Live (auto-cleanup after timeout)
+- **ThreadPoolExecutor**: Non-async parallelism (blocks on `.result()`)
+- **ResearchContext**: Web search insights (design trends, references)
+- **DesignGuideline**: Structured design rules (style, colors, icons, fonts, constraints)
+
