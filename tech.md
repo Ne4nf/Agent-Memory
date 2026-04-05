@@ -1,244 +1,357 @@
-# Source Package
+# Tóm tắt cấu trúc source hệ thống Logo Design
 
-This package contains the as-built backend for the `logo_generate` workflow.
-It is the application layer that sits on top of AI Hub SDK contracts and
-coordinates Stage A, Stage B, and Stage C for logo generation.
+Tài liệu này tổng hợp cách source hiện tại đang tổ chức, từng file/hàm chính làm gì, và nếu refactor theo mô hình Planner / Worker / Observer thì nên tách ra như thế nào.
 
-## Overview
+## 1. Kết luận nhanh
 
-The current runtime flow is stream-first and runs inside a single task execution:
+Source hiện tại không đi theo mô hình Planner / Task Worker / Observer như một requirement cứng của SDK. Nó đang đi theo mô hình orchestrator-centric:
 
-1. `LogoGenerateTask` receives `LogoGenerateInput` through AI Hub SDK.
-2. Stage A detects logo intent, extracts fields, analyzes references, and checks the required-field gate.
-3. If `brand_name` or `industry` is missing, the flow returns clarification chunks and stops.
-4. If the gate passes, Stage B runs web research and guideline inference.
-5. Stage C generates logo options and returns the final payload.
+- `LogoGenerateTask` là lớp bọc SDK mỏng.
+- Stage A, B, C được tách thành các orchestrator riêng.
+- `LifecycleStatusManager` và các chunk status đóng vai trò observer/status emitter.
+- `SessionContextStore` giữ checkpoint theo `session_id`.
 
-The current implementation is fail-closed. It does not fabricate research results,
-guidelines, or logo options when provider calls fail.
+Nói ngắn gọn: hiện tại đã đúng contract và đủ rõ cho POC, nhưng nếu muốn code dễ test hơn và tách trách nhiệm sắc hơn thì refactor theo Planner / Worker / Observer là hợp lý.
 
-## Main entrypoints
+---
 
-- `source/tasks/logo_generate.py`
-- `source/services/stage_a/handler.py`
-- `source/services/stage_a/orchestrator.py`
-- `source/services/stage_b/orchestrator.py`
-- `source/services/stage_c/orchestrator.py`
+## 2. Sơ đồ hiện tại
 
-## Package structure
+```mermaid
+flowchart TD
+  U[User / UI] --> T[LogoGenerateTask]
+  T --> A[StreamIntakeOrchestrator]
+  A --> B[StageBPipeline]
+  B --> C[StreamGenerationOrchestrator]
 
-- `source/context/` - in-memory session checkpoint store and conflict handling.
-- `source/schemas/` - request, response, and stage contract models.
-- `source/services/` - orchestration and business services for all stages.
-- `source/tasks/` - AI Hub SDK task adapter.
-- `source/utils/` - logger and utility helpers.
-- `source/config.py` - runtime configuration and environment settings.
-- `source/logger.py` - shared logging setup.
+  A <--> S[(SessionContextStore)]
+  B <--> S
+  C <--> S
 
-## Stage flow
+  A --> LS[LifecycleStatusManager]
+  B --> LS
+  C --> LS
 
-### Stage A - Intake and clarification
+  A --> DM[DesignMemoryService]
+  B --> DM
 
-Stage A is responsible for:
+  A --> TS[LogoDesignToolset]
+  B --> WR[WebResearchService]
+  C --> OG[OptionGenerationService]
+  C --> PA[AsyncPayloadAssembler]
+```
 
-- intent detection,
-- input extraction,
-- reference image analysis,
-- required-field validation,
-- clarification question generation when required fields are missing.
+### Ý nghĩa sơ đồ hiện tại
 
-Current behavior worth knowing:
+- `LogoGenerateTask` chỉ làm nhiệm vụ adapter cho AI Hub SDK.
+- `StreamIntakeOrchestrator` xử lý Stage A: intent, extraction, merge context, gate required fields, clarification.
+- `StageBPipeline` xử lý Stage B: web research và guideline inference.
+- `StreamGenerationOrchestrator` xử lý Stage C: sinh options và build payload completed.
+- `LifecycleStatusManager` chuẩn hóa status chunk/progress.
+- `DesignMemoryService` ghi snapshot audit/trace.
 
-- `InputExtractionTool` and `ReferenceImageAnalyzeTool` run in parallel after intent detection passes.
-- The required fields are `brand_name` and `industry`.
-- Merge precedence is explicit request fields > extracted fields > previous session context in clarification follow-up mode.
+---
 
-### Stage B - Web research and guideline inference
+## 3. Từng file hiện đang làm gì
 
-Stage B enriches the merged context with web research and then builds the design guideline.
+## 3.1 Task adapter
 
-Current behavior worth knowing:
+### `source/tasks/logo_generate.py`
 
-- Research runs only after the required-field gate passes.
-- Web research keeps fetchable images only.
-- Gemini analysis uses backend-fetched image bytes.
-- The stage checkpoints the research context and guideline into `SessionContextStore`.
+Đây là entrypoint của task `logo_generate`.
 
-### Stage C - Logo generation
+#### Các lớp / hàm chính
 
-Stage C loads the latest guideline from session state and generates logo options.
+- `LogoGenerateTaskOutput`: schema output cho stream task.
+- `LogoGenerateTask`: adapter triển khai `BaseTask`.
+- `LogoGenerateTask.initialize()`: khởi tạo singleton service cho worker.
+- `LogoGenerateTask.cleanup()`: giải phóng singleton khi shutdown.
+- `LogoGenerateTask.stream_process()`: chạy toàn bộ flow stream, wrap chunk thành `LogoGenerateTaskOutput`.
+- `register_tasks()`: registry tương thích cho bootstrap/test cũ.
 
-Current behavior worth knowing:
+#### Tác dụng thực tế
 
-- Generation is parallel per option.
-- The final output includes `guideline`, `required_field_state`, and `options`.
-- If the guideline checkpoint is missing, Stage C fails explicitly with `GUIDELINE_NOT_READY`.
+File này không chứa nghiệp vụ domain nặng. Nó chỉ:
 
-## Key contracts
+- nhận input schema của SDK,
+- khởi tạo service dùng chung,
+- gọi Stage A/B/C theo thứ tự,
+- chuyển chunk sang format mà SDK hiểu.
 
-- Input schema: `LogoGenerateInput`
-- Output stream schema: `LogoGenerateTaskOutput`
-- Session state: `SessionContextStore`
-- Shared status builder: `LifecycleStatusManager`
-- Final payload builder: `AsyncPayloadAssembler`
-- Design trace projection: `DesignMemoryService`
+---
 
-## Session and memory behavior
+## 3.2 Stage A
 
-The runtime keeps session state in `SessionContextStore` and uses versioned
-checkpoints to avoid stale writes.
+### `source/services/stage_a/orchestrator.py`
 
-Important notes:
+Đây là nơi xử lý intake và clarification.
 
-- Session scope is keyed by `session_id`.
-- `context_version` is used for optimistic conflict detection.
-- `source/design.md` is a trace/audit projection, not the authoritative runtime store.
-- The current `SessionContextStore` is in-memory and does not survive process restarts.
+#### Các lớp / hàm chính
 
-## Lazy exports
+- `StreamIntakeOrchestrator`: orchestrator chính của Stage A.
+- `_next_task_id()`: sinh task id stream.
+- `_merge_explicit_with_extracted()`: merge explicit input với context trích xuất.
+- `_summarize_context()`: tạo chuỗi tóm tắt context để debug/status.
+- `_evaluate_gate()`: kiểm tra `brand_name` và `industry`.
+- `build_status()`: wrap `LifecycleStatusManager` thành dict chunk.
+- `emit_with_delay()`: thêm delay nhỏ giữa các chunk stream.
+- `_build_clarification_payload()`: build payload clarification khi thiếu field.
+- `iter_chunks()`: luồng chính Stage A/B stream.
+- `handle()`: chạy stream xong và trả payload cuối cùng.
 
-`source/services/__init__.py` exposes the main service classes through lazy loading:
+#### Tác dụng thực tế
 
-- `StreamIntakeHandler`
-- `StreamIntakeOrchestrator`
-- `StreamGenerationOrchestrator`
-- `LogoDesignToolset`
-- `WebResearchService`
-- `OptionGenerationService`
-- `LifecycleStatusManager`
-- `AsyncPayloadAssembler`
-- `DesignMemoryService`
+Stage A làm 4 việc:
 
-## Practical notes
+1. detect intent.
+2. extract input + analyze reference.
+3. merge context theo precedence.
+4. gate required fields và tạo clarification nếu thiếu.
 
-- This package is optimized for a single `logo_generate` task type.
-- The flow is designed for deterministic clarification and contract-safe output.
-- Provider errors should be handled as explicit failures, not hidden behind fallback content.
-- If you add a new stage or provider, keep the schema contracts stable and update the stage README sections above.
+Điểm quan trọng hiện tại:
 
-## Related files
+- `InputExtractionTool` và `ReferenceImageAnalyzeTool` đang chạy song song bằng `asyncio.gather()` sau khi intent pass.
+- Nếu thiếu `brand_name` hoặc `industry`, flow dừng ở clarification thay vì đi tiếp Stage B.
 
-- [technical-design.md](../technical-design.md)
-- [source-code-review.md](../source-code-review.md)
-# Source Package
+---
 
-This package contains the as-built backend for the `logo_generate` workflow.
-It is the application layer that sits on top of AI Hub SDK contracts and
-coordinates Stage A, Stage B, and Stage C for logo generation.
+### `source/services/stage_a/toolset.py`
 
-## Overview
+Đây là bộ tool domain của Stage A.
 
-The current runtime flow is stream-first and runs inside a single task execution:
+#### Nhiệm vụ chính
 
-1. `LogoGenerateTask` receives `LogoGenerateInput` through AI Hub SDK.
-2. Stage A detects logo intent, extracts fields, analyzes references, and checks the required-field gate.
-3. If `brand_name` or `industry` is missing, the flow returns clarification chunks and stops.
-4. If the gate passes, Stage B runs web research and guideline inference.
-5. Stage C generates logo options and returns the final payload.
+- detect intent logo,
+- extract brand/context từ query,
+- analyze reference images,
+- đề xuất câu hỏi clarification,
+- infer guideline ở đầu Stage B.
 
-The current implementation is fail-closed. It does not fabricate research results,
-guidelines, or logo options when provider calls fail.
+#### Ý nghĩa
 
-## Main entrypoints
+`toolset` là lớp “thực thi domain logic” cho orchestrator. Orchestrator quyết định thứ tự, còn toolset làm phần xử lý nội dung.
 
-- `source/tasks/logo_generate.py`
-- `source/services/stage_a/handler.py`
-- `source/services/stage_a/orchestrator.py`
-- `source/services/stage_b/orchestrator.py`
-- `source/services/stage_c/orchestrator.py`
+---
 
-## Package structure
+### `source/services/stage_a/checkpoint.py`
 
-- `source/context/` - in-memory session checkpoint store and conflict handling.
-- `source/schemas/` - request, response, and stage contract models.
-- `source/services/` - orchestration and business services for all stages.
-- `source/tasks/` - AI Hub SDK task adapter.
-- `source/utils/` - logger and utility helpers.
-- `source/config.py` - runtime configuration and environment settings.
-- `source/logger.py` - shared logging setup.
+#### Hàm chính
 
-## Stage flow
+- `persist_with_cas()`: ghi checkpoint vào `SessionContextStore` theo kiểu compare-and-set.
 
-### Stage A - Intake and clarification
+#### Tác dụng thực tế
 
-Stage A is responsible for:
+- Tránh overwrite checkpoint cũ khi có version conflict.
+- Giữ `session_id` có thể resume cho clarification follow-up.
 
-- intent detection,
-- input extraction,
-- reference image analysis,
-- required-field validation,
-- clarification question generation when required fields are missing.
+---
 
-Current behavior worth knowing:
+## 3.3 Stage B
 
-- `InputExtractionTool` and `ReferenceImageAnalyzeTool` run in parallel after intent detection passes.
-- The required fields are `brand_name` and `industry`.
-- Merge precedence is explicit request fields > extracted fields > previous session context in clarification follow-up mode.
+### `source/services/stage_b/orchestrator.py`
 
-### Stage B - Web research and guideline inference
+Đây là nơi xử lý web research và guideline inference.
 
-Stage B enriches the merged context with web research and then builds the design guideline.
+#### Các thành phần chính
 
-Current behavior worth knowing:
+- `missing_research_enrichment_fields()`: xác định field optional nào còn thiếu để request research hợp lý hơn.
+- `StageBPipeline`: orchestrator của Stage B.
+- `iter_chunks()`: chạy research, phân tích, infer guideline, rồi checkpoint.
 
-- Research runs only after the required-field gate passes.
-- Web research keeps fetchable images only.
-- Gemini analysis uses backend-fetched image bytes.
-- The stage checkpoints the research context and guideline into `SessionContextStore`.
+#### Tác dụng thực tế
 
-### Stage C - Logo generation
+Stage B làm 3 việc:
 
-Stage C loads the latest guideline from session state and generates logo options.
+1. gọi research theo industry/context,
+2. lọc và phân tích ảnh fetchable,
+3. tạo `DesignGuideline` rồi lưu checkpoint.
 
-Current behavior worth knowing:
+Điểm đáng chú ý:
 
-- Generation is parallel per option.
-- The final output includes `guideline`, `required_field_state`, and `options`.
-- If the guideline checkpoint is missing, Stage C fails explicitly with `GUIDELINE_NOT_READY`.
+- Stage B chỉ chạy sau khi gate Stage A pass.
+- Đây là stage network-heavy nhất, nên latency và error handling là vùng cần chú ý nhất.
 
-## Key contracts
+---
 
-- Input schema: `LogoGenerateInput`
-- Output stream schema: `LogoGenerateTaskOutput`
-- Session state: `SessionContextStore`
-- Shared status builder: `LifecycleStatusManager`
-- Final payload builder: `AsyncPayloadAssembler`
-- Design trace projection: `DesignMemoryService`
+### `source/services/stage_b/web_research_service.py`
 
-## Session and memory behavior
+#### Nhiệm vụ
 
-The runtime keeps session state in `SessionContextStore` and uses versioned
-checkpoints to avoid stale writes.
+- build query,
+- gọi search backend,
+- normalize kết quả,
+- dedupe,
+- lọc ảnh fetchable,
+- tạo research context đầu vào cho guideline.
 
-Important notes:
+#### Tác dụng thực tế
 
-- Session scope is keyed by `session_id`.
-- `context_version` is used for optimistic conflict detection.
-- `source/design.md` is a trace/audit projection, not the authoritative runtime store.
-- The current `SessionContextStore` is in-memory and does not survive process restarts.
+Đây là lớp “research ingestion” trước khi đi vào phân tích LLM.
 
-## Lazy exports
+---
 
-`source/services/__init__.py` exposes the main service classes through lazy loading:
+## 3.4 Stage C
 
-- `StreamIntakeHandler`
-- `StreamIntakeOrchestrator`
-- `StreamGenerationOrchestrator`
-- `LogoDesignToolset`
-- `WebResearchService`
-- `OptionGenerationService`
-- `LifecycleStatusManager`
-- `AsyncPayloadAssembler`
-- `DesignMemoryService`
+### `source/services/stage_c/orchestrator.py`
 
-## Practical notes
+Đây là nơi sinh logo options và hoàn thiện payload cuối.
 
-- This package is optimized for a single `logo_generate` task type.
-- The flow is designed for deterministic clarification and contract-safe output.
-- Provider errors should be handled as explicit failures, not hidden behind fallback content.
-- If you add a new stage or provider, keep the schema contracts stable and update the stage README sections above.
+#### Các lớp / hàm chính
 
-## Related files
+- `StreamGenerationOrchestrator`: orchestrator Stage C.
+- `iter_chunks()`: kiểm tra guideline đã có chưa, emit generation_started, sinh options, rồi build completed payload.
 
-- [technical-design.md](../technical-design.md)
-- [source-code-review.md](../source-code-review.md)
+#### Tác dụng thực tế
+
+- load `latest_guideline` từ session,
+- fail nếu guideline chưa có,
+- sinh option theo `variation_count`,
+- gom kết quả và trả `completed` chunk.
+
+---
+
+### `source/services/stage_c/generator.py`
+
+#### Nhiệm vụ
+
+- sinh từng option logo,
+- upload asset,
+- trả metadata cho mỗi option.
+
+#### Tác dụng thực tế
+
+Đây là lớp thực thi generation thật, còn `StreamGenerationOrchestrator` chỉ điều phối và stream status.
+
+---
+
+## 3.5 Shared services
+
+### `source/services/shared/lifecycle_status.py`
+
+#### Các phần chính
+
+- `LifecycleStatusManager`: chuẩn hóa progress/status.
+- `resolve_progress()`: tính progress hợp lệ 0..100.
+- `build_status_response()`: build `JobStatusResponse`.
+
+#### Tác dụng thực tế
+
+Đây là lớp “observer/status emitter” ở mức kỹ thuật. Nó không quyết định business flow, nhưng quyết định format chunk và trạng thái hiển thị.
+
+---
+
+### `source/services/shared/payload_assembler.py`
+
+#### Lớp chính
+
+- `AsyncPayloadAssembler`.
+- `build_completed()`: build payload final completed cho Stage C.
+
+#### Tác dụng thực tế
+
+Nó gom guideline + required_field_state + options thành payload cuối hợp đồng.
+
+---
+
+### `source/services/shared/design_memory.py`
+
+#### Lớp chính
+
+- `DesignMemoryService`.
+- `persist_async()`: ghi trace snapshot theo topic/session.
+
+#### Tác dụng thực tế
+
+Đây là lớp audit/trace projection. Nó không phải source of truth để restore runtime state sau restart.
+
+---
+
+## 4. Sơ đồ sau khi refactor
+
+Nếu refactor theo concept Planner / Worker / Observer, mình sẽ tách như sau:
+
+```mermaid
+flowchart TD
+  U[User / UI] --> T[Task Adapter]
+  T --> P[Planner]
+  P --> O[Observer / Status Emitter]
+  P --> W1[Stage A Worker]
+  P --> W2[Stage B Worker]
+  P --> W3[Stage C Worker]
+
+  W1 <--> S[(SessionContextStore)]
+  W2 <--> S
+  W3 <--> S
+
+  W1 --> D[Design Memory]
+  W2 --> D
+
+  O --> LS[LifecycleStatusManager]
+  O --> PA[Payload Assembler]
+```
+
+### Ý nghĩa của từng vai trò sau refactor
+
+#### Planner
+
+- Chỉ quyết định bước tiếp theo.
+- Không trực tiếp gọi provider hoặc xử lý dữ liệu nặng.
+- Là nơi đặt rules: intent, gate, clarification, stage handoff.
+
+#### Worker
+
+- Chỉ làm việc chuyên môn của từng stage.
+- Ví dụ:
+  - Stage A worker: detect/extract/merge/gate.
+  - Stage B worker: research/infer guideline.
+  - Stage C worker: generate/upload.
+
+#### Observer
+
+- Chỉ lo status, progress, chunk format, error mapping.
+- Không chứa business logic.
+
+---
+
+## 5. Khác nhau giữa hiện tại và refactor
+
+### Hiện tại
+
+- Orchestrator vừa có vai trò lập kế hoạch, vừa điều phối, vừa emit chunk.
+- Task adapter vẫn cần biết đủ nhiều về flow stream.
+- Status chunk và business flow được trộn trong cùng lớp ở một số chỗ.
+
+### Sau refactor
+
+- `TaskAdapter` mỏng hơn nữa.
+- `Planner` tách logic quyết định flow ra khỏi logic thực thi.
+- `Worker` tách rõ xử lý domain.
+- `Observer` gom toàn bộ status/progress/error payload.
+- Dễ test unit theo từng vai trò hơn.
+
+---
+
+## 6. Gợi ý refactor thực tế
+
+Nếu làm từng bước, thứ tự hợp lý là:
+
+1. Tách planner nội bộ từ `StreamIntakeOrchestrator`.
+2. Tách status emitter/observer riêng khỏi orchestrator.
+3. Giữ Stage A/B/C worker theo interface chung.
+4. Chuẩn hóa input/output delta giữa planner và worker.
+5. Chỉ khi thật cần mới tách tiếp sang service/process riêng.
+
+Cách này ít rủi ro hơn so với rewrite toàn bộ kiến trúc ngay lập tức.
+
+---
+
+## 7. Kết luận
+
+Bản chất source hiện tại là:
+
+- task adapter mỏng,
+- orchestrator làm planner + coordinator,
+- stage services làm worker,
+- lifecycle manager/payload assembler làm observer/status layer.
+
+Nếu mục tiêu là POC và code đang chạy ổn, kiến trúc hiện tại chấp nhận được. Nếu mục tiêu là codebase dễ mở rộng và dễ test hơn, refactor theo Planner / Worker / Observer là hướng nên đi, nhưng nên làm theo từng lớp trách nhiệm thay vì tách service vật lý ngay từ đầu.
