@@ -1,335 +1,375 @@
-# Review Mã Nguồn
+# Logo Design AI POC (System Design v2.2)
 
-## Phạm vi
+## 1. Overview
 
-Bản review này chỉ xét package `source` và giải thích toàn bộ luồng tạo logo end-to-end: AI Hub SDK entrypoint, các stage service, schema, session memory, và UI Streamlit.
+### 1.1 POC objective
 
-## Kết luận tóm tắt
+Build a chat-driven Logo Design Service with deterministic orchestration for Step 1 -> Step 6.5:
 
-Ở mức kiến trúc, code khá sạch: luồng được tách rõ, dùng schema làm hợp đồng dữ liệu, và đa số nhánh quan trọng đều fail-closed. Tôi không thấy path nào bịa research, bịa guideline, hay bịa ảnh logo để “lấp chỗ trống” cho user.
+- Step 1: intent detect.
+- Step 2: input extraction + reference analysis.
+- Step 2.5: web research enrichment for logo trends/context.
+- Step 3: required-field validation and clarification loop.
+- Step 4: design guideline inference.
+- Step 6: generate 3-4 logo options.
+- Step 6.5: quick-action-ready metadata for POC regenerate flow.
 
-Tuy nhiên code chưa thể gọi là “không còn fallback” hoàn toàn. Hiện vẫn có một số heuristic/fallback có chủ đích:
+Out-of-scope core phases:
 
-- câu hỏi clarification có fallback sang bộ câu hỏi mặc định nếu LLM trả không hợp lệ,
-- session context được reuse cho follow-up trong cùng `session_id`,
-- UI có fallback đọc ảnh local/remote để ổn định render,
-- một số nhánh compatibility cũ vẫn còn để giữ test/support ổn định.
+- Step 7: prompt-based editing and inpainting workflow.
+- Step 8: follow-up suggestion intelligence.
 
-Nói ngắn gọn: code không “bịa data”, nhưng vẫn còn một vài fallback có chủ đích để hệ thống không bị kẹt.
+Primary task type: `logo_generate`.
 
-## Luồng Full Flow
+### 1.2 Success metrics (POC acceptance targets)
 
-### 1. Điểm vào task
+- >= 90% requests extract or clarify `brand_name` and `industry` before Stage B completes.
+- >= 90% requests that pass required-field gate produce valid `guideline` before Stage C starts.
+- >= 85% requests return 3-4 valid logo options.
+- p95 completion time <= 40s for current POC pipeline.
+- On failure, return actionable `error_code` + `error_message` (+ hints if applicable).
+
+### 1.3 User journey (chat-first flow)
+
+1. User submits request with optional references.
+2. System streams reasoning and gate progress.
+3. If fields are missing, system emits clarification questions.
+4. User answers in the same session and re-calls stream.
+5. System finalizes guideline and runs option generation.
+6. User receives 3-4 options and supporting context.
+
+### 1.4 Technical constraints
+
+- AI Hub SDK service contracts are fixed and used as-is.
+- Stream transport uses NDJSON over HTTP gateway (`/internal/v1/tasks/stream`).
+- Required fields before Stage B/Stage C progression:
+  - `brand_name`
+  - `industry`
+- Merge precedence is fixed:
+  - explicit request fields > extracted fields from new query > session context.
+- Session memory scope is bound by `session_id`.
+- Provider switching must preserve task semantics and output contract.
+
+---
+
+## 2. POC Scope
+
+### 2.1 Build vs defer (aligned to technical-design)
+
+| Area | Build in v2.2 | Defer / Not fully implemented yet |
+| :--- | :--- | :--- |
+| Intent + input | Intent detect, extraction, reference analysis in Stage A | Multi-domain intent routing and advanced confidence policy tuning |
+| Clarification | Required-field gate + clarification chunk + stream recall | Personalized adaptive questioning policy |
+| Reasoning stream | Reasoning timeline and status chunks in Streamlit | Production BFF abstraction for multi-client stream fan-out |
+| Research (Step 2.5) | Bounded web research + fetchable-image selection + multimodal analysis | Query backfill strategy to always guarantee 3 fetchable images before fail |
+| Guideline (Step 4) | Structured guideline inference and checkpoint | Auto guideline optimization loop |
+| Generation (Step 6) | Parallel Stage C generation and asset upload | Provider auto-routing/ranking by live telemetry |
+| Storage/session | Session checkpointing + `design.md` projection | Long-term project memory/version library |
+| Editing (Step 7) | Not implemented | Full edit/inpaint pipeline |
+| Follow-up (Step 8) | Quick-action-ready metadata at POC level | Personalization-aware suggestion ranking |
+
+### 2.2 What is added from technical-design but still pending
+
+The following technical-design items are recognized in v2.2 but not completed yet:
+
+- Production-grade BFF stream management (retry, reconnect, backpressure strategy).
+- Formal queue boundary for Stage A/B vs Stage C in independent services.
+- Confidence-threshold policy for extraction-driven clarification (explicit numerical thresholding policy).
+- Signed URL TTL policy and asset retention policy.
+- Full job-result retention/cleanup lifecycle.
+- End-to-end cost tracking by `task_id` and `session_id`.
+
+---
+
+## 3. System Architecture
+
+### 3.1 Overview
+
+#### 3.1.1 Why this solution
+
+This architecture prioritizes deterministic gating, explicit failure semantics, and chat UX continuity:
+
+1. Required-field gate prevents low-quality generation with missing business context.
+2. Stream-first Stage A/B provides visible reasoning and clarification in real time.
+3. Session-based merge keeps follow-up behavior predictable.
+4. Stage B is fail-closed: only fetchable images are analyzed; no synthetic fallback data.
+5. Stage C runs parallel option generation for throughput.
+
+#### 3.1.2 Diagram 1 - Agent pipeline (top-down)
+
+```mermaid
+flowchart TD
+  U[User Input] --> R[Stream Request: logo_generate]
+  R --> P[Planner and Stage Router]
+
+  subgraph A[Stage A - Intake and Gate]
+    direction TB
+    A1[IntentDetectTool]
+    A2[InputExtractionTool]
+    A3[ReferenceImageAnalyzeTool]
+    A4[Required Field Gate]
+    A5[ClarificationLoopTool]
+  end
+
+  subgraph B[Stage B - Research and Guideline]
+    direction TB
+    B1[WebResearchService]
+    B2[Fetchable Image Selector]
+    B3[GeminiResearchAnalyzer bytes-only]
+    B4[DesignInferenceTool]
+  end
+
+  subgraph C[Stage C - Generation]
+    direction TB
+    C1[Parallel LogoGenerationTool]
+    C2[StorageTool]
+    C3[Quick Action Metadata]
+  end
+
+  P --> A1 --> A2 --> A3 --> A4
+  A4 -->|missing fields| A5 --> A4
+  A4 -->|passed| B1 --> B2 --> B3 --> B4 --> C1 --> C2 --> C3
+  C3 --> O[Response to UI]
+```
+
+#### 3.1.3 Diagram 2 - System components (top-down layered)
+
+```mermaid
+graph TD
+  FE[Frontend or Streamlit UI]
+  BFF[BFF or Stream Adapter]
+  GW[AI Hub Gateway]
+
+  subgraph ORCH[Worker Orchestration]
+    direction TB
+    SO[Stream Orchestrator]
+    SA[Stage A Services]
+    SB[Stage B Services]
+    SC[Stage C Services]
+  end
+
+  CTX[(SessionContextStore)]
+  LLM[Text and Multimodal LLM]
+  IMG[Image Provider]
+  STO[(Object Storage or CDN)]
+
+  FE --> BFF --> GW --> SO
+  SO --> SA --> SB --> SC
+  SA <--> CTX
+  SB <--> CTX
+  SC <--> CTX
+  SB --> LLM
+  SC --> IMG --> STO
+  SO --> FE
+```
+
+### 3.2 Architecture principles
+
+- Task-first:
+  - All business logic is routed by `task_type = logo_generate`.
+- Schema-first:
+  - Pydantic contracts guard boundaries and stream payload integrity.
+- Context-first handoff:
+  - Services return deltas; orchestrator performs merge and checkpoint.
+- Fail-closed policy:
+  - Invalid provider outputs and non-fetchable research assets are not silently bypassed.
+- Deterministic merge precedence:
+  - explicit > extracted > session context.
+
+### 3.3 Component breakdown (tool-level)
+
+| Component or Tool | Spec step | Role | Model/Type | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| IntentDetectTool | Step 1 | Detect logo intent and route | Text LLM | Keeps logo flow deterministic |
+| InputExtractionTool | Step 2 | Extract `brand_name`, `industry`, style hints | Text LLM structured output | Required-field prep |
+| ReferenceImageAnalyzeTool | Step 2 | Parse uploaded/reference visuals | Multimodal LLM | Optional path when refs exist |
+| ClarificationLoopTool | Step 3 | Generate missing-field questions | Text LLM | Stream emits `clarification_needed` |
+| WebResearchService | Step 2.5 | Query and normalize web image candidates | SerpAPI + normalizer | Bounded policy: 3 queries |
+| GeminiResearchAnalyzer | Step 2.5 | Analyze selected references | Gemini multimodal | Backend uploads bytes, not remote URLs |
+| DesignInferenceTool | Step 4 | Infer guideline JSON | Text LLM | Produces generation-ready contract |
+| LogoGenerationTool | Step 6 | Generate 3-4 options | Image model provider | Parallel execution |
+| StorageTool | Shared | Upload and return public URLs | Storage API | Option asset persistence |
+| SessionContextStore | Shared | Checkpoint state by `session_id` | Cache/DB adapter | Used across all stages |
+
+### 3.4 End-to-end pipeline
+
+#### 3.4.1 Full sequence overview (top-down)
+
+```mermaid
+sequenceDiagram
+  actor U as User
+  participant UI as UI
+  participant S as Stream API
+  participant W as Worker
+  participant C as ContextStore
+  participant G as Generation Provider
+
+  U->>UI: Submit query and optional references
+  UI->>S: POST stream (logo_generate)
+  S->>W: Run Stage A then Stage B
+  W->>C: Load and merge session context
+  W-->>UI: reasoning chunks
+
+  alt Required fields missing
+    W-->>UI: clarification_needed (missing_fields, suggested_questions)
+    UI->>S: Re-call stream with answers and same session_id
+    S->>W: Resume merge and gate
+  else Required fields passed
+    W-->>UI: guideline-ready chunk
+    W->>G: Run Stage C option generation (parallel)
+    G-->>W: image bytes
+    W-->>UI: completed options
+  end
+```
+
+#### 3.4.2 Stage A - Intake and clarification loop (Step 1-3)
+
+| Item | Detail |
+| :--- | :--- |
+| Input | `LogoGenerateInput` with `session_id`, query, optional fields/references |
+| Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationLoopTool |
+| Output | Either gate-passed context or `clarification_needed` chunk |
+| Gate | `brand_name` AND `industry` must both exist |
+| Current behavior | Session continuation works with deterministic precedence |
+
+#### 3.4.3 Stage B - Web research and guideline inference (Step 2.5 + Step 4)
+
+| Item | Detail |
+| :--- | :--- |
+| Input | Gate-passed context |
+| Tools used | WebResearchService, GeminiResearchAnalyzer, DesignInferenceTool |
+| Selection policy | Pick from deduped pool, then keep only fetchable images |
+| Failure policy | If < 3 fetchable images, fail explicitly (no synthetic fallback) |
+| Gemini input mode | Bytes uploaded by backend (`Part.from_bytes` path) |
+| Output | `ResearchContext` + `DesignGuideline` |
+
+#### 3.4.4 Stage C - Logo generation (Step 6)
+
+| Item | Detail |
+| :--- | :--- |
+| Input | Guideline + variation count |
+| Tools used | LogoGenerationTool, StorageTool |
+| Output | 3-4 option URLs + metadata |
+| Concurrency | Parallel per-option generation |
+
+### 3.5 Reuse and extensibility
+
+- Add new guideline fields:
+  - extend schemas and prompt templates without changing task contract.
+- Add Step 7 in future:
+  - register `logo_edit` and reuse same session/memory contract.
+- Add provider:
+  - swap provider adapter while preserving output schema.
+
+---
+
+## 4. Data Schema and API Integration
+
+### 4.1 Core models by stage
+
+Core entities:
+
+- `LogoGenerateInput`
+- `BrandContext`
+- `RequiredFieldState`
+- `ResearchContext`
+- `DesignGuideline`
+- `LogoOption`
+- `JobStatusResponse`
+
+### 4.2 Validation and merge rules
+
+- `query` must be non-empty.
+- `variation_count` must be in range 3..4.
+- Required-field gate blocks progression if either `brand_name` or `industry` is missing.
+- Merge precedence is fixed: explicit > extracted > session.
+- Empty string for required scalar fields is treated as missing.
+
+### 4.3 Endpoint mapping (AI Hub SDK native)
+
+- Stream reasoning and clarification:
+  - `POST /internal/v1/tasks/stream`
+- Async submit (when used by deployment mode):
+  - `POST /internal/v1/tasks/submit`
+- Async poll:
+  - `GET /internal/v1/tasks/{task_id}/status`
+
+Status and failure contract baseline:
+
+- `status`: `pending|processing|completed|failed`
+- `error_code`
+- `error_message`
+- `missing_fields` (if gate fail)
+- `suggested_questions` (if clarification needed)
+
+### 4.4 Current benchmark direction (POC policy)
+
+- Text primary: Gemini flash-class model for extraction/inference.
+- Image primary: fast image generation model.
+- Cross-vendor fallback is planned at provider adapter level.
+
+---
+
+## 5. Risks and Open Issues
+
+### 5.1 Latency risk
+
+Risk:
+
+- Stage B network + multimodal analysis can inflate p95.
+
+Mitigation:
+
+- Keep bounded query policy (3 templates, capped URLs/query).
+- Preserve parallel Stage C generation.
+
+### 5.2 Provider reliability risk
+
+Risk:
+
+- Multimodal provider may return internal errors.
+
+Mitigation:
+
+- Fail clearly with explicit error code and stop unsafe continuation.
+
+### 5.3 Data quality risk
+
+Risk:
+
+- Malformed extracted payload can pollute downstream steps.
+
+Mitigation:
+
+- Normalize and validate payloads at stage boundaries.
+
+### 5.4 Open technical decisions (from technical-design, not fully closed)
+
+- BFF stream timeout/reconnect and chunk flush policy.
+- Signed URL TTL by asset type.
+- Job result retention and cleanup lifecycle.
+- Session TTL/reset policy.
+- Query backfill strategy when fetchable-image pool is below threshold.
+
+---
+
+## 6. Implementation Status (v2.2)
+
+### 6.1 Implemented
+
+- Stream clarification loop and same-session continuation.
+- Deterministic merge precedence with session checkpoints.
+- Stage B bounded research query strategy.
+- Fetchable-image-only main path before Gemini analysis.
+- Gemini bytes-based multimodal input (no provider URL fetch dependency).
+- Parallel Stage C generation and upload.
+- Streamlit conversation UI with reasoning + references + canvas.
+
+### 6.2 Not implemented yet (technical-design gap)
+
+- Full Step 7 editing/inpainting flow.
+- Step 8 personalized follow-up intelligence.
+- Production-grade BFF stream abstraction and resilience controls.
+- Explicit confidence-threshold policy automation for clarification routing.
+- Comprehensive cost analytics per job/session.
 
-File: [source/tasks/logo_generate.py](../../source/tasks/logo_generate.py)
-
-`LogoGenerateTask` là adapter của AI Hub SDK, kế thừa `BaseTask`. File này không chứa nghiệp vụ nặng mà chỉ làm nhiệm vụ cầu nối giữa framework và service business.
-
-Các việc chính:
-
-- khai báo `task_type = "logo_generate"`,
-- bind input schema `LogoGenerateInput`,
-- bind output stream schema `LogoGenerateTaskOutput`,
-- khởi tạo singleton service cho worker một lần,
-- điều phối stream qua Stage A/B rồi sang Stage C.
-
-Hàm quan trọng nhất là `stream_process()`:
-
-1. chuyển `input_args` thành dict,
-2. gọi `StreamIntakeHandler.iter_chunks()` cho Stage A/B,
-3. nếu Stage A/B chưa completed thì dừng luôn,
-4. nếu Stage A/B completed thì gọi `StreamGenerationOrchestrator.iter_chunks()` cho Stage C,
-5. wrap từng chunk về `LogoGenerateTaskOutput`.
-
-### 2. Schema layer
-
-File: [source/schemas/__init__.py](../../source/schemas/__init__.py)
-
-Đây là lớp contract trung tâm. File này chỉ re-export model từ `api.py`, `domain.py`, `status.py`, `enums.py` để các service import một chỗ.
-
-Các model chính:
-
-- `LogoGenerateInput`: input cho task,
-- `BrandContext`: context thương hiệu đã merge,
-- `RequiredFieldState`: trạng thái đủ/thiếu field bắt buộc,
-- `ResearchContext`: kết quả web research,
-- `DesignGuideline`: guideline thiết kế,
-- `LogoOption`: metadata logo output,
-- `SessionContextState`: snapshot session,
-- `JobStatusResponse`: payload trạng thái stream/async.
-
-Ý nghĩa thực tế: thay vì truyền dict rời rạc giữa các stage, code dùng model typed để giảm lỗi shape và giúp pipeline rõ ràng hơn.
-
-### 3. Config layer
-
-File: [source/config.py](../../source/config.py)
-
-File này gom toàn bộ biến môi trường/runtime config cho hệ thống.
-
-Nó định nghĩa:
-
-- cấu hình AI Hub SDK (`AI_HUB_SDK_*`),
-- Gemini text/image model,
-- SerpAPI key/endpoint/limit,
-- storage path và asset URL,
-- timeout, retry, cost trace,
-- mode provider ảnh (`IMAGE_PROVIDER_MODE`),
-- số lượng ảnh top cần xử lý trong research.
-
-Điểm cần lưu ý:
-
-- `IMAGE_PROVIDER_MODE` mặc định là `mock`, nhưng Stage C hiện không sinh mock image giả để che lỗi. Nếu provider không bật thì nó fail closed.
-
-## Stage A
-
-### Các file liên quan
-
-- [source/services/stage_a/handler.py](../../source/services/stage_a/handler.py)
-- [source/services/stage_a/orchestrator.py](../../source/services/stage_a/orchestrator.py)
-- [source/services/stage_a/toolset.py](../../source/services/stage_a/toolset.py)
-- [source/services/stage_a/llm_runtime.py](../../source/services/stage_a/llm_runtime.py)
-- [source/services/stage_a/checkpoint.py](../../source/services/stage_a/checkpoint.py)
-
-### Stage A làm gì
-
-Stage A là cửa vào cho intake và clarification.
-
-Nó quyết định 3 việc:
-
-1. có đúng là user đang yêu cầu logo không,
-2. có trích xuất được brand context từ query/reference không,
-3. có đủ `brand_name` và `industry` để qua Stage B không.
-
-### Luồng xử lý
-
-`StreamIntakeHandler` chỉ là adapter mỏng để giữ API cũ, còn logic thật nằm ở `StreamIntakeOrchestrator`.
-
-`StreamIntakeOrchestrator.iter_chunks()` làm theo thứ tự:
-
-1. load snapshot session cũ,
-2. emit chunk intake,
-3. gọi `LogoDesignToolset.detect_intent_async()`,
-4. gọi `extract_inputs_async()` và `analyze_reference_images_async()`,
-5. merge explicit input + extracted data + session fallback,
-6. đánh giá `RequiredFieldState`,
-7. nếu thiếu field bắt buộc thì emit clarification và dừng,
-8. nếu đủ thì handoff sang Stage B.
-
-### AI Hub SDK được dùng như thế nào
-
-Stage A không gọi SDK “thô” trực tiếp ở nhiều nơi; nó đi qua task adapter và lifecycle manager:
-
-- `BaseTask` cho contract task,
-- `TaskOutputBaseModel` cho stream output,
-- `ServingMode.STREAM` để chạy dạng stream,
-- `build_status_response()` để chuẩn hóa chunk payload.
-
-### Đánh giá heuristic/fallback ở Stage A
-
-Có một fallback cố ý:
-
-- `suggest_clarifications_async()` ưu tiên lấy câu hỏi từ LLM,
-- nếu LLM fail thì rơi xuống bộ câu hỏi mặc định hardcoded.
-
-Đây không phải bịa dữ liệu sản phẩm. Nó chỉ là UX fallback để tránh user bị kẹt khi model không trả về câu hỏi hợp lệ.
-
-Cũng có heuristic reuse session:
-
-- follow-up trong cùng `session_id` sẽ lấy context cũ làm fallback,
-- nhưng nó được giới hạn rõ bằng `context_version` và rule merge.
-
-### Chỗ còn nên để ý
-
-Trong Stage A toolset, một số prompt text rất cứng tay, ví dụ yêu cầu LLM chỉ trả field explicit, không được đoán. Đây là tốt về mặt an toàn, nhưng vẫn là heuristic prompt-based chứ không phải rule engine thuần.
-
-## Stage B
-
-### Các file liên quan
-
-- [source/services/stage_b/web_research_service.py](../../source/services/stage_b/web_research_service.py)
-- [source/services/stage_b/research_clients.py](../../source/services/stage_b/research_clients.py)
-- [source/services/stage_b/research_normalizer.py](../../source/services/stage_b/research_normalizer.py)
-- [source/services/stage_b/gemini_analyzer.py](../../source/services/stage_b/gemini_analyzer.py)
-- [source/services/stage_b/orchestrator.py](../../source/services/stage_b/orchestrator.py)
-
-### Stage B làm gì
-
-Stage B là phần enrich guideline bằng web research theo domain logo.
-
-Luồng hiện tại:
-
-1. build 3 query từ `industry`,
-2. gọi SerpAPI song song cho 3 query,
-3. dedupe source/image,
-4. chọn top images,
-5. gọi Gemini phân tích top ảnh,
-6. aggregate strategic directions và signals,
-7. infer `DesignGuideline`,
-8. checkpoint lại kết quả.
-
-### AI Hub SDK usage
-
-Stage B vẫn đi theo cùng contract stream status với Stage A. Tức là nó build chunk status thông qua lifecycle manager rồi task adapter pass qua UI.
-
-### Latency thật sự đến từ đâu
-
-Stage B đã parallel nhưng vẫn có 2 pha nối tiếp:
-
-- pha 1: SerpAPI song song cho 3 query,
-- pha 2: Gemini song song cho top 3 ảnh,
-- sau đó mới merge, infer guideline và checkpoint.
-
-Nghĩa là latency Stage B vẫn cao vì đây là pipeline network-heavy có 2 tầng gọi ngoài mạng nối tiếp nhau, không phải vì chỉ có 1 call blocking đơn lẻ.
-
-### Đánh giá heuristic/fallback ở Stage B
-
-Ở đây không thấy bịa research hay bịa guideline.
-
-Các điểm fail-closed khá rõ:
-
-- `SerpApiImageClient` fail nếu API thiếu hoặc request lỗi,
-- `GeminiResearchAnalyzer` fail nếu response multimodal rỗng/không hợp lệ,
-- `StageBPipeline` chỉ persist sau khi guideline thật đã tạo xong.
-
-Tuy nhiên, phần `GeminiResearchAnalyzer` vẫn còn một số helper legacy như:
-
-- `_generate_payload_text_only()`
-- `_generate_payload_text_only_async()`
-- `_filter_fetchable_images()`
-- `_filter_fetchable_images_async()`
-
-Hiện luồng chính đã đi theo per-image parallel analysis, nên các helper này chủ yếu là compatibility/legacy. Chúng không phải main path, nhưng nếu muốn code “sạch tuyệt đối” thì nên dọn tiếp.
-
-### Kết luận riêng cho Stage B
-
-- Không thấy bịa data.
-- Có heuristic prompt.
-- Có legacy fallback code còn sót.
-- Đây là phần cần dọn tiếp nếu bạn muốn codebase strict hơn nữa.
-
-## Stage C
-
-### Các file liên quan
-
-- [source/services/stage_c/orchestrator.py](../../source/services/stage_c/orchestrator.py)
-- [source/services/stage_c/generator.py](../../source/services/stage_c/generator.py)
-
-### Stage C làm gì
-
-Stage C sinh logo options thật.
-
-Luồng:
-
-1. load guideline đã checkpoint,
-2. fail nếu chưa có guideline,
-3. emit generation-start chunk,
-4. generate 3-4 option song song,
-5. upload asset và lấy public URL,
-6. emit chunk completed cuối cùng.
-
-### Đánh giá heuristic/fallback ở Stage C
-
-Stage C cũng fail closed:
-
-- nếu provider không sẵn sàng thì raise `GEMINI_UNAVAILABLE`,
-- không sinh ảnh giả,
-- không bịa logo placeholder để lấp trạng thái.
-
-Chỗ duy nhất mang tính heuristic là prompt directive:
-
-- ép brand text phải đúng,
-- giảm gibberish lettering,
-- ràng buộc style/colors/constraints để kết quả ổn định hơn.
-
-Đây là heuristic cho generation, không phải fallback dữ liệu.
-
-## UI layer
-
-### File
-
-- [streamlit_logo_flow_demo.py](../../streamlit_logo_flow_demo.py)
-
-### UI làm gì
-
-UI là demo Streamlit, không phải source of truth của backend.
-
-Nó làm các việc:
-
-- dựng giao diện chat,
-- submit input,
-- stream reasoning chunk,
-- render reference images,
-- render canvas,
-- giữ chat history trong `st.session_state`.
-
-### Đánh giá fallback ở UI
-
-UI có fallback render hợp lý:
-
-- nếu upload file thì render bytes trực tiếp,
-- nếu là local file path thì resolve path,
-- nếu là remote URL thì thử download,
-- nếu download fail thì để browser thử load URL.
-
-Đây là resilience cho UI, không phải bịa data.
-
-## Đánh giá theo file
-
-### Sạch và chấp nhận được
-
-- [source/tasks/logo_generate.py](../../source/tasks/logo_generate.py)
-- [source/context/session_store.py](../../source/context/session_store.py)
-- [source/services/shared/lifecycle_status.py](../../source/services/shared/lifecycle_status.py)
-- [source/services/shared/payload_assembler.py](../../source/services/shared/payload_assembler.py)
-- [source/services/stage_a/checkpoint.py](../../source/services/stage_a/checkpoint.py)
-- [source/services/stage_b/web_research_service.py](../../source/services/stage_b/web_research_service.py)
-- [source/services/stage_b/research_clients.py](../../source/services/stage_b/research_clients.py)
-- [source/services/stage_c/orchestrator.py](../../source/services/stage_c/orchestrator.py)
-- [source/services/stage_c/generator.py](../../source/services/stage_c/generator.py)
-
-### Sạch nhưng có fallback có chủ đích
-
-- [source/services/stage_a/toolset.py](../../source/services/stage_a/toolset.py): clarification fallback mặc định nếu LLM fail,
-- [source/services/stage_a/orchestrator.py](../../source/services/stage_a/orchestrator.py): reuse session context cho follow-up,
-- [streamlit_logo_flow_demo.py](../../streamlit_logo_flow_demo.py): fallback render ảnh local/remote,
-- [source/tasks/logo_generate.py](../../source/tasks/logo_generate.py): fallback import cho compatibility test cũ,
-- [source/config.py](../../source/config.py): default `mock` ở config, nhưng không có mock image fabrication path.
-
-### Cần dọn tiếp nếu muốn strict hơn
-
-- [source/services/stage_b/gemini_analyzer.py](../../source/services/stage_b/gemini_analyzer.py): còn helper legacy text-only/fetchability,
-- [source/services/stage_b/gemini_analyzer.py](../../source/services/stage_b/gemini_analyzer.py): prompt và branch compatibility chưa được tối giản hết.
-
-## Review sâu hơn: có heuristic/fallback bịa data không?
-
-### Không thấy bịa data ở các đường chính
-
-Tôi không thấy path nào đang:
-
-- tự dựng research result giả,
-- tự dựng guideline giả,
-- tự dựng logo image output giả,
-- hoặc giả completed status khi pipeline chưa xong.
-
-### Các fallback còn lại là gì
-
-1. Fallback clarification questions trong Stage A.
-2. Reuse session context trong cùng `session_id`.
-3. Fallback image preview trong UI.
-4. Legacy helper path trong Stage B analyzer.
-
-### Đánh giá rủi ro còn lại
-
-- Rủi ro kỹ thuật lớn nhất hiện tại là latency Stage B.
-- Rủi ro maintainability lớn nhất là `gemini_analyzer.py` còn code cũ chưa dọn.
-- Rủi ro “bịa data” thấp, vì các stage chính đều fail closed.
-
-## Kết luận cuối
-
-Nếu hỏi thẳng: `source` đã clean chưa?
-
-- Về luồng nghiệp vụ và data integrity: khá clean.
-- Về heuristic/fallback bịa data: không thấy bịa data ở đường chính.
-- Về code hygiene tuyệt đối: chưa sạch hoàn toàn, vì `source/services/stage_b/gemini_analyzer.py` còn legacy fallback/helper cần dọn tiếp.
-
-Nếu bạn muốn làm strict hơn nữa, bước kế tiếp hợp lý nhất là tối giản `gemini_analyzer.py` về một luồng duy nhất và bỏ các helper text-only / fetchability cũ không còn dùng trên main path.
