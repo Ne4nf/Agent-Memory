@@ -76,7 +76,7 @@ Key UX point:
 | Research | SerpAPI query + normalization + fetchable-image selection + Gemini analysis | Automatic query backfill when fetchable image pool is insufficient |
 | Guideline | Structured guideline inference from context + research | Guideline optimization loop |
 | Generation | Parallel option generation and storage upload | Provider auto-routing/ranking |
-| Storage/session | Session checkpoints (`SessionContextStore`) | Long-term project memory/version history |
+| Storage/session | Session checkpoints (`SessionContextStore`) + shared status/payload services | Long-term project memory/version history |
 | Editing | Deferred | Step 7 |
 | Follow-up suggestion | Deferred | Step 8 |
 
@@ -109,21 +109,34 @@ Current architecture prioritizes deterministic gating and contract-safe outputs:
 ```mermaid
 flowchart TD
   U[User Request] --> ST[POST /internal/v1/tasks/stream]
-  ST --> A1[Stage A Intent Detect]
-  A1 --> A2[Stage A Input Extraction]
-  A2 --> A3[Stage A Reference Analysis]
-  A3 --> GATE[Required Field Gate]
 
-  GATE -->|missing brand_name or industry| CL[clarification_needed chunk]
-  CL --> RC[User re-call stream with same session_id]
-  RC --> A2
+  subgraph SA[Stage A - Intake and Clarification]
+    direction TB
+    A1[IntentDetectTool]
+    A2[InputExtractionTool]
+    A3[ReferenceImageAnalyzeTool]
+    A4[Context Merge explicit > extracted > session]
+    A5[Required Field Gate brand_name + industry]
+    A6[ClarificationLoopTool]
+  end
 
-  GATE -->|passed| B1[Stage B Web Research]
-  B1 --> B2[Fetchable Image Selection]
-  B2 --> B3[Gemini Multimodal Analysis bytes-based]
-  B3 --> B4[Design Guideline Inference]
-  B4 --> C1[Stage C Parallel Option Generation]
-  C1 --> C2[Asset Upload]
+  subgraph SB[Stage B - Research and Guideline]
+    direction TB
+    B1[WebResearchService query + normalize]
+    B2[Fetchable Image Selector]
+    B3[GeminiResearchAnalyzer bytes-based]
+    B4[DesignInferenceTool]
+  end
+
+  subgraph SC[Stage C - Generation]
+    direction TB
+    C1[OptionGenerationService parallel]
+    C2[Storage persistence]
+  end
+
+  ST --> A1 --> A2 --> A3 --> A4 --> A5
+  A5 -->|missing fields| A6 --> A4
+  A5 -->|gate passed| B1 --> B2 --> B3 --> B4 --> C1 --> C2
   C2 --> DONE[completed chunk + result payload]
 ```
 
@@ -135,36 +148,64 @@ graph TD
   GW[AI Hub HTTP Gateway]
   TASK[LogoGenerateTask STREAM]
 
-  subgraph ORCH[Orchestration]
+  subgraph ORCH[Orchestration by Stage]
     direction TB
-    IA[StreamIntakeOrchestrator Stage A/B]
-    SB[StageBPipeline]
-    SC[StreamGenerationOrchestrator Stage C]
+    OA[Stage A Orchestrator StreamIntakeOrchestrator]
+    OB[Stage B Orchestrator StageBPipeline]
+    OC[Stage C Orchestrator StreamGenerationOrchestrator]
   end
 
-  subgraph TOOLS[Tool and Service Layer]
+  subgraph TOOLS[Tool and Service Layer by Stage]
     direction TB
-    TS[LogoDesignToolset]
-    WR[WebResearchService]
-    GA[GeminiResearchAnalyzer]
-    OG[OptionGenerationService]
+    TA1[Stage A IntentDetectTool]
+    TA2[Stage A InputExtractionTool]
+    TA3[Stage A ReferenceImageAnalyzeTool]
+    TA4[Stage A ClarificationLoopTool]
+    TB1[Stage B WebResearchService]
+    TB2[Stage B GeminiResearchAnalyzer]
+    TB3[Stage B DesignInferenceTool]
+    TC1[Stage C OptionGenerationService]
+    TC2[Stage C StorageTool]
+  end
+
+  subgraph SHARED[source/services/shared]
+    direction TB
+    SS1[LifecycleStatusManager]
+    SS2[AsyncPayloadAssembler]
+    SS3[DesignMemoryService]
   end
 
   CTX[(SessionContextStore)]
+  DM[(source/design.md projection)]
   LLM[Text and Multimodal LLM]
   IMG[Image Provider]
   STO[(Asset Storage)]
 
-  FE --> GW --> TASK --> IA --> SB --> SC
-  IA --> TS
-  SB --> WR --> GA
-  SC --> OG --> IMG --> STO
+  FE --> GW --> TASK --> OA --> OB --> OC
+  OA --> TA1
+  OA --> TA2
+  OA --> TA3
+  OA --> TA4
+  OB --> TB1 --> TB2 --> TB3
+  OC --> TC1 --> TC2 --> IMG --> STO
 
-  IA <--> CTX
-  SB <--> CTX
-  SC <--> CTX
-  TS --> LLM
-  GA --> LLM
+  OA --> SS1
+  OB --> SS1
+  OC --> SS1
+  OC --> SS2
+  OA --> SS3
+  OB --> SS3
+  SS3 --> DM
+
+  OA <--> CTX
+  OB <--> CTX
+  OC <--> CTX
+  TA1 --> LLM
+  TA2 --> LLM
+  TA3 --> LLM
+  TA4 --> LLM
+  TB2 --> LLM
+  TB3 --> LLM
 ```
 
 ### 3.2 Architecture principles
@@ -187,11 +228,12 @@ graph TD
 3. Checkpoints are persisted into `SessionContextStore` after key stages.
 4. Clarification follow-up reuses latest session state by `session_id`.
 5. `context_version` is used by checkpoint helper for stale-write-safe merges.
+6. `DesignMemoryService` persists per-topic snapshots into `source/design.md` at clarification and guideline checkpoints.
 
 #### 3.2.2 POC simplification notes
 
 - Planner/observer are logical roles embedded in orchestrators.
-- Stage A/B and Stage C are executed in one stream lifecycle in current runtime path.
+- Stage A, Stage B, and Stage C are executed sequentially in one stream lifecycle in current runtime path.
 - Separate async queue execution for Stage C is not implemented in current `source/tasks/logo_generate.py` flow.
 
 ### 3.3 Component breakdown (tool-level)
@@ -209,6 +251,14 @@ graph TD
 | StorageTool | Shared | Persist image outputs and return URLs | Storage API | Called in Stage C path |
 | SessionContextStore | Shared | Session checkpoint persistence | Cache/DB adapter | Used by Stage A/B/C |
 
+### 3.3.1 Shared services in source/services/shared
+
+| Shared module | Responsibility | Used by |
+| :--- | :--- | :--- |
+| `LifecycleStatusManager` | Build status payloads + progress mapping | Stage A/B/C orchestrators |
+| `AsyncPayloadAssembler` | Build completed/failed result payload contract | Stage C orchestrator |
+| `DesignMemoryService` | Persist design context snapshots to `source/design.md` | Stage A and Stage B |
+
 ### 3.4 End-to-end pipeline
 
 POC external task type: `logo_generate`.
@@ -220,24 +270,24 @@ sequenceDiagram
   actor FE as Frontend
   participant ST as Stream API
   participant T as LogoGenerateTask
-  participant A as StreamIntakeOrchestrator
-  participant B as StageBPipeline
-  participant C as StreamGenerationOrchestrator
+  participant OA as Stage A Orchestrator
+  participant OB as Stage B Orchestrator
+  participant OC as Stage C Orchestrator
 
   FE->>ST: POST /internal/v1/tasks/stream
   ST->>T: stream_process(input_args)
-  T->>A: Stage A/B chunks
-  A-->>FE: intake/extraction/merge/gate chunks
+  T->>OA: run Stage A
+  OA-->>FE: intake_started, query_extracted, context_merged, gate_evaluated
 
   alt required fields missing
-    A-->>FE: clarification_needed + suggested_questions
+    OA-->>FE: clarification_needed + suggested_questions
     FE->>ST: re-call with same session_id and updated input
   else required fields passed
-    A->>B: run web research and guideline inference
-    B-->>FE: web_research_started/completed + guideline_completed
-    T->>C: run Stage C generation
-    C-->>FE: generation_started + generation_option_ready chunks
-    C-->>FE: completed chunk with final result
+    OA->>OB: handoff gate-passed context
+    OB-->>FE: web_research_started, web_research_completed, guideline_completed
+    T->>OC: run Stage C generation
+    OC-->>FE: generation_started + generation_option_ready chunks
+    OC-->>FE: completed chunk with final result
   end
 ```
 
@@ -416,3 +466,4 @@ Mitigation:
 - Query backfill strategy when fetchable image count is below threshold.
 - Cost tracking/reporting by task/session.
 - Asset URL TTL and retention policies.
+- Session store persistence strategy: current `SessionContextStore` is in-memory and does not survive process restarts.
