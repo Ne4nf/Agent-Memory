@@ -50,6 +50,51 @@ flowchart TD
 - `LifecycleStatusManager` chuẩn hóa status chunk/progress.
 - `DesignMemoryService` ghi snapshot audit/trace.
 
+### Project Structure hiện tại (rút gọn theo luồng logo)
+
+```text
+source/
+  tasks/
+    logo_generate.py                  # SDK task adapter + stream_process
+
+  services/
+    stage_a/
+      orchestrator.py                 # Intake + gate + clarification + handoff Stage B
+      toolset.py                      # Intent/extraction/reference/clarification/guideline tools
+      checkpoint.py                   # persist_with_cas
+
+    stage_b/
+      orchestrator.py                 # StageBPipeline
+      web_research_service.py         # Query/normalize/dedupe/fetchable filtering
+      research_clients.py             # HTTP clients (SerpAPI, fetch image bytes)
+      gemini_analyzer.py              # Multimodal analysis for strategic directions
+      research_normalizer.py          # Query/result normalization helpers
+
+    stage_c/
+      orchestrator.py                 # StreamGenerationOrchestrator
+      generator.py                    # Option generation + upload
+
+    shared/
+      lifecycle_status.py             # Status/progress contract builder
+      payload_assembler.py            # Completed/failed payload builder
+      design_memory.py                # Trace snapshot projection
+
+  context/
+    session_store.py                  # SessionContextStore + context_version
+
+  schemas/
+    api.py
+    domain.py
+    status.py
+    __init__.py
+```
+
+Nhận xét nhanh:
+
+- Cấu trúc hiện tại tách theo stage rõ ràng, dễ lần theo flow runtime.
+- Một số lớp orchestrator đang kiêm cả điều phối và phát status.
+- Khi scale số feature, nguy cơ tăng coupling giữa flow decision và worker execution.
+
 ---
 
 ## 3. Từng file hiện đang làm gì
@@ -310,6 +355,61 @@ flowchart TD
 
 - Chỉ lo status, progress, chunk format, error mapping.
 - Không chứa business logic.
+
+### Project Structure đề xuất sau refactor
+
+```text
+source/
+  tasks/
+    logo_generate.py                  # Chỉ còn SDK adapter mỏng
+
+  orchestration/
+    planner/
+      logo_generate_planner.py        # Quyết định flow, gate, handoff
+      plan_types.py                   # Plan/Decision DTOs
+
+    observer/
+      stream_observer.py              # Emit chunk theo lifecycle
+      error_mapper.py                 # Mapping error_code/error_message theo stage
+
+  workers/
+    stage_a_worker.py                 # Intake worker (tool calls + merge + gate)
+    stage_b_worker.py                 # Research + guideline worker
+    stage_c_worker.py                 # Generation worker
+    worker_types.py                   # Stage result delta models
+
+  services/
+    stage_a/
+      toolset.py
+      checkpoint.py
+    stage_b/
+      web_research_service.py
+      research_clients.py
+      gemini_analyzer.py
+      research_normalizer.py
+    stage_c/
+      generator.py
+    shared/
+      lifecycle_status.py
+      payload_assembler.py
+      design_memory.py
+
+  context/
+    session_store.py
+
+  schemas/
+    api.py
+    domain.py
+    status.py
+    __init__.py
+```
+
+Nguyên tắc tách:
+
+- `orchestration/planner` chỉ quyết định làm bước nào.
+- `workers` chỉ thực thi stage và trả delta.
+- `orchestration/observer` chỉ phát status/error payload.
+- `services` giữ nguyên phần hạ tầng/tool/provider logic để giảm rủi ro rewrite.
 
 ---
 
