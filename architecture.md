@@ -115,9 +115,10 @@ flowchart TD
     A1[IntentDetectTool]
     A2[InputExtractionTool]
     A3[ReferenceImageAnalyzeTool]
-    A4[Context Merge explicit > extracted > session]
-    A5[Required Field Gate brand_name + industry]
-    A6[ClarificationLoopTool]
+    A4[asyncio.gather after intent passes]
+    A5[Context Merge explicit > extracted > session]
+    A6[Required Field Gate brand_name + industry]
+    A7[ClarificationLoopTool]
   end
 
   subgraph SB[Stage B - Research and Guideline]
@@ -134,9 +135,14 @@ flowchart TD
     C2[Storage persistence]
   end
 
-  ST --> A1 --> A2 --> A3 --> A4 --> A5
-  A5 -->|missing fields| A6 --> A4
-  A5 -->|gate passed| B1 --> B2 --> B3 --> B4 --> C1 --> C2
+  ST --> A1 --> A4
+  A4 --> A2
+  A4 --> A3
+  A2 --> A5
+  A3 --> A5
+  A5 --> A6
+  A6 -->|missing fields| A7 --> A5
+  A6 -->|gate passed| B1 --> B2 --> B3 --> B4 --> C1 --> C2
   C2 --> DONE[completed chunk + result payload]
 ```
 
@@ -170,26 +176,12 @@ graph TD
     C2[StorageTool]
   end
 
-  subgraph SHARED[source/services/shared]
-    direction TB
-    S1[LifecycleStatusManager]
-    S2[AsyncPayloadAssembler]
-    S3[DesignMemoryService]
-  end
-
   CTX[(SessionContextStore)]
   DM[(source/design.md)]
   LLM[Text / Multimodal LLM]
   IMG[Image Provider]
 
   FE --> TASK --> A --> B --> C
-  A --> S1
-  B --> S1
-  C --> S1
-  C --> S2
-  A --> S3
-  B --> S3
-  S3 --> DM
 
   A <--> CTX
   B <--> CTX
@@ -202,6 +194,12 @@ graph TD
   C1 --> IMG
   C2 --> IMG
 ```
+
+Shared helpers used behind the scenes:
+
+- `LifecycleStatusManager` builds status payloads and progress values for Stage A/B/C.
+- `AsyncPayloadAssembler` assembles the final `JobStatusResponse` in Stage C.
+- `DesignMemoryService` writes trace snapshots to `source/design.md` at clarification and guideline checkpoints.
 
 ### 3.2 Architecture principles
 
@@ -251,7 +249,7 @@ graph TD
 
 Ghi chú:
 
-- `shared` ở đây nghĩa là helper/hạ tầng dùng chung cho orchestrator và status contract, không bắt buộc phải được gọi bởi nhiều stage.
+- `shared` ở đây nghĩa là helper/hạ tầng dùng chung cho orchestrator và status contract, không cần vẽ vào diagram chính nếu chỉ làm reviewer rối.
 
 | Shared module | Responsibility | Used by |
 | :--- | :--- | :--- |
@@ -300,7 +298,7 @@ sequenceDiagram
 | Output | Gate-passed merged context or clarification chunk |
 | Gate | `brand_name` AND `industry` must be present |
 | Ordering | Clarification happens before any Stage B web research |
-| Execution model | In current source, `InputExtractionTool` and `ReferenceImageAnalyzeTool` are awaited sequentially inside Stage A; they are not parallelized |
+| Execution model | In current source, `InputExtractionTool` and `ReferenceImageAnalyzeTool` run in parallel with `asyncio.gather()` after intent detection passes |
 
 #### 3.4.3 Stage B - Web research and guideline inference (Step 2.5 + Step 4)
 
