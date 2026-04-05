@@ -115,7 +115,6 @@ flowchart TD
     A1[IntentDetectTool]
     A2[InputExtractionTool]
     A3[ReferenceImageAnalyzeTool]
-    A4[asyncio.gather after intent passes]
     A5[Context Merge explicit > extracted > session]
     A6[Required Field Gate brand_name + industry]
     A7[ClarificationLoopTool]
@@ -135,9 +134,9 @@ flowchart TD
     C2[Storage persistence]
   end
 
-  ST --> A1 --> A4
-  A4 --> A2
-  A4 --> A3
+  ST --> A1
+  A1 --> A2
+  A1 --> A3
   A2 --> A5
   A3 --> A5
   A5 --> A6
@@ -177,7 +176,6 @@ graph TD
   end
 
   CTX[(SessionContextStore)]
-  DM[(source/design.md)]
   LLM[Text / Multimodal LLM]
   IMG[Image Provider]
 
@@ -247,9 +245,9 @@ Shared helpers used behind the scenes:
 
 ### 3.3.1 Shared services in source/services/shared
 
-Ghi chú:
+Note:
 
-- `shared` ở đây nghĩa là helper/hạ tầng dùng chung cho orchestrator và status contract, không cần vẽ vào diagram chính nếu chỉ làm reviewer rối.
+- `shared` here means common helper/infrastructure modules for orchestrators and status contracts. They do not need to appear in the main diagram when that adds reviewer noise.
 
 | Shared module | Responsibility | Used by |
 | :--- | :--- | :--- |
