@@ -145,67 +145,62 @@ flowchart TD
 ```mermaid
 graph TD
   FE[Frontend or Streamlit UI]
-  GW[AI Hub HTTP Gateway]
-  TASK[LogoGenerateTask STREAM]
+  TASK[POST /internal/v1/tasks/stream]
 
-  subgraph ORCH[Orchestration by Stage]
+  subgraph A[Stage A - Intake]
     direction TB
-    OA[Stage A Orchestrator StreamIntakeOrchestrator]
-    OB[Stage B Orchestrator StageBPipeline]
-    OC[Stage C Orchestrator StreamGenerationOrchestrator]
+    A1[IntentDetectTool]
+    A2[InputExtractionTool]
+    A3[ReferenceImageAnalyzeTool]
+    A4[ClarificationLoopTool]
+    A5[Required Field Gate]
   end
 
-  subgraph TOOLS[Tool and Service Layer by Stage]
+  subgraph B[Stage B - Research]
     direction TB
-    TA1[Stage A IntentDetectTool]
-    TA2[Stage A InputExtractionTool]
-    TA3[Stage A ReferenceImageAnalyzeTool]
-    TA4[Stage A ClarificationLoopTool]
-    TB1[Stage B WebResearchService]
-    TB2[Stage B GeminiResearchAnalyzer]
-    TB3[Stage B DesignInferenceTool]
-    TC1[Stage C OptionGenerationService]
-    TC2[Stage C StorageTool]
+    B1[WebResearchService]
+    B2[Fetchable Image Selection]
+    B3[GeminiResearchAnalyzer]
+    B4[DesignInferenceTool]
+  end
+
+  subgraph C[Stage C - Generation]
+    direction TB
+    C1[OptionGenerationService]
+    C2[StorageTool]
   end
 
   subgraph SHARED[source/services/shared]
     direction TB
-    SS1[LifecycleStatusManager]
-    SS2[AsyncPayloadAssembler]
-    SS3[DesignMemoryService]
+    S1[LifecycleStatusManager]
+    S2[AsyncPayloadAssembler]
+    S3[DesignMemoryService]
   end
 
   CTX[(SessionContextStore)]
-  DM[(source/design.md projection)]
-  LLM[Text and Multimodal LLM]
+  DM[(source/design.md)]
+  LLM[Text / Multimodal LLM]
   IMG[Image Provider]
-  STO[(Asset Storage)]
 
-  FE --> GW --> TASK --> OA --> OB --> OC
-  OA --> TA1
-  OA --> TA2
-  OA --> TA3
-  OA --> TA4
-  OB --> TB1 --> TB2 --> TB3
-  OC --> TC1 --> TC2 --> IMG --> STO
+  FE --> TASK --> A --> B --> C
+  A --> S1
+  B --> S1
+  C --> S1
+  C --> S2
+  A --> S3
+  B --> S3
+  S3 --> DM
 
-  OA --> SS1
-  OB --> SS1
-  OC --> SS1
-  OC --> SS2
-  OA --> SS3
-  OB --> SS3
-  SS3 --> DM
-
-  OA <--> CTX
-  OB <--> CTX
-  OC <--> CTX
-  TA1 --> LLM
-  TA2 --> LLM
-  TA3 --> LLM
-  TA4 --> LLM
-  TB2 --> LLM
-  TB3 --> LLM
+  A <--> CTX
+  B <--> CTX
+  C <--> CTX
+  A1 --> LLM
+  A2 --> LLM
+  A3 --> LLM
+  B3 --> LLM
+  B4 --> LLM
+  C1 --> IMG
+  C2 --> IMG
 ```
 
 ### 3.2 Architecture principles
@@ -229,6 +224,7 @@ graph TD
 4. Clarification follow-up reuses latest session state by `session_id`.
 5. `context_version` is used by checkpoint helper for stale-write-safe merges.
 6. `DesignMemoryService` persists per-topic snapshots into `source/design.md` at clarification and guideline checkpoints.
+7. `source/design.md` is an audit/trace projection only; it is not read back to restore runtime context after process shutdown.
 
 #### 3.2.2 POC simplification notes
 
@@ -253,10 +249,14 @@ graph TD
 
 ### 3.3.1 Shared services in source/services/shared
 
+Ghi chú:
+
+- `shared` ở đây nghĩa là helper/hạ tầng dùng chung cho orchestrator và status contract, không bắt buộc phải được gọi bởi nhiều stage.
+
 | Shared module | Responsibility | Used by |
 | :--- | :--- | :--- |
 | `LifecycleStatusManager` | Build status payloads + progress mapping | Stage A/B/C orchestrators |
-| `AsyncPayloadAssembler` | Build completed/failed result payload contract | Stage C orchestrator |
+| `AsyncPayloadAssembler` | Build completed/failed JobStatusResponse payload contract | Stage C orchestrator |
 | `DesignMemoryService` | Persist design context snapshots to `source/design.md` | Stage A and Stage B |
 
 ### 3.4 End-to-end pipeline
@@ -300,6 +300,7 @@ sequenceDiagram
 | Output | Gate-passed merged context or clarification chunk |
 | Gate | `brand_name` AND `industry` must be present |
 | Ordering | Clarification happens before any Stage B web research |
+| Execution model | In current source, `InputExtractionTool` and `ReferenceImageAnalyzeTool` are awaited sequentially inside Stage A; they are not parallelized |
 
 #### 3.4.3 Stage B - Web research and guideline inference (Step 2.5 + Step 4)
 
