@@ -1,271 +1,323 @@
-# Source Architecture Summary - Logo Design Full Flow (As-Built)
+# Source Architecture Summary - Full Flow trong `source`
 
-Tai lieu nay mo ta duy nhat flow dang chay that trong code hien tai sau khi da clean path du.
-Muc tieu: doc 1 lan de hieu he thong chay nhu the nao, file nao giu logic gi, va call path cu the di qua dau.
+Tai lieu nay chi tap trung vao module `source`, mo ta ro:
 
-## 1. Tong quan nhanh
+1. Full flow chay nhu the nao.
+2. File nao chua ham gi trong full flow.
+3. Moi file quan trong dong vai tro gi.
+4. Vi du case cu the de de hinh dung.
 
-Flow hien tai la stream-first, chay tron bo Stage A -> Stage B -> Stage C trong mot request stream:
+## 1. Full flow tong quan (chay that trong code hien tai)
 
-1. UI tao `LogoGenerateInput` va goi `LogoGenerateTask.stream_process()`.
-2. Task chuyen input sang planner.
-3. Planner dieu phoi Stage A worker (intake/gate).
-4. Neu thieu required fields thi dung o clarification.
-5. Neu pass gate thi chay Stage B worker (research + guideline).
-6. Sau guideline thi chay Stage C worker (generate option theo stream).
-7. Cuoi cung tra chunk `completed` voi payload day du.
+Flow hien tai la stream end-to-end:
+
+1. UI tao `LogoGenerateInput`.
+2. UI goi `LogoGenerateTask.stream_process(...)`.
+3. Task day request vao planner.
+4. Planner chay Stage A -> Stage B -> Stage C.
+5. Moi stage emit chunk theo thoi gian thuc.
+6. Ket thuc bang chunk `completed` chua output cuoi.
 
 Luu y quan trong:
 
-- Stage B da la async-only trong runtime hien tai.
-- Nhung sync path cu cua Stage B da duoc bo.
-- Planner khong con flag include_generation trong full flow hien tai, Stage C la path mac dinh.
+- Stage B hien tai la async-only.
+- Stage C van chay parallel cho generate option.
+- Session context duoc luu trong memory de clarification follow-up.
 
-## 2. End-to-end call path chi tiet
+## 2. Call path cu the theo file/ham
 
-### 2.1 Tu UI den task
+### 2.1 Entry point task
 
-- `streamlit_logo_design.py` tao input:
-  - `LogoGenerateInput(session_id, query, references, variation_count)`
-- UI goi:
-  - `LogoGenerateTask.stream_process(...)`
+File: `source/tasks/logo_generate.py`
 
-### 2.2 Task adapter
+Ham quan trong:
 
-- `source/tasks/logo_generate.py`
-- Vai tro:
-  - Khoi tao singleton dependency (`initialize()`)
-  - Build planner qua `build_logo_generate_planner(...)`
-  - Stream tung chunk planner tra ve
-  - Neu fail thi map sang output failed chunk
+- `LogoGenerateTask.initialize()`:
+  - Tao `SessionContextStore`, `LifecycleStatusManager`.
+  - Tao `LogoDesignToolset`, `WebResearchService`, `OptionGenerationService`.
+  - Build planner qua `build_logo_generate_planner(...)`.
 
-Call path:
+- `LogoGenerateTask.stream_process(...)`:
+  - Nhan `LogoGenerateInput`.
+  - Tao `request_body`.
+  - `async for chunk in self._planner.iter_chunks(request_body)`.
+  - Wrap tung chunk thanh `LogoGenerateTaskOutput`.
 
-- `stream_process()`
-  - tao `request_body`
-  - `async for chunk in self._planner.iter_chunks(request_body)`
-  - wrap thanh `LogoGenerateTaskOutput`
+Tac dung:
 
-### 2.3 Planner orchestration
+- Day la adapter voi ai_hub_sdk, khong xu ly nghiep vu logo o day.
 
-- `source/orchestration/planner/logo_generate_planner.py`
-- Vai tro:
-  - Dieu phoi thu tu stage
-  - Khong xu ly nghiep vu nang
-  - Emit processing/failed/completed chunk qua observer
+### 2.2 Planner dieu phoi
 
-Call path trong `iter_chunks()`:
+File: `source/orchestration/planner/logo_generate_planner.py`
 
-1. Parse input + lay previous session state.
-2. Emit intake chunk.
-3. `await self._stage_a_worker.run(...)`.
-4. Neu not logo intent hoac gate fail -> emit clarification chunk + return.
-5. Emit web_research_started.
-6. `await self._stage_b_worker.run(...)`.
-7. Emit web_research_completed + guideline_completed.
-8. `async for chunk in self._stage_c_worker.iter_chunks(...)`.
+Ham quan trong:
 
-## 3. Stage A chi tiet
+- `iter_chunks(request_body)`:
+  - Parse input.
+  - Lay previous context trong session store.
+  - Emit chunk intake.
+  - `await stage_a_worker.run(...)`.
+  - Neu fail gate thi emit clarification + dung.
+  - Neu pass gate thi emit web_research_started.
+  - `await stage_b_worker.run(...)`.
+  - Emit web_research_completed + guideline_completed.
+  - `async for chunk in stage_c_worker.iter_chunks(...)`.
 
-### 3.1 Worker
+Tac dung:
 
-- `source/workers/stage_a_worker.py`
-- Vai tro:
-  - Intent detect
-  - Extract + reference analysis song song
-  - Merge explicit fields + extracted + session fallback
-  - Required-field gate (`brand_name`, `industry`)
-  - Persist checkpoint clarification neu gate fail
+- Dieu phoi thu tu stage.
+- Map exception thanh failed chunk qua observer.
+- Khong chua logic LLM hay logic research chi tiet.
 
-### 3.2 Toolset va runtime
+### 2.3 Observer stream payload
 
-- `source/services/stage_a/toolset.py`
-- `source/services/stage_a/llm_runtime.py`
+File: `source/orchestration/observer/stream_observer.py`
 
-Diem chinh:
+Ham quan trong:
 
-- Toolset hien tai dung async methods trong full flow:
-  - `detect_intent_async(...)`
-  - `extract_inputs_async(...)`
-  - `analyze_references_async(...)`
-  - `build_clarification_questions_async(...)`
-  - `infer_guideline_async(...)`
-- Runtime helper dung async path JSON tool call.
+- `processing(...)`
+- `failed_from_exception(...)`
 
-### 3.3 Checkpoint helper
+Tac dung:
 
-- `source/services/stage_a/checkpoint.py`
-- Vai tro:
-  - `persist_with_cas(...)`
-  - upsert state theo `context_version`
-  - retry conflict de tranh stale write
+- Chuan hoa payload chunk (`status`, `progress_percent`, `metadata`, `error_code`, `error_message`).
 
-## 4. Stage B chi tiet (async-only)
+File: `source/orchestration/observer/error_mapper.py`
 
-### 4.1 Worker
+- `split_error_code_message(...)` de tach `CODE: message`.
 
-- `source/workers/stage_b_worker.py`
-- Call path:
-  - `await self._web_research_service.run_async(...)`
-  - enrich optional fields neu context con thieu
-  - `await self._toolset.infer_guideline_async(...)`
-  - persist checkpoint guideline + research context
+## 3. Stage A - Intake/Gate
 
-### 4.2 Web research service
+### 3.1 Worker Stage A
 
-- `source/services/stage_b/web_research_service.py`
-- Path chinh:
-  - `run_async(...)`
-    - build queries
-    - `asyncio.gather` goi `search_async` cho tung query
-    - `_finalize_context_async(...)`
-      - dedupe source/image
-      - `_select_fetchable_images_async(...)`
-      - `await self._gemini.analyze_async(...)`
-      - build `ResearchContext`
+File: `source/workers/stage_a_worker.py`
 
-### 4.3 External clients
+Ham quan trong:
 
-- `source/services/stage_b/research_clients.py`
-- Vai tro:
-  - `search_async(query)` goi SerpAPI
-  - `can_fetch_image_async(image_url)` probe URL anh
+- `run(input_data, previous)`
 
-Image fetchability policy hien tai:
+Logic:
 
-- uu tien HEAD check
-- fallback GET stream de check header
-- chi can status + content-type image
-- khong download full body o buoc can_fetch
+1. Goi intent detect.
+2. Chay song song:
+  - extract input tu query
+  - phan tich reference image
+3. Merge context:
+  - explicit field tu request
+  - extracted field tu model
+  - fallback tu previous session neu la clarification follow-up
+4. Gate required fields (`brand_name`, `industry`).
+5. Neu fail gate, persist checkpoint de lan sau resume.
+
+### 3.2 Toolset Stage A
+
+File: `source/services/stage_a/toolset.py`
+
+Cac ham full flow dung:
+
+- `detect_intent_async(...)`
+- `extract_inputs_async(...)`
+- `analyze_references_async(...)`
+- `build_clarification_questions_async(...)`
+- `infer_guideline_async(...)`
+
+Tac dung:
+
+- Day la noi dong goi prompt va parse output cho domain logo.
+
+### 3.3 Runtime helper Stage A
+
+File: `source/services/stage_a/llm_runtime.py`
+
+Ham quan trong:
+
+- `_call_json_tool_async(...)`
+
+Tac dung:
+
+- Goi LLM async, ep output ve JSON object/list, throw `ToolExecutionError` neu payload loi.
+
+### 3.4 CAS checkpoint helper
+
+File: `source/services/stage_a/checkpoint.py`
+
+Ham quan trong:
+
+- `persist_with_cas(...)`
+
+Tac dung:
+
+- Ghi state theo `context_version` de tranh stale write.
+
+## 4. Stage B - Research + Guideline (async-only)
+
+### 4.1 Worker Stage B
+
+File: `source/workers/stage_b_worker.py`
+
+Ham quan trong:
+
+- `run(...)`
+
+Logic:
+
+1. Xac dinh optional fields con thieu (`style/color/symbol/typography`).
+2. Goi `await web_research_service.run_async(...)`.
+3. Enrich context tu research output neu con thieu field.
+4. Goi `await toolset.infer_guideline_async(...)`.
+5. Persist checkpoint gom context + guideline + research context.
+
+### 4.2 WebResearchService
+
+File: `source/services/stage_b/web_research_service.py`
+
+Ham quan trong:
+
+- `run_async(context, requested_optional_fields)`
+- `_select_fetchable_images_async(...)`
+- `_finalize_context_async(...)`
+
+Logic chi tiet:
+
+1. Build query list tu context.
+2. `asyncio.gather` goi SerpAPI cho moi query.
+3. Gop ket qua, dedupe sources/images.
+4. Loc top image fetchable.
+5. Goi Gemini analyzer async.
+6. Build `ResearchContext` (queries, top_images, market_analysis, strategic_directions, takeaways, citations).
+
+### 4.3 Research client
+
+File: `source/services/stage_b/research_clients.py`
+
+Ham quan trong:
+
+- `search_async(query)`
+- `can_fetch_image_async(image_url)`
+
+Logic image fetchability:
+
+1. Thu `HEAD` truoc.
+2. Neu host khong support thi fallback `GET` stream.
+3. Chi check header status + content-type image.
+4. Khong download full body o buoc can_fetch.
 
 ### 4.4 Gemini analyzer
 
-- `source/services/stage_b/gemini_analyzer.py`
-- Vai tro:
-  - Download image bytes async
-  - Gui multimodal request cho Gemini
-  - Parse JSON output
-  - Aggregate market analysis + strategic directions + extracted signals
+File: `source/services/stage_b/gemini_analyzer.py`
 
-Path chinh:
+Ham quan trong:
 
 - `analyze_async(...)`
-  - tao tasks `_analyze_single_image_async(...)`
-  - `await asyncio.gather(*tasks)`
-  - `_aggregate_analysis_rows(...)`
+- `_analyze_single_image_async(...)`
+- `_download_image_bytes_async(...)`
+- `_aggregate_analysis_rows(...)`
+
+Logic:
+
+1. Moi image duoc analyze rieng.
+2. Download bytes that su cho buoc multimodal.
+3. Goi Gemini va parse JSON.
+4. Tong hop thanh ket qua cuoi Stage B.
 
 Luu y:
 
-- Sync path cu da duoc bo.
-- Full flow hien tai chi dung async methods.
+- Sync path Stage B da duoc bo trong code hien tai.
 
-## 5. Stage C chi tiet
+## 5. Stage C - Generate option
 
-### 5.1 Worker
+### 5.1 Worker Stage C
 
-- `source/workers/stage_c_worker.py`
-- Vai tro:
-  - validate guideline checkpoint
-  - emit `generation_started`
-  - stream tung `generation_option_ready`
-  - assemble completed payload
+File: `source/workers/stage_c_worker.py`
+
+Ham quan trong:
+
+- `iter_chunks(task_id, input_args)`
+
+Logic:
+
+1. Lay guideline da checkpoint.
+2. Emit `generation_started`.
+3. `async for option in option_generation_service.iter_generate_async(...)`.
+4. Moi option emit 1 chunk `generation_option_ready`.
+5. Cuoi cung assemble payload completed.
 
 ### 5.2 Generator
 
-- `source/services/stage_c/generator.py`
-- Vai tro:
-  - build prompt option theo concept variant
-  - goi Gemini image generation
-  - persist asset
-  - tra `LogoOption`
+File: `source/services/stage_c/generator.py`
 
-Parallel path:
+Ham quan trong:
 
 - `iter_generate_async(...)`
-  - tao list task qua `asyncio.to_thread(...)`
-  - consume theo `asyncio.as_completed(...)`
+- `_generate_single_option(...)`
 
-Hanh vi UI chunk:
+Logic parallel:
 
-- Option nao xong truoc se phat chunk truoc.
-- Nen 1/3, 2/3, 3/3 la stream incremental dung thiet ke.
+1. Tao task bang `asyncio.to_thread(...)` cho tung concept.
+2. Consume theo `asyncio.as_completed(...)`.
+3. Option nao xong truoc emit truoc.
 
-## 6. Observer + Shared services
+Y nghia voi UI:
 
-### 6.1 Observer
+- Timeline 1/3 -> 2/3 -> 3/3 la dung theo stream incremental.
 
-- `source/orchestration/observer/stream_observer.py`
-- Vai tro:
-  - tao payload processing/completed/failed
-  - chuan hoa metadata stage
-  - tach error code/message
+## 6. Shared va session context
 
-- `source/orchestration/observer/error_mapper.py`
-  - helper tach prefix error dang `CODE: message`
+### 6.1 Shared status/payload
 
-### 6.2 Shared
+File: `source/services/shared/lifecycle_status.py`
 
-- `source/services/shared/lifecycle_status.py`
-  - `LifecycleStatusManager`
-  - map status -> progress
-  - build `JobStatusResponse`
+- `LifecycleStatusManager`:
+  - `resolve_progress(...)`
+  - `build_status_response(...)`
 
-- `source/services/shared/payload_assembler.py`
-  - `AsyncPayloadAssembler`
-  - build completed payload
-  - build failed payload
+File: `source/services/shared/payload_assembler.py`
 
-## 7. Session state va schema layer
+- `AsyncPayloadAssembler`:
+  - Build payload completed/failed cho output cuoi.
 
-### 7.1 Session context
+### 6.2 Session store
 
-- `source/context/session_store.py`
-- Class:
-  - `SessionContextStore`
-  - `ContextVersionConflictError`
+File: `source/context/session_store.py`
 
-Dung trong full flow:
+Cac ham full flow dung:
 
-- `get(session_id)` de resume clarification
-- `upsert(state, expected_context_version=...)` de CAS-safe checkpoint
+- `get(session_id)`
+- `upsert(state, expected_context_version=...)`
 
-### 7.2 Schema
+Tac dung:
 
-- `source/schemas/domain.py`
-  - `LogoGenerateInput` (TaskInputBaseModel)
-  - `BrandContext`, `RequiredFieldState`, `DesignGuideline`, `ResearchContext`, `LogoOption`, `LogoGenerateOutput`
-- `source/schemas/api.py`
-  - status/request payload contracts
-- `source/schemas/status.py`
-  - `SessionContextState`
+- Luu checkpoint clarification/guideline trong memory.
 
-## 8. UI Streamlit hien tai va latency notes
+## 7. Vi du case cu the de de hieu
 
-- File: `streamlit_logo_design.py`
+Case:
 
-Flow UI:
+- User nhap: "Thiet ke logo cho Lumi Cafe, phong cach toi gian, tong mau nau kem."
 
-1. Tao input + references tu text, upload, URL.
-2. Goi async task stream qua `_run_chat_turn(...)`.
-3. Moi chunk cap nhat:
-  - timeline
-  - thinking text
-  - progress
-  - gallery/canvas
+Flow:
 
-Cac diem da clean de giam latency web-search rendering:
+1. Stage A:
+  - detect intent -> logo request.
+  - extract duoc `brand_name=Lumi Cafe`, `industry=cafe`.
+  - gate pass vi du required fields.
 
-- Giam render lai reference gallery trong luc stream:
-  - chi render khi doi stage va stage nam trong nhom can preview.
-- Giam so card preview reference:
-  - user refs va web refs deu limit 3.
-- Don gian hoa remote image fetch:
-  - dung 1 HTTPX pass timeout ngan hon.
-  - bo fallback urllib de tranh wait keo dai trong UI loop.
+2. Stage B:
+  - build query trend/logo cafe.
+  - search async nhieu query.
+  - loc top image fetchable.
+  - analyze async tung image bang Gemini.
+  - infer guideline tu context + research.
 
-## 9. Danh sach file quan trong nhat can doc truoc
+3. Stage C:
+  - generate 3 options song song.
+  - UI nhan chunk option theo thu tu hoan thanh (khong nhat thiet theo seed).
+  - assembler tra completed payload.
 
-Neu muon onboard nhanh, nen doc theo thu tu:
+## 8. Danh sach file nen doc theo thu tu
+
+Neu onboard nhanh, nen doc theo thu tu sau:
 
 1. `source/tasks/logo_generate.py`
 2. `source/orchestration/planner/logo_generate_planner.py`
@@ -278,9 +330,9 @@ Neu muon onboard nhanh, nen doc theo thu tu:
 9. `source/services/stage_c/generator.py`
 10. `source/context/session_store.py`
 
-## 10. Ket luan ky thuat
+## 9. Ket luan
 
-1. Full flow hien tai la async stream end-to-end trong mot task execution.
-2. Stage B la async-only path; sync path cu da duoc clean.
-3. Stage C van parallel generation va stream incremental dung semantics.
-4. Architecture hien tai de doc va trace call path ro rang hon sau khi bo path du.
+1. Full flow trong `source` hien tai da ro rang theo Task -> Planner -> Workers -> Services.
+2. Stage B la async-only va da bo path du sync.
+3. Stage C stream incremental + parallel generation dung semantics.
+4. Viec trace loi va review code se de hon neu bam theo call path trong tai lieu nay.
