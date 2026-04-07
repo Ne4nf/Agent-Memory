@@ -1,780 +1,268 @@
-# Source Architecture Summary - Full Flow trong `source`
-
-Tai lieu nay chi tap trung vao module `source`, mo ta ro:
-
-1. Full flow chay nhu the nao.
-2. File nao chua ham gi trong full flow.
-3. Moi file quan trong dong vai tro gi.
-4. Vi du case cu the de de hinh dung.
-
-## 1. Full flow tong quan (chay that trong code hien tai)
-
-Flow hien tai la stream end-to-end:
-
-1. UI tao `LogoGenerateInput`.
-2. UI goi `LogoGenerateTask.stream_process(...)`.
-3. Task day request vao planner.
-4. Planner chay Stage A -> Stage B -> Stage C.
-5. Moi stage emit chunk theo thoi gian thuc.
-6. Ket thuc bang chunk `completed` chua output cuoi.
-
-Luu y quan trong:
-
-- Stage B hien tai la async-only.
-- Stage C van chay parallel cho generate option.
-- Session context duoc luu trong memory de clarification follow-up.
-
-## 2. Call path cu the theo file/ham
-
-### 2.1 Entry point task
-
-File: `source/tasks/logo_generate.py`
-
-Ham quan trong:
-
-- `LogoGenerateTask.initialize()`:
-  - Tao `SessionContextStore`, `LifecycleStatusManager`.
-  - Tao `LogoDesignToolset`, `WebResearchService`, `OptionGenerationService`.
-  - Build planner qua `build_logo_generate_planner(...)`.
-
-- `LogoGenerateTask.stream_process(...)`:
-  - Nhan `LogoGenerateInput`.
-  - Tao `request_body`.
-  - `async for chunk in self._planner.iter_chunks(request_body)`.
-  - Wrap tung chunk thanh `LogoGenerateTaskOutput`.
-
-Tac dung:
-
-- Day la adapter voi ai_hub_sdk, khong xu ly nghiep vu logo o day.
-
-### 2.2 Planner dieu phoi
-
-File: `source/orchestration/planner/logo_generate_planner.py`
-
-Ham quan trong:
-
-- `iter_chunks(request_body)`:
-  - Parse input.
-  - Lay previous context trong session store.
-  - Emit chunk intake.
-  - `await stage_a_worker.run(...)`.
-  - Neu fail gate thi emit clarification + dung.
-  - Neu pass gate thi emit web_research_started.
-  - `await stage_b_worker.run(...)`.
-  - Emit web_research_completed + guideline_completed.
-  - `async for chunk in stage_c_worker.iter_chunks(...)`.
-
-Tac dung:
-
-- Dieu phoi thu tu stage.
-- Map exception thanh failed chunk qua observer.
-- Khong chua logic LLM hay logic research chi tiet.
-
-### 2.3 Observer stream payload
-
-File: `source/orchestration/observer/stream_observer.py`
-
-Ham quan trong:
-
-- `processing(...)`
-- `failed_from_exception(...)`
-
-Tac dung:
-
-- Chuan hoa payload chunk (`status`, `progress_percent`, `metadata`, `error_code`, `error_message`).
-
-File: `source/orchestration/observer/error_mapper.py`
-
-- `split_error_code_message(...)` de tach `CODE: message`.
-
-## 3. Stage A - Intake/Gate
-
-### 3.1 Worker Stage A
-
-File: `source/workers/stage_a_worker.py`
-
-Ham quan trong:
-
-- `run(input_data, previous)`
-
-Logic:
-
-1. Goi intent detect.
-2. Chay song song:
-  - extract input tu query
-  - phan tich reference image
-3. Merge context:
-  - explicit field tu request
-  - extracted field tu model
-  - fallback tu previous session neu la clarification follow-up
-4. Gate required fields (`brand_name`, `industry`).
-5. Neu fail gate, persist checkpoint de lan sau resume.
-
-### 3.2 Toolset Stage A
-
-File: `source/services/stage_a/toolset.py`
-
-Cac ham full flow dung:
-
-- `detect_intent_async(...)`
-- `extract_inputs_async(...)`
-- `analyze_references_async(...)`
-- `build_clarification_questions_async(...)`
-- `infer_guideline_async(...)`
-
-Tac dung:
-
-- Day la noi dong goi prompt va parse output cho domain logo.
-
-### 3.3 Runtime helper Stage A
-
-File: `source/services/stage_a/llm_runtime.py`
-
-Ham quan trong:
-
-- `_call_json_tool_async(...)`
-
-Tac dung:
-
-- Goi LLM async, ep output ve JSON object/list, throw `ToolExecutionError` neu payload loi.
-
-### 3.4 CAS checkpoint helper
-
-File: `source/services/stage_a/checkpoint.py`
-
-Ham quan trong:
-
-- `persist_with_cas(...)`
-
-Tac dung:
-
-- Ghi state theo `context_version` de tranh stale write.
-
-## 4. Stage B - Research + Guideline (async-only)
-
-### 4.1 Worker Stage B
-
-File: `source/workers/stage_b_worker.py`
-
-Ham quan trong:
-
-- `run(...)`
-
-Logic:
-
-1. Xac dinh optional fields con thieu (`style/color/symbol/typography`).
-2. Goi `await web_research_service.run_async(...)`.
-3. Enrich context tu research output neu con thieu field.
-4. Goi `await toolset.infer_guideline_async(...)`.
-5. Persist checkpoint gom context + guideline + research context.
-
-### 4.2 WebResearchService
-
-File: `source/services/stage_b/web_research_service.py`
-
-Ham quan trong:
-
-- `run_async(context, requested_optional_fields)`
-- `_select_fetchable_images_async(...)`
-- `_finalize_context_async(...)`
-
-Logic chi tiet:
-
-1. Build query list tu context.
-2. `asyncio.gather` goi SerpAPI cho moi query.
-3. Gop ket qua, dedupe sources/images.
-4. Loc top image fetchable.
-5. Goi Gemini analyzer async.
-6. Build `ResearchContext` (queries, top_images, market_analysis, strategic_directions, takeaways, citations).
-
-### 4.3 Research client
-
-File: `source/services/stage_b/research_clients.py`
-
-Ham quan trong:
-
-- `search_async(query)`
-- `can_fetch_image_async(image_url)`
-
-Logic image fetchability:
-
-1. Thu `HEAD` truoc.
-2. Neu host khong support thi fallback `GET` stream.
-3. Chi check header status + content-type image.
-4. Khong download full body o buoc can_fetch.
-
-### 4.4 Gemini analyzer
-
-File: `source/services/stage_b/gemini_analyzer.py`
-
-Ham quan trong:
-
-- `analyze_async(...)`
-- `_analyze_single_image_async(...)`
-- `_download_image_bytes_async(...)`
-- `_aggregate_analysis_rows(...)`
-
-Logic:
-
-1. Moi image duoc analyze rieng.
-2. Download bytes that su cho buoc multimodal.
-3. Goi Gemini va parse JSON.
-4. Tong hop thanh ket qua cuoi Stage B.
-
-Luu y:
-
-- Sync path Stage B da duoc bo trong code hien tai.
-
-## 5. Stage C - Generate option
-
-### 5.1 Worker Stage C
-
-File: `source/workers/stage_c_worker.py`
-
-Ham quan trong:
-
-- `iter_chunks(task_id, input_args)`
-
-Logic:
-
-1. Lay guideline da checkpoint.
-2. Emit `generation_started`.
-3. `async for option in option_generation_service.iter_generate_async(...)`.
-4. Moi option emit 1 chunk `generation_option_ready`.
-5. Cuoi cung assemble payload completed.
-
-### 5.2 Generator
-
-File: `source/services/stage_c/generator.py`
-
-Ham quan trong:
-
-- `iter_generate_async(...)`
-- `_generate_single_option(...)`
-
-Logic parallel:
-
-1. Tao task bang `asyncio.to_thread(...)` cho tung concept.
-2. Consume theo `asyncio.as_completed(...)`.
-3. Option nao xong truoc emit truoc.
-
-Y nghia voi UI:
-
-- Timeline 1/3 -> 2/3 -> 3/3 la dung theo stream incremental.
-
-## 6. Shared va session context
-
-### 6.1 Shared status/payload
-
-File: `source/services/shared/lifecycle_status.py`
-
-- `LifecycleStatusManager`:
-  - `resolve_progress(...)`
-  - `build_status_response(...)`
-
-File: `source/services/shared/payload_assembler.py`
-
-- `AsyncPayloadAssembler`:
-  - Build payload completed/failed cho output cuoi.
-
-### 6.2 Session store
-
-File: `source/context/session_store.py`
-
-Cac ham full flow dung:
-
-- `get(session_id)`
-- `upsert(state, expected_context_version=...)`
-
-Tac dung:
-
-- Luu checkpoint clarification/guideline trong memory.
-
-## 7. Vi du case cu the de de hieu
-
-Case:
-
-- User nhap: "Thiet ke logo cho Lumi Cafe, phong cach toi gian, tong mau nau kem."
-
-Flow:
-
-1. Stage A:
-  - detect intent -> logo request.
-  - extract duoc `brand_name=Lumi Cafe`, `industry=cafe`.
-  - gate pass vi du required fields.
-
-2. Stage B:
-  - build query trend/logo cafe.
-  - search async nhieu query.
-  - loc top image fetchable.
-  - analyze async tung image bang Gemini.
-  - infer guideline tu context + research.
-
-3. Stage C:
-  - generate 3 options song song.
-  - UI nhan chunk option theo thu tu hoan thanh (khong nhat thiet theo seed).
-  - assembler tra completed payload.
-
-# Dòng Chảy Toàn Bộ Quy Trình Logo Generation
-
-**Từ Input → Stage A → Stage B → Stage C (với ví dụ cụ thể)**
+# Plan: Clean Tool Architecture + Logo Design Pipeline
+
+## Summary
+
+Refactor ai_hub_sdk tools/schemas to support **Logo Design Pipeline**:
+
+### Full Flow: POST /internal/v1/tasks/stream
+```
+User Request 
+  → Stage A (Intake & Clarification)
+    → IntentDetectTool → InputExtractionTool → ReferenceImageAnalyzeTool 
+    → ContextMerge → RequiredFieldGate 
+    → [if missing] ClarificationLoopTool (loop back to merge)
+  → Stage B (Research & Guideline)
+    → WebResearchService → FetchableImageSelector → GeminiResearchAnalyzer → DesignInferenceTool
+  → Stage C (Generation)
+    → OptionGenerationService (parallel) → StoragePersistence
+  → Stream completed chunks progressively
+```
+
+### Implementation Goals
+1. **Tool wrappers** — wrap Stage A/B/C tools in clean BaseTool subclasses
+2. **Tool context** — metadata for planner (name, description, input/output schemas)
+3. **DAG planner** — generates Stage-ordered DAG (A → B → C with gate logic)
+4. **Stream executor** — executes DAG, yields results after each stage/task
+5. **Clean imports** — `from ai_hub_sdk.tools import IntentDetectTool, WebResearchService, ...`
+
+**Approach**: Extend existing BaseTool + ToolContextManager → build Stage-aware planner → stream results per stage completion.
 
 ---
 
-## 📥 Input Ví Dụ
+## Phases & Steps
 
-```json
-{
-  "session_id": "session_abc123",
-  "query": "Logo công ty đồ uống thân thiện với môi trường",
-  "brand_name": "EcoFlow",
-  "industry": "Beverage/Sustainability",
-  "style_preference": ["modern"],
-  "color_preference": ["green"],
-  "symbol_preference": ["leaf", "water drop"],
-  "variation_count": 4,
-  "use_session_context": true
-}
-```
+### Phase 1: Foundation - Tool Wrappers + Context (Parallel-capable)
 
----
+**Goal**: Wrap existing/new logo design tools in clean BaseTool classes + build metadata system.
 
-## 🎯 STAGE A: Phát Hiện Ý Định → Hợp Nhất Context → Kiểm Tra Cổng
+1. **Create `ToolContext` schema** [ai_hub_sdk/schemas/tool_context.py]
+   - Model: `name`, `description`, `input_schema` (JSON), `output_schema` (JSON), `stage` (A/B/C), `category` (detect/extract/research/generate)
+   - Method: `@classmethod from_tool(tool: BaseTool)` to auto-extract
 
-### Quy Trình Chi Tiết
+2. **Extend `BaseTool`** [ai_hub_sdk/tools/base.py]
+   - Add attributes: `stage: Literal["A", "B", "C"]`, `category: str`
+   - Add method: `to_context() -> ToolContext`
+   - Ensure: name, description always required
 
-```
-Input Payload
-    ↓
-[LLM Gọi Phát Hiện Ý Định]
-    ├─ Xác định: Tạo logo mới? Hay lặp lại logo hiện có?
-    └─ Output: IntentDecision { action: "generate_new", confidence: 0.98 }
-    
-[Phân Tích Ảnh Tham Khảo (nếu có)]
-    ├─ Trích xuất tín hiệu trực quan (phong cách, màu sắc, ký hiệu)
-    └─ Output: ExtractionDecision { extracted_style: ["minimalist", "organic"], ... }
-    
-[Hợp Nhất Context]
-    ├─ Nguồn 1: Context được cung cấp từ input
-    ├─ Nguồn 2: Context trích xuất (từ ảnh tham khảo)
-    ├─ Nguồn 3: Context phiên làm việc hiện có (nếu tái sử dụng session)
-    └─ Quy Tắc Hợp Nhất: Explicit > Extracted > Session
-    
-Output: BrandContext {
-  brand_name: "EcoFlow",
-  industry: "Beverage",
-  style_preference: ["modern", "minimalist", "organic"],
-  color_preference: ["green"],
-  symbol_preference: ["leaf", "water drop"],
-  typography_direction: null  ← cần điền ở Stage B
-}
-    ↓
-[Kiểm Tra Cổng - Các Trường Bắt Buộc]
-    └─ brand_name ✓, industry ✓, missing: typography_direction
-    
-Output: GateResult {
-  state: { brand_name: bắt_buộc✓, industry: bắt_buộc✓, typography_direction: thiếu },
-  missing_fields: ["typography_direction"]
-}
-```
+3. **Create `ToolContextManager`** [ai_hub_sdk/tools/context_manager.py]
+   - Registry: `register(tool, stage)`, `get_by_stage(stage) -> List[ToolContext]`
+   - Build: `build_contexts(tools) -> Dict[str, ToolContext]` (keyed by name)
+   - Export: `to_llm_format() -> Dict` (OpenAI format)
 
-### Checkpoint Sau Stage A
+4. **Create Stage A tools** [ai_hub_sdk/tools/stage_a/]
+   - `intent_detect.py`: `IntentDetectTool` (detect intent: logo/banner/icon)
+   - `input_extraction.py`: `InputExtractionTool` (parse query for brand_name, industry, colors, etc)
+   - `reference_image_analyzer.py`: `ReferenceImageAnalyzeTool` (analyze uploaded reference images via Gemini)
+   - `context_merger.py`: `ContextMergerTool` (merge explicit input → extracted → session context)
+   - `required_field_gate.py`: `RequiredFieldGateTool` (validate brand_name + industry present)
+   - `clarification_loop.py`: `ClarificationLoopTool` (LLM asks user for missing fields)
 
-```python
-SessionContextState(
-  session_id: "session_abc123",
-  latest_brand_context: BrandContext(...),
-  required_field_state: GateResult(...),
-  latest_guidelines: [],  # ← chưa có, sẽ điền ở Stage B
-  latest_research_context: None,
-  context_version: 1
-)
-```
+5. **Create Stage B tools** [ai_hub_sdk/tools/stage_b/]
+   - `web_research_service.py`: `WebResearchService` (search web for design trends)
+   - `fetchable_image_selector.py`: `FetchableImageSelector` (filter searchable images)
+   - `gemini_research_analyzer.py`: `GeminiResearchAnalyzer` (analyze image bytes + research)
+   - `design_inference_tool.py`: `DesignInferenceTool` (infer design guidelines from research)
 
----
+6. **Create Stage C tools** [ai_hub_sdk/tools/stage_c/]
+   - `option_generation_service.py`: `OptionGenerationService` (generate N design options, parallel)
+   - `storage_persistence.py`: `StoragePersistenceTool` (persist results to DB)
 
-## 🔍 STAGE B: Nghiên Cứu Web → Phân Tích Từng Ảnh → Guideline Cho Mỗi Concept
+7. **Test tool extraction** (unit tests)
+   - Verify `ToolContext` for each tool
+   - Schemas correct
+   - Stage + category tagged properly
 
-### **Bước 1: Tạo Truy Vấn Tìm Kiếm**
+### Phase 2: DAG Schema + Stage-Aware Planner (Depends on Phase 1)
 
-```python
-queries = [
-  "xu hướng logo thiết kế 2026 đồ uống",
-  "ví dụ danh tính thị giác thương hiệu đồ uống",
-  "các thực hành tốt nhất thiết kế logo đồ uống",
-]
+**Goal**: Define DAG structure for stage pipeline, build planner that generates it.
 
-# SerpAPI Search
-results = await serp.search_async(queries)
-  ├─ Truy vấn 1: 15 kết quả
-  ├─ Truy vấn 2: 12 kết quả
-  └─ Truy vấn 3: 18 kết quả
-    → Loại bỏ URL/ảnh trùng lặp
-    → Chọn 3 ảnh có thể lấy được
-```
+8. **Create DAG schemas** [ai_hub_sdk/schemas/pipeline_dag.py]
+   - `TaskNode`: `id`, `name`, `tool_name`, `stage`, `tool_input`, `metadata`
+   - `StageGroup`: `stage` (A/B/C), `tasks: List[TaskNode]`, `parallel` (bool)
+   - `PipelineDAG`: `stages: List[StageGroup]`, `dependencies`, `execution_order`
+   - Logic: Stage A → B → C (sequential), but within stage can parallelize
 
-### **Bước 2: Phân Tích Multimodal Gemini (TỪNG ẢNH)**
+9. **Create `LogoPlannerTool`** [ai_hub_sdk/tools/logo_planner.py]
+   - Inherits: `BaseTool`
+   - Input: query, uploaded_images, session_context, available_tools
+   - Output: `PipelineDAG`
+   - Implementation:
+     - OpenAI GPT-4o structured output
+     - System: "You are a logo design planner. Create execution plan: Stage A (intake/clarify) → Stage B (research/analyze) → Stage C (generate options)"
+     - Ensure: A always has RequiredFieldGate before B
+     - If missing fields detected → include ClarificationLoopTool in stage A
 
-```
-Ảnh 0: "Logo Lá Xanh Hiện Đại"
-├─ Prompt Gemini:
-│   "Phân tích logo này cho:
-│    - design_intelligence_market_analysis (xu hướng thị trường)
-│    - strategic_design_direction (khái niệm chính)
-│    - extracted_style_preference (phong cách trực quan)
-│    - extracted_color_preference (màu sắc chiếm ưu thế)
-│    - extracted_symbol_preference (yếu tố biểu tượng)
-│    - extracted_typography_direction (hướng tiếp cận phông chữ)"
-│
-└─ Response (JSON):
-   {
-     "design_intelligence_market_analysis": [
-       "Các thiết kế hình học tối giản đang, xu hướng năm 2024-2026",
-       "Ký hiệu bền vững (lá, vòng tròn) chiếm ưu thế ở ngành đồ uống",
-       "Kiểu chữ không chân được ưa thích cho các thương hiệu sinh thái hiện đại"
-     ],
-     "strategic_design_direction": "Khái Niệm Sinh Thái Tối Giản Hiện Đại",
-     "extracted_style_preference": ["hình học", "đường sạch", "thiết kế phẳng"],
-     "extracted_color_preference": ["xanh lá cây rừng", "không gian trắng"],
-     "extracted_symbol_preference": ["lá được phong cách hóa", "hình dạng tròn"],
-     "extracted_typography_direction": "kiểu chữ không chân hiện đại"
-   }
-    ↓
-    PerImageAnalysis(
-      image_index=0,
-      image_url="https://...",
-      market_analysis=[...],
-      strategic_direction="Khái Niệm Sinh Thái Tối Giản Hiện Đại",
-      extracted_style_preference=[...],
-      extracted_color_preference=[...],
-      extracted_symbol_preference=[...],
-      extracted_typography_direction="kiểu chữ không chân hiện đại"
-    )
+10. **Test Planner** (integration test)
+    - Query: "create logo for tech startup Acme, modern style"
+    - Expected: DAG with Stage A complete, B ready, C queued
+    - Verify: task IDs, tool names, gate logic correct
 
-Ảnh 1: "Logo Chai Nước Hình Dạng Có Đường Cong Hữu Cơ"
-├─ Response: PerImageAnalysis(
-     image_index=1,
-     strategic_direction="Khái Niệm Sinh Thái Dòng Chảy Hữu Cơ",
-     extracted_style_preference=["đường cong", "vẽ tay", "đường cong hữu cơ"],
-     ...
-   )
+### Phase 3: Pipeline Executor + Streaming (Depends on Phase 2)
 
-Ảnh 2: "Logo Thương Hiệu Bền Vững Hướng Đến Công Nghệ"
-├─ Response: PerImageAnalysis(
-     image_index=2,
-     strategic_direction="Khái Niệm Bền Vững Hướng Đến Công Nghệ",
-     extracted_style_preference=["tương lai hóa", "tối giản", "kỹ thuật số"],
-     ...
-   )
+**Goal**: Execute DAG by stage, stream results progressively.
 
-ResearchContext = {
-  queries: [...],
-  sources: [15 nguồn web],
-  top_images: [Ảnh0, Ảnh1, Ảnh2],
-  per_image_analyses: [
-    PerImageAnalysis(0, "Khái Niệm Sinh Thái Tối Giản Hiện Đại", ...),
-    PerImageAnalysis(1, "Khái Niệm Sinh Thái Dòng Chảy Hữu Cơ", ...),
-    PerImageAnalysis(2, "Khái Niệm Bền Vững Hướng Đến Công Nghệ", ...)
-  ],
-  takeaways: [
-    "Các thiết kế hình học tối giản đang xu hướng",
-    "Ký hiệu bền vững rất quan trọng",
-    "Kiểu chữ không chân được ưa thích",
-    "Hình dạng dòng chảy hữu cơ đang nổi lên",
-    ...
-  ]
-}
-```
+11. **Create `PipelineExecutor`** [ai_hub_sdk/core/task/pipeline_executor.py]
+    - Input: `PipelineDAG`, `tool_registry: Dict[str, BaseTool]`, `session_context`
+    - Execution: 
+      - Stage A: run sequential (intent → extract → analyze → merge → validate; loop if gate fails)
+      - Stage B: run sequential (research → select → analyze → infer)
+      - Stage C: run parallel (generate N options, persist all)
+    - Output: `AsyncGenerator[StageEvent]`
 
-### **Bước 3: Suy Luận Guideline Cho Mỗi Concept (3 Lần Gọi LLM)**
+12. **Create event schemas** [ai_hub_sdk/schemas/pipeline_events.py]
+    - `StageStarted(stage, task_count)`
+    - `TaskStarted(task_id, task_name)`
+    - `TaskCompleted(task_id, result)`
+    - `GateFailed(required_fields)` → triggers clarification
+    - `StageCompleted(stage, all_results)`
+    - `PipelineCompleted(final_output, designs)`
+    - `ProcessingError(error)`
 
-```
-Cho mỗi PerImageAnalysis → Tạo 1 DesignGuideline
+13. **Integrate streaming** (async generator)
+    - Runner: `async def run_logo_pipeline(query, context) → AsyncGenerator[PipelineEvent]`:
+      - 1. Load tool registry
+      - 2. Call LogoPlannerTool → PipelineDAG
+      - 3. Yield: `PipelineStarted(dag)`
+      - 4. Execute stage by stage:
+         - a. Yield: `StageStarted(A)`
+         - b. For each task: yield TaskStarted → execute → yield TaskCompleted
+         - c. Handle GateFailed → loop/clarify
+         - d. Yield: `StageCompleted(A, results)`
+      - 5. Final: `PipelineCompleted(results)`
 
-Lần 1: infer_guideline_for_image_async(
-  context: BrandContext("EcoFlow", "Beverage", style: ["modern"], color: ["green"]),
-  per_image_analysis: PerImageAnalysis(0, "Khái Niệm Sinh Thái Tối Giản Hiện Đại", ...)
-)
-├─ Prompt Gemini:
-│   "Dựa trên hướng chiến lược này và bối cảnh thương hiệu:
-│    - Chiến lược: Khái Niệm Sinh Thái Tối Giản Hiện Đại
-│    - Thông tin chi thị trường: Thiết kế tối giản đang xu hướng, bền vững rất quan trọng
-│    - Tùy chọn trích xuất: hình học, đường sạch, xanh lá cây rừng
-│    Tạo JSON guideline với: concept_statement, style_direction,
-│    color_palette, typography_direction, icon_direction, constraints"
-│
-└─ Output: DesignGuideline {
-     concept_statement: "Sinh thái tối giản hiện đại nhấn mạnh bền vững sạch sẽ",
-     concept_variants: ["Khái Niệm Sinh Thái Tối Giản Hiện Đại"],
-     style_direction: ["hình học", "đường sạch", "thiết kế phẳng", "trang trí tối thiểu"],
-     color_palette: ["xanh lá cây rừng", "trắng", "xám nhạt", "nhấn đồng"],
-     typography_direction: ["không chân", "hiện đại", "hình học"],
-     icon_direction: ["ký hiệu lá tối giản", "vòng tròn hình học", "đường sạch"],
-     constraints: ["không gradient", "tối đa 3 màu", "chỉ hình dạng hình học"]
-   }
+### Phase 4: Clean Exports + Docs (Depends on Phase 3)
 
-Lần 2: infer_guideline_for_image_async(
-  context: BrandContext(...),
-  per_image_analysis: PerImageAnalysis(1, "Khái Niệm Sinh Thái Dòng Chảy Hữu Cơ", ...)
-)
-└─ Output: DesignGuideline {
-     concept_statement: "Danh tính trực quan tự nhiên-truyền cảm hứng dòng chảy hữu cơ",
-     concept_variants: ["Khái Niệm Sinh Thái Dòng Chảy Hữu Cơ"],
-     style_direction: ["đường cong hữu cơ", "vẽ tay", "dòng chảy", "hình dạng tự nhiên"],
-     color_palette: ["xanh nhạt", "xám tự nhiên", "xanh nước", "tông màu đất"],
-     typography_direction: ["không chân bo tròn", "thân thiện", "dòng chảy"],
-     icon_direction: ["hình dạng nước dòng chảy", "hình dạng lá tự nhiên", "đường cong tự nhiên"],
-     constraints: ["cho phép đường cong", "bảng màu đất, "cảm giác thủ công"]
-   }
+**Goal**: Easy imports + usage guide.
 
-Lần 3: infer_guideline_for_image_async(
-  context: BrandContext(...),
-  per_image_analysis: PerImageAnalysis(2, "Khái Niệm Bền Vững Hướng Đến Công Nghệ", ...)
-)
-└─ Output: DesignGuideline {
-     concept_statement: "Tính tối giản bền vững hướng đến công nghệ với độ chính xác hiện đại",
-     concept_variants: ["Khái Niệm Bền Vững Hướng Đến Công Nghệ"],
-     style_direction: ["tương lai hóa", "tối giản", "kỹ thuật số", "độ chính xác hình học"],
-     color_palette: ["xanh lục", "than chì", "trắng", "nhấn kim loại"],
-     typography_direction: ["không chân hiện đại", "hình học", "kỹ thuật"],
-     icon_direction: ["lá lấy cảm hứng công nghệ", "lưới kỹ thuật số", "hình dạng độ chính xác"],
-     constraints: ["cho phép góc cạnh", "th美học công nghệ", "độ chính xác bắt buộc"]
-   }
+14. **Update exports** [ai_hub_sdk/tools/__init__.py, ai_hub_sdk/schemas/__init__.py]
+    - Tools: stage A/B/C tools + LogoPlannerTool
+    - Schemas: ToolContext, PipelineDAG, StageGroup, TaskNode, all Events
 
-latest_guidelines = [
-  DesignGuideline(concept_statement="Sinh thái tối giản hiện đại..."),
-  DesignGuideline(concept_statement="Dòng chảy hữu cơ..."),
-  DesignGuideline(concept_statement="Hướng đến công nghệ...")
-]
-```
+15. **Write Vietnamese guide** [docs/guides/tools/logo_pipeline_vi.md]
+    - Architecture overview
+    - Flow diagram (Stage A → B → C)
+    - Each tool's role
+    - How to extend
 
-### Checkpoint Sau Stage B
+16. **Write English guide** [docs/guides/tools/logo_pipeline.md]
+    - Same as above, English
 
-```python
-SessionContextState(
-  session_id: "session_abc123",
-  latest_brand_context: BrandContext({
-    brand_name: "EcoFlow",
-    industry: "Beverage",
-    style_preference: ["modern", "geometric", "flowing", "futuristic"],  # được làm giàu
-    color_preference: ["green", "forest green", "sage green", "teal"],   # được làm giàu
-    symbol_preference: ["leaf", "water drop", "circle", "flowing forms"],# được làm giàu
-    typography_direction: "sans-serif modern"  # được làm giàu ← điền trường thiếu!
-  }),
-  required_field_state: { brand_name: ✓, industry: ✓, typography_direction: ✓ },
-  latest_guidelines: [
-    DesignGuideline(concept_statement="Sinh thái tối giản hiện đại...", ...),
-    DesignGuideline(concept_statement="Dòng chảy hữu cơ...", ...),
-    DesignGuideline(concept_statement="Hướng đến công nghệ...", ...)
-  ],
-  latest_research_context: ResearchContext(...),
-  context_version: 2
-)
-```
+17. **Code example** [examples/logo_pipeline_demo.ipynb]
+    - Minimal: load tools → run query → stream results
+    - Advanced: custom tool + DAG inspection + event handling
+
+### Phase 5: Testing + Validation
+
+**Goal**: Ensure architecture + backward compatibility.
+
+18. **Unit tests** [tests/unit/tools/]
+    - ToolContext extraction per tool
+    - Tool registry by stage
+    - DAG schema validation
+    - Event schemas serialization
+
+19. **Integration tests** [tests/integration/]
+    - Full pipeline (mock tools) query → plan → execute
+    - Gate logic: missing fields → clarification → retry
+    - Stage transitions + streaming events
+    - Agent unchanged (backward compat)
+
+20. **Manual e2e test**
+    - Real query: "logo for tech company, blue + modern style"
+    - Check: plan generated → stages executed → options streamed
 
 ---
 
-## 🎨 STAGE C: Tạo Logo Song Song (Cho Mỗi Concept)
+## Relevant Files
 
-```
-Truy xuất session_state = SessionContextState(latest_guidelines=[3 guidelines])
+**To Create:**
 
-Cho mỗi guideline trong latest_guidelines:
-  
-  Guideline 1: "Khái Niệm Sinh Thái Tối Giản Hiện Đại"
-  ├─ Biến Thể Concept: ["Khái Niệm Sinh Thái Tối Giản Hiện Đại"]
-  ├─ Phong Cách: ["hình học", "đường sạch"]
-  ├─ Màu Sắc: ["xanh lá cây rừng", "trắng", "đồng"]
-  ├─ Kiểu Chữ: ["không chân", "hiện đại"]
-  │
-  └─ Cho variation_count=4: Tạo 4 hình ảnh
-      ├─ Tùy Chọn 1: prompt="Thiết kế logo sinh thái tối giản, lá hình học, xanh lá cây rừng, không chân"
-      │   └─ Gọi Gemini + tạo thành s3://bucket/opt_1.png
-      │       LogoOption(
-      │         option_id="task_xyz_opt_1",
-      │         concept_name="Khái Niệm Sinh Thái Tối Giản Hiện Đại",
-      │         image_url="https://s3.../opt_1.png",
-      │         seed=42,
-      │         quality_flags=["gemini_generated"]
-      │       )
-      │
-      ├─ Tùy Chọn 2: prompt="Thiết kế logo sinh thái tối giản, vòng tròn hình học, nền trắng, không chân"
-      │   └─ LogoOption(option_id="task_xyz_opt_2", ...)
-      │
-      ├─ Tùy Chọn 3: prompt="Thiết kế logo sinh thái tối giản, nhấn đồng, thiết kế sạch"
-      │   └─ LogoOption(option_id="task_xyz_opt_3", ...)
-      │
-      └─ Tùy Chọn 4: prompt="Thiết kế logo sinh thái tối giản, các yếu tố hình học khác nhau"
-          └─ LogoOption(option_id="task_xyz_opt_4", ...)
-  
-  Guideline 2: "Khái Niệm Sinh Thái Dòng Chảy Hữu Cơ"
-  ├─ Biến Thể Concept: ["Khái Niệm Sinh Thái Dòng Chảy Hữu Cơ"]
-  ├─ Phong Cách: ["đường cong hữu cơ", "vẽ tay", "dòng chảy"]
-  ├─ Màu Sắc: ["xanh nhạt", "xanh nước", "tông màu đất"]
-  │
-  └─ Cho variation_count=4: Tạo 4 hình ảnh
-      ├─ Tùy Chọn 5: prompt="Thiết kế logo sinh thái dòng chảy hữu cơ, hình dạng nước, xanh nhạt"
-      │   └─ LogoOption(option_id="task_xyz_opt_5", ...)
-      ├─ Tùy Chọn 6: prompt="Thiết kế logo sinh thái dòng chảy hữu cơ, lá vẽ tay"
-      │   └─ LogoOption(option_id="task_xyz_opt_6", ...)
-      ├─ Tùy Chọn 7: ...LogoOption(option_id="task_xyz_opt_7", ...)
-      └─ Tùy Chọn 8: ...LogoOption(option_id="task_xyz_opt_8", ...)
-  
-  Guideline 3: "Khái Niệm Bền Vững Hướng Đến Công Nghệ"
-  ├─ Biến Thể Concept: ["Khái Niệm Bền Vững Hướng Đến Công Nghệ"]
-  ├─ Phong Cách: ["tương lai hóa", "độ chính xác hình học"]
-  ├─ Màu Sắc: ["xanh lục", "than chì", "kim loại"]
-  │
-  └─ Cho variation_count=4: Tạo 4 hình ảnh
-      ├─ Tùy Chọn 9: prompt="Thiết kế logo công nghệ sinh thái, lá hình học, xanh lục"
-      │   └─ LogoOption(option_id="task_xyz_opt_9", ...)
-      ├─ Tùy Chọn 10: ...LogoOption(option_id="task_xyz_opt_10", ...)
-      ├─ Tùy Chọn 11: ...LogoOption(option_id="task_xyz_opt_11", ...)
-      └─ Tùy Chọn 12: ...LogoOption(option_id="task_xyz_opt_12", ...)
+**Schemas:**
+- `ai_hub_sdk/schemas/tool_context.py` — ToolContext with stage + category
+- `ai_hub_sdk/schemas/pipeline_dag.py` — TaskNode, StageGroup, PipelineDAG
+- `ai_hub_sdk/schemas/pipeline_events.py` — StageStarted, TaskStarted, TaskCompleted, GateFailed, StageCompleted, PipelineCompleted, ProcessingError
 
-Tổng Tạo: 12 tùy chọn (3 concepts × 4 biến thể)
-  sắp xếp theo: (seed, option_id)
-```
+**Tools - Stage A:**
+- `ai_hub_sdk/tools/stage_a/__init__.py`
+- `ai_hub_sdk/tools/stage_a/intent_detect.py` — IntentDetectTool
+- `ai_hub_sdk/tools/stage_a/input_extraction.py` — InputExtractionTool
+- `ai_hub_sdk/tools/stage_a/reference_image_analyzer.py` — ReferenceImageAnalyzeTool
+- `ai_hub_sdk/tools/stage_a/context_merger.py` — ContextMergerTool
+- `ai_hub_sdk/tools/stage_a/required_field_gate.py` — RequiredFieldGateTool
+- `ai_hub_sdk/tools/stage_a/clarification_loop.py` — ClarificationLoopTool
 
-### Output Cuối Cùng
+**Tools - Stage B:**
+- `ai_hub_sdk/tools/stage_b/__init__.py`
+- `ai_hub_sdk/tools/stage_b/web_research_service.py` — WebResearchService
+- `ai_hub_sdk/tools/stage_b/fetchable_image_selector.py` — FetchableImageSelector
+- `ai_hub_sdk/tools/stage_b/gemini_research_analyzer.py` — GeminiResearchAnalyzer
+- `ai_hub_sdk/tools/stage_b/design_inference_tool.py` — DesignInferenceTool
 
-```python
-LogoGenerateOutput(
-  guideline: DesignGuideline(  # sử dụng guideline đầu tiên cho output cuối cùng
-    concept_statement="Sinh thái tối giản hiện đại...",
-    concept_variants=["Khái Niệm Sinh Thái Tối Giản Hiện Đại"],
-    ...
-  ),
-  required_field_state: { brand_name: ✓, industry: ✓, typography: ✓ },
-  options: [
-    LogoOption(option_id="task_xyz_opt_1", concept_name="Khái Niệm Sinh Thái Tối Giản Hiện Đại", image_url="s3://...png", ...),
-    LogoOption(option_id="task_xyz_opt_2", concept_name="Khái Niệm Sinh Thái Tối Giản Hiện Đại", image_url="s3://...png", ...),
-    LogoOption(option_id="task_xyz_opt_3", concept_name="Khái Niệm Sinh Thái Tối Giản Hiện Đại", image_url="s3://...png", ...),
-    LogoOption(option_id="task_xyz_opt_4", concept_name="Khái Niệm Sinh Thái Tối Giản Hiện Đại", image_url="s3://...png", ...),
-    LogoOption(option_id="task_xyz_opt_5", concept_name="Khái Niệm Sinh Thái Dòng Chảy Hữu Cơ", image_url="s3://...png", ...),
-    LogoOption(option_id="task_xyz_opt_6", concept_name="Khái Niệm Sinh Thái Dòng Chảy Hữu Cơ", image_url="s3://...png", ...),
-    ...
-    LogoOption(option_id="task_xyz_opt_12", concept_name="Khái Niệm Bền Vững Hướng Đến Công Nghệ", image_url="s3://...png", ...),
-  ]
-)
-```
+**Tools - Stage C:**
+- `ai_hub_sdk/tools/stage_c/__init__.py`
+- `ai_hub_sdk/tools/stage_c/option_generation_service.py` — OptionGenerationService
+- `ai_hub_sdk/tools/stage_c/storage_persistence.py` — StoragePersistenceTool
+
+**Core:**
+- `ai_hub_sdk/tools/logo_planner.py` — LogoPlannerTool (stage-aware)
+- `ai_hub_sdk/tools/context_manager.py` — ToolContextManager (by stage)
+- `ai_hub_sdk/core/task/pipeline_executor.py` — PipelineExecutor (stage-sequential, task-parallel)
+
+**Docs & Examples:**
+- `docs/guides/tools/logo_pipeline_vi.md` — Vietnamese guide (CHI TIẾT)
+- `docs/guides/tools/logo_pipeline.md` — English guide
+- `examples/logo_pipeline_demo.ipynb` — Full flow demo
+
+**To Modify:**
+- `ai_hub_sdk/tools/base.py` — Add `stage`, `category` attributes + `to_context()` method
+- `ai_hub_sdk/schemas/__init__.py` — Export new schemas
+- `ai_hub_sdk/tools/__init__.py` — Export all stage tools + planner + context manager
 
 ---
 
-## 📈 Sơ Đồ Dòng Chảy Dữ Liệu Context
+## Verification
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                 STAGE A: Kiểm Tra & Hợp Nhất                   │
-├─────────────────────────────────────────────────────────────────┤
-│ INPUT                                                            │
-│ ├─ query: "Logo công ty đồ uống thân thiện với môi trường"      │
-│ ├─ brand_name: "EcoFlow"                                        │
-│ ├─ style_preference: ["modern"]                                 │
-│ └─ color_preference: ["green"]                                  │
-│                                                                  │
-│ XỬ LÝ                                                            │
-│ ├─ Ý Định → "generate_new"                                      │
-│ ├─ Phân Tích Ảnh Tham Khảo → trích xuất tín hiệu                │
-│ └─ Hợp Nhất: explicit > extracted > session                     │
-│                                                                  │
-│ OUTPUT: BrandContext                                            │
-│ ├─ brand_name: "EcoFlow" ✓                                      │
-│ ├─ industry: "Beverage" ✓                                       │
-│ ├─ style_preference: ["modern", "minimalist", "organic"]        │
-│ ├─ color_preference: ["green"]                                  │
-│ └─ typography_direction: null ← THIẾU                           │
-└─────────────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────────┐
-│              STAGE B: Nghiên Cứu & Guideline                    │
-├─────────────────────────────────────────────────────────────────┤
-│ NGHIÊN CỨU                                                       │
-│ ├─ Truy Vấn: 3 truy vấn tìm kiếm qua SerpAPI                    │
-│ ├─ Kết Quả: ~45 nguồn, 100+ ảnh                                 │
-│ └─ Chọn: 3 ảnh có thể lấy được hàng đầu                         │
-│                                                                  │
-│ PHÂN TÍCH GEMINI (3 lần - từng ảnh)                             │
-│ ├─ Ảnh 0 → PerImageAnalysis(                                    │
-│ │              index=0,                                          │
-│ │              strategic_direction="Tối Giản Hiện Đại",        │
-│ │              market_analysis=[...],                           │
-│ │              extracted_style_preference=["hình học"],         │
-│ │              ...                                               │
-│ │            )                                                   │
-│ ├─ Ảnh 1 → PerImageAnalysis(index=1, "Dòng Chảy Hữu Cơ", ...)   │
-│ └─ Ảnh 2 → PerImageAnalysis(index=2, "Hướng Đến Công Nghệ", ...)│
-│                                                                  │
-│ DUYỆT GUIDELINE (3 lần - mỗi concept)                           │
-│ ├─ Concept 0: DesignGuideline {                                 │
-│ │   concept_statement: "Sinh thái tối giản hiện đại",          │
-│ │   style_direction: ["hình học", "đường sạch"],               │
-│ │   color_palette: ["xanh lá cây rừng", "trắng"],              │
-│ │   typography_direction: ["không chân"],                       │
-│ │   ...                                                          │
-│ │ }                                                              │
-│ ├─ Concept 1: DesignGuideline { "Dòng chảy hữu cơ", ... }      │
-│ └─ Concept 2: DesignGuideline { "Hướng đến công nghệ", ... }   │
-│                                                                  │
-│ OUTPUT: ResearchContext + BrandContext (được làm giàu)          │
-│ ├─ per_image_analyses: [3 PerImageAnalysis]                     │
-│ ├─ brand_context được làm giàu: typography_direction="sans"✓    │
-│ └─ latest_guidelines: [3 DesignGuideline]                       │
-└─────────────────────────────────────────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────────────┐
-│                  STAGE C: Tạo & Output                          │
-├─────────────────────────────────────────────────────────────────┤
-│ TẠO SONG SONG (3 concepts × 4 biến thể = 12 tùy chọn)          │
-│                                                                  │
-│ Concept 0: Tối Giản Hiện Đại                                    │
-│ ├─ DesignGuideline { color_palette: ["xanh rừng"] }             │
-│ └─ Tùy Chọn: 4 biến thể                                         │
-│     ├─ opt_1: prompt="logo hình học tối giản, xanh"            │
-│     ├─ opt_2: prompt="ký hiệu lá tối giản, sạch"               │
-│     ├─ opt_3: prompt="hình dạng vòng tròn tối giản, nền trắng" │
-│     └─ opt_4: prompt="tối giản đồng + nhấn xanh"               │
-│                                                                  │
-│ Concept 1: Dòng Chảy Hữu Cơ                                     │
-│ ├─ DesignGuideline { color_palette: ["xanh nhạt", "nước"] }     │
-│ └─ Tùy Chọn: 4 biến thể                                         │
-│     ├─ opt_5: prompt="hình dạng nước dòng chảy, xanh nhạt"     │
-│     ├─ opt_6: prompt="lá vẽ tay đường cong, hữu cơ"            │
-│     ├─ opt_7: prompt="nước dòng chảy + kết hợp lá"             │
-│     └─ opt_8: prompt="hình dạng hữu cơ, tông màu đất"          │
-│                                                                  │
-│ Concept 2: Hướng Đến Công Nghệ                                  │
-│ ├─ DesignGuideline { color_palette: ["xanh lục", "than chì"] }  │
-│ └─ Tùy Chọn: 4 biến thể                                         │
-│     ├─ opt_9: prompt="logo lá công nghệ, xanh lục"             │
-│     ├─ opt_10: prompt="hình dạng độ chính xác, than + xanh"    │
-│     ├─ opt_11: prompt="lưới kỹ thuật số + ký hiệu lá"          │
-│     └─ opt_12: prompt="nhấn kim loại hình học"                 │
-│                                                                  │
-│ OUTPUT: LogoGenerateOutput                                      │
-│ ├─ guideline: DesignGuideline đầu tiên (Tối Giản)              │
-│ ├─ required_field_state: tất cả trường ✓                        │
-│ └─ options: [12 LogoOption với URLs]                            │
-└─────────────────────────────────────────────────────────────────┘
-```
+1. **Tools wrap correctly**: Each stage tool instantiates, schema exports valid
+2. **ToolContextManager**: Registry by stage works, exports to OpenAI format
+3. **LogoPlannerTool**: Query → PipelineDAG with stage structure
+4. **PipelineExecutor**: DAG executes stage-by-stage, events streamed
+5. **Gate logic**: Missing required_fields → ClarificationLoopTool triggered → retry
+6. **Streaming**: Events flow properly (StageStarted → TaskStarted → TaskCompleted → StageCompleted)
+7. **Backward compat**: Existing Agent + tools unaffected
 
 ---
 
-## 🔑 Các Hiểu Biết Chính
+## Decisions & Scope
 
-✅ **Phân Tích Từng Ảnh** → Mỗi ảnh được phân tích độc lập (xu hướng thị trường, hướng chiến lược)  
-✅ **Cô Lập Concept** → 3 guideline khác nhau, không chia sẻ tùy chọn  
-✅ **Căn Chỉnh Ngữ Nghĩa** → Mỗi concept mang lại color/style từ ảnh nguồn của nó  
-✅ **Output Phong Phú** → 12 tùy chọn so với 3-4 trước (gấp 3x thêm variety)  
-✅ **Làm Giàu Context** → Các trường thiếu được điền từ thông tin nghiên cứu  
+**Included:**
+- Tool wrappers for Stage A/B/C (logo design)
+- Tool context + stage + category tagging
+- Stage-aware DAG + planner
+- Pipeline executor with streaming events
+- Gate logic (validation + clarification loop)
+- Clean imports
+
+**Excluded:**
+- Observer/monitoring → add later
+- Parallel task execution (within stage parallelizable, between stages sequential)
+- Result aggregation beyond events → keep simple
+- SQLite/DB integration → persist results only
+- Custom agent framework changes
+
+**Key Assumptions:**
+1. OpenAI API available for LogoPlannerTool + LLM calls
+2. Gemini API available for image analysis (Stage B)
+3. Web search API available (Stage B)
+4. Tools are deterministic (no circular gate failures)
+5. Each stage output feeds next stage input automatically
 
 ---
 
-## 📚 Tham Chiếu Kỹ Thuật
+## Timeline
 
-- **Stage A**: `source/workers/stage_a_worker.py`, `source/services/stage_a/toolset.py`
-- **Stage B**: `source/workers/stage_b_worker.py`, `source/services/stage_b/`
-- **Stage C**: `source/workers/stage_c_worker.py`, `source/services/stage_c/`
-- **Schemas**: `source/schemas/domain.py` (BrandContext, PerImageAnalysis, DesignGuideline)
-- **Context**: `source/context/session_context_store.py`, `source/schemas/status.py` (SessionContextState)
-
+- **Phase 1**: ~1h (6-7 tools + schemas)
+- **Phase 2**: ~30min (DAG + planner)
+- **Phase 3**: ~45min (executor + events)
+- **Phase 4**: ~45min (exports + docs + notebook)
+- **Phase 5**: ~30min (tests)
+- **Total**: ~3.5 hours focused work
