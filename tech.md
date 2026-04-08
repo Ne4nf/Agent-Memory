@@ -1,268 +1,427 @@
-# Plan: Clean Tool Architecture + Logo Design Pipeline
+# Kế Hoạch Refactor Source (Tools + Agents + Schemas)
 
-## Summary
+## 1) Phạm vi và Mục tiêu
 
-Refactor ai_hub_sdk tools/schemas to support **Logo Design Pipeline**:
+### Trong phạm vi
+- Refactor kiến trúc trong source/ theo hướng tool-first và DAG planner.
+- Tập trung vào tools, orchestration theo agents, schemas, runner/executor.
+- Giữ tương thích contract task hiện tại (LogoGenerateTask.stream_process).
+- Ưu tiên framework OpenAI (GPT-4o), sau đó mở rộng adapter cho Google ADK.
 
-### Full Flow: POST /internal/v1/tasks/stream
+### Ngoài phạm vi (giai đoạn này)
+- Thiết kế lại observer và lifecycle.
+- Thiết kế lại UI.
+- Chuyển đổi persistence ngoài cơ chế session CAS hiện tại.
+
+### Mục tiêu chính
+- Loại bỏ naming theo stage (stage_a, stage_b, stage_c) ở domain logic.
+- Tổ chức tool wrapper có input/output schema rõ ràng, tái sử dụng tốt.
+- Planner trả về DAG JSON (nodes, edges) thay vì hardcode pipeline.
+- Tool context chỉ chứa metadata + schema.
+- Giữ tương thích stream behavior và clarification loop hiện tại.
+- Hỗ trợ dynamic/iterative planning (re-plan) khi cần clarification.
+- Đảm bảo nội suy biến runtime an toàn cho tool_input.
+- Tránh tràn context window bằng cơ chế payload reference cho dữ liệu lớn.
+
+---
+
+## 2) Vấn đề hiện tại
+
+1. Planner đang hardcode trình tự thực thi và chuyển trạng thái nghiệp vụ.
+2. Worker theo stage bị coupling cao vào service cụ thể.
+3. LogoDesignToolset đang là God-object (intent, extract, clarify, guideline cùng một chỗ).
+4. Contract của tool đang ngầm định qua method, chưa là artifact bậc nhất của registry.
+5. Typing của StageBExecution.guideline còn rộng (object), chưa strict schema.
+6. Khó tái sử dụng cho domain khác vì naming stage và wiring trực tiếp.
+7. Chưa có DAG validator thống nhất cho dependency/cycle.
+8. Trace thực thi tool chưa normalize theo chuẩn ToolResult.
+
+---
+
+## 3) Kiến trúc đích
+
+## 3.1 Cấu trúc thư mục đề xuất
+
+```text
+source/
+  agents/
+    logo_creator_agent.py
+    runner.py
+  planner/
+    dag_models.py
+    dag_validator.py
+    planner_tool.py
+    planner_templates.py
+  tools/
+    __init__.py
+    base_tool.py
+    intent_detect_tool.py
+    input_extract_tool.py
+    reference_analyze_tool.py
+    clarification_tool.py
+    web_research_tool.py
+    guideline_generate_tool.py
+    logo_generate_tool.py
+    tool_search_tool.py
+    researcher_tool.py
+  executors/
+    tool_executor.py
+    result.py
+    validator.py
+  schemas/
+    plan.py
+    tool_context.py
+    tool_io.py
+    runtime_state.py
 ```
-User Request 
-  → Stage A (Intake & Clarification)
-    → IntentDetectTool → InputExtractionTool → ReferenceImageAnalyzeTool 
-    → ContextMerge → RequiredFieldGate 
-    → [if missing] ClarificationLoopTool (loop back to merge)
-  → Stage B (Research & Guideline)
-    → WebResearchService → FetchableImageSelector → GeminiResearchAnalyzer → DesignInferenceTool
-  → Stage C (Generation)
-    → OptionGenerationService (parallel) → StoragePersistence
-  → Stream completed chunks progressively
+
+Ghi chú:
+- source/services/* giữ vai trò provider/service nội bộ, được gọi từ tool class.
+- source/workers/* sẽ được thay dần bằng agents/runner.py + executors/tool_executor.py.
+
+## 3.2 Hợp đồng dữ liệu cốt lõi
+
+### ToolContext (chỉ metadata)
+- name
+- description
+- parameters (JSON schema của input)
+- output (JSON schema của output)
+
+### DAG JSON
+- nodes: danh sách task
+- edges: danh sách phụ thuộc
+
+Node gồm:
+- id: định danh node
+- tool: tên tool đăng ký
+- tool_input: dict (hỗ trợ template biến)
+- deps: danh sách node phụ thuộc
+
+### ToolResult
+- node_id
+- tool_name
+- result
+- error
+- trace
+
+### RuntimeState (thuộc executor)
+- input: query/user_context hiện tại
+- node_results: map từ node_id sang ToolResult
+- artifacts: map optional cho payload lớn (path/object key)
+
+### InputResolver (nội suy biến)
+- Resolve biểu thức ${...} trong tool_input tại runtime (không resolve lúc planner).
+- Nguồn dữ liệu là RuntimeState.
+- Fail fast với lỗi typed nếu expression không resolve được.
+
+### PlanningMode
+- single_pass: planner trả full DAG một lần.
+- iterative: planner trả DAG từng đoạn, executor có thể re-plan.
+
+### LargePayloadRef
+- ref_id: mã định danh artifact
+- kind: inline | file | object_store | vector_store
+- preview: tóm tắt ngắn cho node sau
+- uri_or_key: vị trí lưu trữ
+
+---
+
+## 4) Quy tắc đổi tên
+
+Đổi từ stage-based sang role-based:
+- stage_a_worker -> intake_planning_runner (hoặc tách thành tools + runner)
+- stage_b_worker -> research_guideline_runner
+- stage_c_worker -> generation_runner
+- GeminiResearchAnalyzer -> ReferenceInsightTool (nếu expose như tool)
+- LogoDesignToolset -> tách thành các tool class độc lập
+
+Nguyên tắc đặt tên:
+- Tên class tool phải thể hiện vai trò nghiệp vụ rõ ràng.
+- Tránh A/B/C trong API public.
+- Tránh naming quá workflow-specific trong abstraction dùng chung.
+
+---
+
+## 5) Luồng thực thi mục tiêu
+
+```text
+logo_creator.stream(query, user_context)
+  -> Runner.run(task_id, query, context)
+    -> PlannerTool.plan(query, user_context, tool_contexts) -> DAG JSON
+    -> DAGValidator.validate(dag)
+    -> InputResolver.bind_with_runtime_state(...)
+    -> ToolExecutor.execute_dag(dag)
+      -> [Tool].execute(...)
+      -> ToolResult(...)
+      -> RuntimeState.update(node_result)
+      -> optional RePlanner.plan_next(...) khi cần clarification
+    -> Validator.react(results)
+    -> stream chunks
 ```
 
-### Implementation Goals
-1. **Tool wrappers** — wrap Stage A/B/C tools in clean BaseTool subclasses
-2. **Tool context** — metadata for planner (name, description, input/output schemas)
-3. **DAG planner** — generates Stage-ordered DAG (A → B → C with gate logic)
-4. **Stream executor** — executes DAG, yields results after each stage/task
-5. **Clean imports** — `from ai_hub_sdk.tools import IntentDetectTool, WebResearchService, ...`
+### Architecture Diagram
 
-**Approach**: Extend existing BaseTool + ToolContextManager → build Stage-aware planner → stream results per stage completion.
+```mermaid
+flowchart LR
+  U[User Query] --> A[Logo Creator Agent]
+  A --> R[Runner]
+  R --> P[PlannerTool]
+  P --> D[DAG JSON]
+  D --> V[DAGValidator]
+  V --> I[InputResolver]
+  I --> E[ToolExecutor]
+  E --> T1[IntentDetectTool]
+  E --> T2[InputExtractTool]
+  E --> T3[WebResearchTool]
+  E --> T4[GuidelineGenerateTool]
+  E --> T5[LogoGenerateTool]
+  E --> S[(RuntimeState)]
+  S --> I
+  E --> O[Stream Chunks]
+```
 
----
+### Sequence Diagram (Iterative Planning + Clarification)
 
-## Phases & Steps
+```mermaid
+sequenceDiagram
+  participant User
+  participant Agent as LogoCreatorAgent
+  participant Runner
+  participant Planner as PlannerTool
+  participant Executor as ToolExecutor
+  participant State as RuntimeState
 
-### Phase 1: Foundation - Tool Wrappers + Context (Parallel-capable)
+  User->>Agent: stream(query, user_context)
+  Agent->>Runner: run(task_id, query, context)
+  Runner->>Planner: plan(query, context, tool_contexts)
+  Planner-->>Runner: DAG (planning_mode=iterative)
+  Runner->>Executor: execute_dag(dag)
 
-**Goal**: Wrap existing/new logo design tools in clean BaseTool classes + build metadata system.
+  Executor->>Executor: execute intent + extract
+  Executor->>State: lưu node results
+  Executor->>Executor: execute clarification_gate
 
-1. **Create `ToolContext` schema** [ai_hub_sdk/schemas/tool_context.py]
-   - Model: `name`, `description`, `input_schema` (JSON), `output_schema` (JSON), `stage` (A/B/C), `category` (detect/extract/research/generate)
-   - Method: `@classmethod from_tool(tool: BaseTool)` to auto-extract
+  alt Thiếu required fields
+    Executor-->>Runner: clarification_required
+    Runner-->>User: clarification question chunk
+    User->>Runner: clarification answer
+    Runner->>State: update input/context
+    Runner->>Planner: re-plan(next segment)
+    Planner-->>Runner: next DAG segment
+    Runner->>Executor: resume execute_dag
+  else Đủ required fields
+    Executor->>Executor: execute research + guideline + generate
+  end
 
-2. **Extend `BaseTool`** [ai_hub_sdk/tools/base.py]
-   - Add attributes: `stage: Literal["A", "B", "C"]`, `category: str`
-   - Add method: `to_context() -> ToolContext`
-   - Ensure: name, description always required
-
-3. **Create `ToolContextManager`** [ai_hub_sdk/tools/context_manager.py]
-   - Registry: `register(tool, stage)`, `get_by_stage(stage) -> List[ToolContext]`
-   - Build: `build_contexts(tools) -> Dict[str, ToolContext]` (keyed by name)
-   - Export: `to_llm_format() -> Dict` (OpenAI format)
-
-4. **Create Stage A tools** [ai_hub_sdk/tools/stage_a/]
-   - `intent_detect.py`: `IntentDetectTool` (detect intent: logo/banner/icon)
-   - `input_extraction.py`: `InputExtractionTool` (parse query for brand_name, industry, colors, etc)
-   - `reference_image_analyzer.py`: `ReferenceImageAnalyzeTool` (analyze uploaded reference images via Gemini)
-   - `context_merger.py`: `ContextMergerTool` (merge explicit input → extracted → session context)
-   - `required_field_gate.py`: `RequiredFieldGateTool` (validate brand_name + industry present)
-   - `clarification_loop.py`: `ClarificationLoopTool` (LLM asks user for missing fields)
-
-5. **Create Stage B tools** [ai_hub_sdk/tools/stage_b/]
-   - `web_research_service.py`: `WebResearchService` (search web for design trends)
-   - `fetchable_image_selector.py`: `FetchableImageSelector` (filter searchable images)
-   - `gemini_research_analyzer.py`: `GeminiResearchAnalyzer` (analyze image bytes + research)
-   - `design_inference_tool.py`: `DesignInferenceTool` (infer design guidelines from research)
-
-6. **Create Stage C tools** [ai_hub_sdk/tools/stage_c/]
-   - `option_generation_service.py`: `OptionGenerationService` (generate N design options, parallel)
-   - `storage_persistence.py`: `StoragePersistenceTool` (persist results to DB)
-
-7. **Test tool extraction** (unit tests)
-   - Verify `ToolContext` for each tool
-   - Schemas correct
-   - Stage + category tagged properly
-
-### Phase 2: DAG Schema + Stage-Aware Planner (Depends on Phase 1)
-
-**Goal**: Define DAG structure for stage pipeline, build planner that generates it.
-
-8. **Create DAG schemas** [ai_hub_sdk/schemas/pipeline_dag.py]
-   - `TaskNode`: `id`, `name`, `tool_name`, `stage`, `tool_input`, `metadata`
-   - `StageGroup`: `stage` (A/B/C), `tasks: List[TaskNode]`, `parallel` (bool)
-   - `PipelineDAG`: `stages: List[StageGroup]`, `dependencies`, `execution_order`
-   - Logic: Stage A → B → C (sequential), but within stage can parallelize
-
-9. **Create `LogoPlannerTool`** [ai_hub_sdk/tools/logo_planner.py]
-   - Inherits: `BaseTool`
-   - Input: query, uploaded_images, session_context, available_tools
-   - Output: `PipelineDAG`
-   - Implementation:
-     - OpenAI GPT-4o structured output
-     - System: "You are a logo design planner. Create execution plan: Stage A (intake/clarify) → Stage B (research/analyze) → Stage C (generate options)"
-     - Ensure: A always has RequiredFieldGate before B
-     - If missing fields detected → include ClarificationLoopTool in stage A
-
-10. **Test Planner** (integration test)
-    - Query: "create logo for tech startup Acme, modern style"
-    - Expected: DAG with Stage A complete, B ready, C queued
-    - Verify: task IDs, tool names, gate logic correct
-
-### Phase 3: Pipeline Executor + Streaming (Depends on Phase 2)
-
-**Goal**: Execute DAG by stage, stream results progressively.
-
-11. **Create `PipelineExecutor`** [ai_hub_sdk/core/task/pipeline_executor.py]
-    - Input: `PipelineDAG`, `tool_registry: Dict[str, BaseTool]`, `session_context`
-    - Execution: 
-      - Stage A: run sequential (intent → extract → analyze → merge → validate; loop if gate fails)
-      - Stage B: run sequential (research → select → analyze → infer)
-      - Stage C: run parallel (generate N options, persist all)
-    - Output: `AsyncGenerator[StageEvent]`
-
-12. **Create event schemas** [ai_hub_sdk/schemas/pipeline_events.py]
-    - `StageStarted(stage, task_count)`
-    - `TaskStarted(task_id, task_name)`
-    - `TaskCompleted(task_id, result)`
-    - `GateFailed(required_fields)` → triggers clarification
-    - `StageCompleted(stage, all_results)`
-    - `PipelineCompleted(final_output, designs)`
-    - `ProcessingError(error)`
-
-13. **Integrate streaming** (async generator)
-    - Runner: `async def run_logo_pipeline(query, context) → AsyncGenerator[PipelineEvent]`:
-      - 1. Load tool registry
-      - 2. Call LogoPlannerTool → PipelineDAG
-      - 3. Yield: `PipelineStarted(dag)`
-      - 4. Execute stage by stage:
-         - a. Yield: `StageStarted(A)`
-         - b. For each task: yield TaskStarted → execute → yield TaskCompleted
-         - c. Handle GateFailed → loop/clarify
-         - d. Yield: `StageCompleted(A, results)`
-      - 5. Final: `PipelineCompleted(results)`
-
-### Phase 4: Clean Exports + Docs (Depends on Phase 3)
-
-**Goal**: Easy imports + usage guide.
-
-14. **Update exports** [ai_hub_sdk/tools/__init__.py, ai_hub_sdk/schemas/__init__.py]
-    - Tools: stage A/B/C tools + LogoPlannerTool
-    - Schemas: ToolContext, PipelineDAG, StageGroup, TaskNode, all Events
-
-15. **Write Vietnamese guide** [docs/guides/tools/logo_pipeline_vi.md]
-    - Architecture overview
-    - Flow diagram (Stage A → B → C)
-    - Each tool's role
-    - How to extend
-
-16. **Write English guide** [docs/guides/tools/logo_pipeline.md]
-    - Same as above, English
-
-17. **Code example** [examples/logo_pipeline_demo.ipynb]
-    - Minimal: load tools → run query → stream results
-    - Advanced: custom tool + DAG inspection + event handling
-
-### Phase 5: Testing + Validation
-
-**Goal**: Ensure architecture + backward compatibility.
-
-18. **Unit tests** [tests/unit/tools/]
-    - ToolContext extraction per tool
-    - Tool registry by stage
-    - DAG schema validation
-    - Event schemas serialization
-
-19. **Integration tests** [tests/integration/]
-    - Full pipeline (mock tools) query → plan → execute
-    - Gate logic: missing fields → clarification → retry
-    - Stage transitions + streaming events
-    - Agent unchanged (backward compat)
-
-20. **Manual e2e test**
-    - Real query: "logo for tech company, blue + modern style"
-    - Check: plan generated → stages executed → options streamed
+  Executor->>State: finalize results
+  Runner-->>User: completed stream chunks
+```
 
 ---
 
-## Relevant Files
+## 6) Định dạng output của Planner
 
-**To Create:**
+```json
+{
+  "planning_mode": "iterative",
+  "nodes": [
+    {
+      "id": "intent",
+      "tool": "intent_detect",
+      "tool_input": {"query": "${query}"},
+      "deps": []
+    },
+    {
+      "id": "extract",
+      "tool": "input_extract",
+      "tool_input": {"query": "${query}", "references": "${user_context.references}"},
+      "deps": ["intent"]
+    },
+    {
+      "id": "clarification_gate",
+      "tool": "clarification_gate",
+      "tool_input": {"context": "${extract.result.context}"},
+      "deps": ["extract"]
+    },
+    {
+      "id": "clarification",
+      "tool": "clarification_tool",
+      "tool_input": {"missing_fields": "${clarification_gate.result.missing_fields}"},
+      "deps": ["clarification_gate"]
+    },
+    {
+      "id": "research",
+      "tool": "web_research",
+      "tool_input": {"brand_context": "${extract.result.context}"},
+      "deps": ["clarification_gate"]
+    },
+    {
+      "id": "guideline",
+      "tool": "guideline_generate",
+      "tool_input": {
+        "brand_context": "${extract.result.context}",
+        "research_context": "${research.result}"
+      },
+      "deps": ["research"]
+    },
+    {
+      "id": "generate",
+      "tool": "logo_generate",
+      "tool_input": {
+        "guidelines": "${guideline.result.guidelines}",
+        "brand_name": "${extract.result.context.brand_name}",
+        "industry": "${extract.result.context.industry}"
+      },
+      "deps": ["guideline"]
+    }
+  ],
+  "edges": [
+    ["intent", "extract"],
+    ["extract", "clarification_gate"],
+    ["clarification_gate", "clarification"],
+    ["clarification_gate", "research"],
+    ["research", "guideline"],
+    ["guideline", "generate"]
+  ]
+}
+```
 
-**Schemas:**
-- `ai_hub_sdk/schemas/tool_context.py` — ToolContext with stage + category
-- `ai_hub_sdk/schemas/pipeline_dag.py` — TaskNode, StageGroup, PipelineDAG
-- `ai_hub_sdk/schemas/pipeline_events.py` — StageStarted, TaskStarted, TaskCompleted, GateFailed, StageCompleted, PipelineCompleted, ProcessingError
+Clarification behavior:
+- Nếu clarification_gate báo thiếu required fields, runner emit chunk hỏi lại và tạm dừng.
+- Sau khi user trả lời, hệ thống update RuntimeState.input rồi gọi planner để lập DAG đoạn tiếp theo.
+- Nếu không thiếu required fields, bỏ qua node clarification và chạy tiếp.
 
-**Tools - Stage A:**
-- `ai_hub_sdk/tools/stage_a/__init__.py`
-- `ai_hub_sdk/tools/stage_a/intent_detect.py` — IntentDetectTool
-- `ai_hub_sdk/tools/stage_a/input_extraction.py` — InputExtractionTool
-- `ai_hub_sdk/tools/stage_a/reference_image_analyzer.py` — ReferenceImageAnalyzeTool
-- `ai_hub_sdk/tools/stage_a/context_merger.py` — ContextMergerTool
-- `ai_hub_sdk/tools/stage_a/required_field_gate.py` — RequiredFieldGateTool
-- `ai_hub_sdk/tools/stage_a/clarification_loop.py` — ClarificationLoopTool
+Interpolation behavior:
+- Biểu thức ${extract.result.context.brand_name} được resolve ngay trước khi execute node.
+- Resolver hỗ trợ truy cập nested dict/list và trả lỗi rõ ràng khi thiếu path.
 
-**Tools - Stage B:**
-- `ai_hub_sdk/tools/stage_b/__init__.py`
-- `ai_hub_sdk/tools/stage_b/web_research_service.py` — WebResearchService
-- `ai_hub_sdk/tools/stage_b/fetchable_image_selector.py` — FetchableImageSelector
-- `ai_hub_sdk/tools/stage_b/gemini_research_analyzer.py` — GeminiResearchAnalyzer
-- `ai_hub_sdk/tools/stage_b/design_inference_tool.py` — DesignInferenceTool
-
-**Tools - Stage C:**
-- `ai_hub_sdk/tools/stage_c/__init__.py`
-- `ai_hub_sdk/tools/stage_c/option_generation_service.py` — OptionGenerationService
-- `ai_hub_sdk/tools/stage_c/storage_persistence.py` — StoragePersistenceTool
-
-**Core:**
-- `ai_hub_sdk/tools/logo_planner.py` — LogoPlannerTool (stage-aware)
-- `ai_hub_sdk/tools/context_manager.py` — ToolContextManager (by stage)
-- `ai_hub_sdk/core/task/pipeline_executor.py` — PipelineExecutor (stage-sequential, task-parallel)
-
-**Docs & Examples:**
-- `docs/guides/tools/logo_pipeline_vi.md` — Vietnamese guide (CHI TIẾT)
-- `docs/guides/tools/logo_pipeline.md` — English guide
-- `examples/logo_pipeline_demo.ipynb` — Full flow demo
-
-**To Modify:**
-- `ai_hub_sdk/tools/base.py` — Add `stage`, `category` attributes + `to_context()` method
-- `ai_hub_sdk/schemas/__init__.py` — Export new schemas
-- `ai_hub_sdk/tools/__init__.py` — Export all stage tools + planner + context manager
-
----
-
-## Verification
-
-1. **Tools wrap correctly**: Each stage tool instantiates, schema exports valid
-2. **ToolContextManager**: Registry by stage works, exports to OpenAI format
-3. **LogoPlannerTool**: Query → PipelineDAG with stage structure
-4. **PipelineExecutor**: DAG executes stage-by-stage, events streamed
-5. **Gate logic**: Missing required_fields → ClarificationLoopTool triggered → retry
-6. **Streaming**: Events flow properly (StageStarted → TaskStarted → TaskCompleted → StageCompleted)
-7. **Backward compat**: Existing Agent + tools unaffected
-
----
-
-## Decisions & Scope
-
-**Included:**
-- Tool wrappers for Stage A/B/C (logo design)
-- Tool context + stage + category tagging
-- Stage-aware DAG + planner
-- Pipeline executor with streaming events
-- Gate logic (validation + clarification loop)
-- Clean imports
-
-**Excluded:**
-- Observer/monitoring → add later
-- Parallel task execution (within stage parallelizable, between stages sequential)
-- Result aggregation beyond events → keep simple
-- SQLite/DB integration → persist results only
-- Custom agent framework changes
-
-**Key Assumptions:**
-1. OpenAI API available for LogoPlannerTool + LLM calls
-2. Gemini API available for image analysis (Stage B)
-3. Web search API available (Stage B)
-4. Tools are deterministic (no circular gate failures)
-5. Each stage output feeds next stage input automatically
+Large payload behavior:
+- Tool có thể trả LargePayloadRef thay vì nhét dữ liệu lớn inline.
+- Node sau dùng preview + uri_or_key tùy nhu cầu.
 
 ---
 
-## Timeline
+## 7) Kế hoạch migration
 
-- **Phase 1**: ~1h (6-7 tools + schemas)
-- **Phase 2**: ~30min (DAG + planner)
-- **Phase 3**: ~45min (executor + events)
-- **Phase 4**: ~45min (exports + docs + notebook)
-- **Phase 5**: ~30min (tests)
-- **Total**: ~3.5 hours focused work
+## Phase 1: Nền tảng tool + schema
+- Tạo source/schemas/plan.py, tool_context.py, tool_io.py.
+- Thêm RuntimeState, LargePayloadRef và ToolResult strict schema.
+- Tạo source/tools/base_tool.py kế thừa ai_hub_sdk.tools.base.BaseTool.
+- Tách LogoDesignToolset thành các tool class.
+- Giữ song song code cũ để tránh break flow.
+
+Deliverable:
+- Có ToolRegistry và build_tool_context(tools).
+
+## Phase 2: Planner tool + DAG validator
+- Xây PlannerTool.plan() trả DAG JSON.
+- Thêm validator cho cycle, missing deps.
+- Schema validate strict cho output planner.
+- Thêm quy ước planning mode (single_pass, iterative).
+
+Deliverable:
+- Planner trả DAG ổn định cho intake/research/generation.
+
+## Phase 3: Tool executor + runner
+- Xây ToolExecutor.execute_node() và execute_dag().
+- Xây Runner.run() với dependency scheduling + result store.
+- Thêm InputResolver cho ${...} từ runtime state.
+- Thêm pause/re-plan cho clarification loop.
+- Emit stream chunks theo event node completion.
+
+Deliverable:
+- End-to-end chạy không cần stage workers.
+
+## Phase 4: Tương thích adapter hiện tại
+- Giữ nguyên API LogoGenerateTask.stream_process.
+- Route nội bộ sang runner + planner mới.
+- Deprecate import cũ của stage workers.
+
+Deliverable:
+- Frontend/tests hiện tại vẫn pass.
+
+## Phase 5: Tối ưu OpenAI-first
+- Tối ưu planner prompt + strict JSON output cho GPT-4o.
+- Thêm retry/repair khi planner trả JSON lỗi.
+- Thêm trace cost và latency theo tool.
+- Thêm policy context-budget: ngưỡng inline + fallback sang artifact ref.
+
+Deliverable:
+- Runtime OpenAI-first ổn định.
+
+## Phase 6: Google ADK parity
+- Thêm test tương thích planner/runtime trên google engine.
+- Giữ chung ToolContext và DAG schema.
+- Guard theo provider chỉ nằm ở adapter layer.
+
+Deliverable:
+- Cùng format plan chạy được OpenAI và Google ADK.
+
+---
+
+## 8) Quy tắc thiết kế để scale và tái sử dụng ngoài project
+
+1. Tool Isolation
+- source/tools/* không import planner hoặc runner.
+- Tool chỉ phụ thuộc schema và provider interface được inject.
+
+2. Pydantic Schema nghiêm ngặt
+- Mỗi tool có ToolInput và ToolOutput rõ ràng.
+- ToolContext.parameters/output sinh từ model_json_schema, không dùng dict lỏng.
+
+3. Dependency Injection
+- Không khởi tạo cứng HTTP/DB/API client trong execute().
+- Tiêm dependencies qua constructor để test/mock dễ.
+
+4. Tách observability khỏi lõi tool
+- Logging, retry, timeout, cost tracking nằm ở executor middleware.
+- Lõi tool giữ thuần, deterministic, dễ reuse.
+
+5. Config bằng BaseSettings
+- Dùng pydantic_settings.BaseSettings cho config typed và validate.
+- Secret, quota, timeout được inject vào planner/executor/tools.
+
+---
+
+## 9) Rủi ro và giảm thiểu
+
+Risk: Planner trả DAG JSON sai.
+- Mitigation: schema validate + repair prompt + fallback template DAG.
+
+Risk: Hành vi mới lệch flow cũ.
+- Mitigation: golden tests so milestone stream chunks cũ/mới.
+
+Risk: Đổi tên làm vỡ import.
+- Mitigation: transitional re-export + deprecation warnings.
+
+Risk: Provider concern rò rỉ vào API của tool.
+- Mitigation: để provider-specific logic ở adapter layer.
+
+Risk: Sai path nội suy gây crash runtime.
+- Mitigation: InputResolver trung tâm + parser path strict + validate trước execute.
+
+Risk: Clarification loop bị deadlock.
+- Mitigation: giới hạn số vòng clarification + fallback deterministic + terminal fail state.
+
+Risk: Payload trung gian quá lớn làm nổ token budget.
+- Mitigation: trả LargePayloadRef + summary ngắn cho node sau.
+
+---
+
+## 10) Danh sách việc làm ngay
+
+1. Tạo source/schemas/plan.py với DAG models.
+2. Tạo source/schemas/tool_context.py với metadata-only contract.
+3. Tạo source/schemas/runtime_state.py cho runtime state.
+4. Tạo source/tools/* class cho nhóm tác vụ hiện tại.
+5. Tạo source/planner/planner_tool.py cho OpenAI-first DAG planning.
+6. Tạo source/executors/input_resolver.py cho ${...} binding.
+7. Tạo source/executors/tool_executor.py cho node execution.
+8. Viết tests:
+- planner DAG validity,
+- topological ordering,
+- tool input/output schema validation,
+- fallback khi planner trả malformed JSON,
+- interpolation resolution success/failure,
+- clarification pause + re-plan,
+- large payload reference handoff.
