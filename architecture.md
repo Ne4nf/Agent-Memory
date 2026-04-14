@@ -1,92 +1,61 @@
-# Logo Design AI POC (As-Built)
+# Logo Design AI — Technical Design
 
 ## 1. Overview
 
-### 1.1 POC objective
+### 1.1 Objective
 
-Build a logo generation backend aligned with ai-hub-sdk task contract for Step 1 -> Step 6.
+Build a simplified logo generation and editing backend for a **POC** using the **OpenAI Agents SDK**. The architecture moves away from complex DAG orchestration in favor of a lean **Agent + Tools** pattern. An LLM-based Agent acts as the coordinator, determining the execution path based on user input and conversation state.
 
-In-scope:
+### 1.2 In-scope (5-tool pipeline)
 
-- Step 1: intent detect.
-- Step 2: input extraction + reference analysis.
-- Step 2.5: web research enrichment for logo domain.
-- Step 3: required-field validation and clarification loop.
-- Step 4: design guideline inference.
-- Step 6: generate logo options and return final payload.
+| Step | Tool | What the backend does |
+|:---|:---|:---|
+| Step 1 | `analyze_logo_request` | **Multi-extract**: Extracts brand context (name, industry, style) from query AND reference images. Validates required fields. |
+| Step 2 | `search_references` | **Web Search**: Finds visual inspirations based on the extracted context. |
+| Step 3 | `generate_design_guideline` | **Context Manager**: Merges research + brand context to create/update `DESIGN.md`. |
+| Step 4 | `generate_logo` | **Generation**: Produces 3 logo options from the guidelines. |
+| Step 5 | `Edit Loop` | **Iteration**: Refines the existing design by updating `DESIGN.md` guidelines and generating new logo candidates (count=1) based on user instructions and/or a selected image. |
 
-Out-of-scope:
+### 1.3 Out-of-scope
 
-- Step 7: prompt-based editing/inpainting.
-- Step 8: follow-up suggestion intelligence.
+- Multi-domain classification (non-logo tasks).
+- Production-grade queue/caching layers.
+- Complex multi-agent recursive critique.
 
-Notes:
+### 1.4 Success metrics
 
-- Step 5 "Design direction selection" is automated by Stage B via `strategic_design_directions`; there is no separate user selection step in current source.
-- Current source does not implement quick-action orchestration.
+| Metric | Target |
+|:---|:---|
+| Successful `brand_name` + `industry` extraction | >= 90% |
+| End-to-end completion (Generate flow) | <= 40s |
+| Valid image edit turnaround | <= 15s |
 
-### 1.2 Success metrics (POC acceptance targets)
+### 1.5 Technical constraints
 
-- >= 90% requests extract or clarify `brand_name` and `industry` before generation.
-- >= 90% requests that pass required-field gate produce valid `guideline`.
-- >= 85% requests return valid options payload.
-- p95 stream end-to-end completion target <= 40s for current POC runtime target.
-- On failure, return actionable `error_code` and `error_message` in stream chunk.
-
-### 1.3 User journey (current implemented flow)
-
-1. User submits query with optional explicit fields and references.
-2. System streams Stage A chunks (intent/extraction/merge/gate).
-3. If required fields are missing, system emits `clarification_needed` with `missing_fields` and `suggested_questions`.
-4. User answers and re-calls stream with same `session_id`.
-5. System runs Stage B (web research + guideline inference) only after gate pass.
-6. System runs Stage C and returns completed payload (`guideline`, `required_field_state`, `options`).
-
-Key UX point:
-
-- Current `source` implementation is stream-first end-to-end in one task execution (`ServingMode.STREAM`).
-- Stage C is not executed as separate submit/poll async job in current task runtime path.
-
-### 1.4 Technical constraints
-
-- ai-hub-sdk task is implemented via `BaseTask` with:
-  - `task_type = logo_generate`
-  - `serving_mode = STREAM`
-- Input schema: `LogoGenerateInput`.
-- Output stream schema: `LogoGenerateTaskOutput` chunks.
-- Mandatory fields before Stage B/Stage C:
-  - `brand_name`
-  - `industry`
-- Merge precedence in current orchestrator:
-  - explicit request fields > extracted fields > previous session context fallback (clarification follow-up mode).
-- Session scope is per `session_id` via `SessionContextStore` checkpoints.
-- Provider failures are fail-closed, no synthetic guideline/options fallback.
+- Runtime: **OpenAI Agents SDK** (`openai-agents` package).
+- Architecture: **Agent-Tool Loop** (LLM decides tool usage).
+- State Persistence: **DESIGN.md** (Markdown) per session.
+- Services: Configurable via providers (LLM, Search, Generation, Edit).
 
 ---
 
-## 2. POC Scope
+## 2. Scope
 
 ### 2.1 Build vs Defer
 
-| Area | Build (current source) | Defer |
-| :--- | :--- | :--- |
-| Intent + input | Intent detect, extraction, reference analysis in Stage A | Multi-domain intent classifier |
-| Clarification | Required-field gate + clarification chunk + stream re-call | Adaptive personalized questioning policy |
-| Reasoning | Stage-level reasoning chunks and metadata in stream | Multi-agent self-critique loops |
-| Research | SerpAPI query + normalization + fetchable-image selection + Gemini analysis | Automatic query backfill when fetchable image pool is insufficient |
-| Guideline | Structured guideline inference from context + research | Guideline optimization loop |
-| Generation | Parallel option generation and storage upload | Provider auto-routing/ranking |
-| Storage/session | Session checkpoints (`SessionContextStore`) + shared status/payload services | Long-term project memory/version history |
-| Editing | Deferred | Step 7 |
-| Follow-up suggestion | Deferred | Step 8 |
+| Area | Build (POC) | Defer |
+|:---|:---|:---|
+| Analysis | Consolidated `analyze_logo_request` | Domain-specific intent routing |
+| Research | `search_references` via Search API | Automated inspiration gallery |
+| Context | `DESIGN.md` (Markdown per session) | SQL/NoSQL Document store |
+| Orchestration | **OpenAI Agents (Loop)** | Complex DAG/Workflow engines |
+| Deployment | Local/Cloud Run sync | Async Job Queues |
 
-### 2.2 Technical-design items not yet implemented
+### 2.2 POC Focus
 
-- Production BFF stream controls (retry/reconnect/backpressure/chunk flush policies).
-- Queue-decoupled deployment where Stage C is isolated from stream worker.
-- Explicit confidence-threshold gate policy as hard rule.
-- End-to-end cost analytics by `task_id` and `session_id`.
-- Asset retention and signed URL TTL runtime policy.
+- Minimal toolset (5 tools).
+- Natural language "Agent" coordinator instead of static DAG.
+- Direct UI-editable design context (`DESIGN.md`).
 
 ---
 
@@ -94,373 +63,800 @@ Key UX point:
 
 ### 3.1 Overview
 
-#### 3.1.1 Why this solution
+The system uses the **OpenAI Agents SDK** for its coordinator role. Instead of a hard-coded DAG, the **Agent** (acting as a dynamic planner) evaluates inputs and conversation history to determine which of the 5 tools to execute in each turn.
 
-Current architecture prioritizes deterministic gating and contract-safe outputs:
-
-1. Stage A enforces required-field quality before expensive downstream work.
-2. Stage B enriches context only after gate pass and only with fetchable references.
-3. Stage C generates options in parallel from validated guideline concepts.
-4. Session checkpointing makes clarification continuation deterministic.
-5. Error handling is explicit; invalid preconditions do not silently degrade to fabricated results.
-
-#### 3.1.2 Diagram 1 - Agent pipeline (top-down)
+#### 3.1.1 Diagram — Full flow (flowchart)
 
 ```mermaid
 flowchart TD
-  U[User Request] --> ST[POST /internal/v1/tasks/stream]
+    A([User sends message]) --> B["analyze_logo_request(message, session_id, image?)"]
+    B --> DB1[("write DESIGN.md</br>Overview, Brand, Style")]
+    DB1 --> C{brand + industry?}
+    C -- No --> D[Clarify question]
+    D --> E([User replies])
+    E --> B
+    C -- Yes --> IMG{image reference?}
+    IMG -- Yes --> G["generate_design_guideline(session_id)"]
+    IMG -- No --> F["search_references(industry)"]
+    F -- "auto-pick top 3 by relevance" --> G
+    G --> DB2[("read DESIGN.md</br>write Do's and Don'ts")]
+    DB2 --> H["generate_logo(guideline, count=3)"]
+    H --> J([User selects logo])
 
-  subgraph SA[Stage A - Intake and Clarification]
-    direction TB
-    A1[IntentDetectTool]
-    A2[InputExtractionTool]
-    A3[ReferenceImageAnalyzeTool]
-    A5[Context Merge explicit > extracted > session]
-    A6[Required Field Gate brand_name + industry]
-    A7[ClarificationLoopTool]
-  end
+    subgraph edit[Edit loop]
+        J --> ELG["generate_design_guideline(session_id, instruction, selected_url?)"]
+        ELG --> ELP["generate_logo(guideline, count=1, selected_url?)"]
+        ELP --> DB3[("update DESIGN.md")]
+        DB3 --> M[Suggest follow-ups]
+        M --> N{Edit again?}
+        N -- Yes --> J
+    end
 
-  subgraph SB[Stage B - Research and Guideline]
-    direction TB
-    B1[WebResearchService query + normalize]
-    B2[Fetchable Image Selector]
-    B3[GeminiResearchAnalyzer bytes-based]
-    B4[DesignInferenceTool]
-  end
+    N -- No --> O([Done])
 
-  subgraph SC[Stage C - Generation]
-    direction TB
-    C1[OptionGenerationService parallel]
-    C2[Storage persistence]
-  end
+    B:::tool
+    F:::tool
+    G:::tool
+    ELG:::tool
+    ELP:::tool
+    H:::tool
+    C:::decision
+    IMG:::decision
+    N:::decision
+    DB1:::db
+    DB2:::db
+    DB3:::db
+    O:::done
 
-  ST --> A1
-  A1 --> A2
-  A1 --> A3
-  A2 --> A5
-  A3 --> A5
-  A5 --> A6
-  A6 -->|missing fields| A7 --> A5
-  A6 -->|gate passed| B1 --> B2 --> B3 --> B4 --> C1 --> C2
-  C2 --> DONE[completed chunk + result payload]
+    classDef user fill:#E6F1FB,stroke:#185FA5,color:#0C447C
+    classDef tool fill:#e1f5fe,stroke:#01579b,color:#01579b
+    classDef decision fill:#fff3cd,stroke:#e67e22,color:#412402
+    classDef db fill:#f3e5f5,stroke:#7b1fa2,color:#4a148c
+    classDef done fill:#EAF3DE,stroke:#3B6D11,color:#173404
 ```
 
-#### 3.1.3 Diagram 2 - System components (top-down layered)
-
-```mermaid
-graph TD
-  FE[Frontend or Streamlit UI]
-  TASK[POST /internal/v1/tasks/stream]
-
-  subgraph A[Stage A - Intake]
-    direction TB
-    A1[IntentDetectTool]
-    A2[InputExtractionTool]
-    A3[ReferenceImageAnalyzeTool]
-    A4[ClarificationLoopTool]
-    A5[Required Field Gate]
-  end
-
-  subgraph B[Stage B - Research]
-    direction TB
-    B1[WebResearchService]
-    B2[Fetchable Image Selection]
-    B3[GeminiResearchAnalyzer]
-    B4[DesignInferenceTool]
-  end
-
-  subgraph C[Stage C - Generation]
-    direction TB
-    C1[OptionGenerationService]
-    C2[StorageTool]
-  end
-
-  CTX[(SessionContextStore)]
-  LLM[Text / Multimodal LLM]
-  IMG[Image Provider]
-
-  FE --> TASK --> A --> B --> C
-
-  A <--> CTX
-  B <--> CTX
-  C <--> CTX
-  A1 --> LLM
-  A2 --> LLM
-  A3 --> LLM
-  B3 --> LLM
-  B4 --> LLM
-  C1 --> IMG
-  C2 --> IMG
-```
-
-Shared helpers used behind the scenes:
-
-- `LifecycleStatusManager` builds status payloads and progress values for Stage A/B/C.
-- `AsyncPayloadAssembler` assembles the final `JobStatusResponse` in Stage C.
-- `DesignMemoryService` writes trace snapshots to `source/design.md` at clarification and guideline checkpoints.
-
-### 3.2 Architecture principles
-
-- Task-first:
-  - Business capability is routed by one task type `logo_generate`.
-- Schema-first:
-  - Pydantic models enforce request/response and stage-boundary contracts.
-- Context-first handoff:
-  - Services produce deltas; orchestrators merge and checkpoint.
-- Fail-closed:
-  - Missing prerequisites/provider failures return explicit failures.
-- Deterministic merge:
-  - explicit > extracted > session fallback (clarification follow-up path).
-
-#### 3.2.1 Memory flow contract (current source)
-
-1. Orchestrators own runtime state (`task_id`, progress, stage transitions).
-2. Tool services remain stateless regarding global workflow state.
-3. Checkpoints are persisted into `SessionContextStore` after key stages.
-4. Clarification follow-up reuses latest session state by `session_id`.
-5. `context_version` is used by checkpoint helper for stale-write-safe merges.
-6. `DesignMemoryService` persists per-topic snapshots into `source/design.md` at clarification and guideline checkpoints.
-7. `source/design.md` is an audit/trace projection only; it is not read back to restore runtime context after process shutdown.
-
-#### 3.2.2 POC simplification notes
-
-- Planner/observer are logical roles embedded in orchestrators.
-- Stage A, Stage B, and Stage C are executed sequentially in one stream lifecycle in current runtime path.
-- Separate async queue execution for Stage C is not implemented in current `source/tasks/logo_generate.py` flow.
-
-### 3.3 Component breakdown (tool-level)
-
-| Component or Tool | Spec step | Role | Model Type | Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| IntentDetectTool | Step 1 | Detect logo intent | Text LLM | Returns `is_logo_intent`, confidence, reason |
-| InputExtractionTool | Step 2 | Extract brand and preferences | Text LLM structured output | Explicit-only extraction prompt policy |
-| ReferenceImageAnalyzeTool | Step 2 | Analyze visual references | Multimodal LLM | Supports URL/local bytes references |
-| ClarificationLoopTool | Step 3 | Generate targeted questions for missing fields | Text LLM + deterministic fallback | Emits `suggested_questions` |
-| WebResearchService | Step 2.5 | Query + normalize + dedupe + fetchable filtering | SerpAPI + normalizer | Runs only after required-field gate pass |
-| GeminiResearchAnalyzer | Step 2.5 | Analyze top references for strategic directions | Gemini multimodal | Backend sends image bytes |
-| DesignInferenceTool | Step 4 | Build guideline JSON | Text LLM | Requires exactly 3 strategic directions |
-| LogoGenerationTool | Step 6 | Generate options from concept variants | Image provider | Parallel per-option generation |
-| StorageTool | Shared | Persist image outputs and return URLs | Storage API | Called in Stage C path |
-| SessionContextStore | Shared | Session checkpoint persistence | Cache/DB adapter | Used by Stage A/B/C |
-
-### 3.3.1 Shared services in source/services/shared
-
-Note:
-
-- `shared` here means common helper/infrastructure modules for orchestrators and status contracts. They do not need to appear in the main diagram when that adds reviewer noise.
-
-| Shared module | Responsibility | Used by |
-| :--- | :--- | :--- |
-| `LifecycleStatusManager` | Build status payloads + progress mapping | Stage A/B/C orchestrators |
-| `AsyncPayloadAssembler` | Build completed/failed JobStatusResponse payload contract | Stage C orchestrator |
-| `DesignMemoryService` | Persist design context snapshots to `source/design.md` | Stage A and Stage B |
-
-### 3.4 End-to-end pipeline
-
-POC external task type: `logo_generate`.
-
-#### 3.4.1 Full sequence overview (current source)
+#### 3.1.2 Diagram — Sequence diagram
 
 ```mermaid
 sequenceDiagram
-  actor FE as Frontend
-  participant ST as Stream API
-  participant T as LogoGenerateTask
-  participant OA as Stage A Orchestrator
-  participant OB as Stage B Orchestrator
-  participant OC as Stage C Orchestrator
+  actor FE as FE
+  participant Agent as Agent
+  participant Tools as Tools
+  participant DB as DB (DESIGN.md)
+  participant ImageAPI as Image API
 
-  FE->>ST: POST /internal/v1/tasks/stream
-  ST->>T: stream_process(input_args)
-  T->>OA: run Stage A
-  OA-->>FE: intake_started, query_extracted, context_merged, gate_evaluated
+  FE->>Agent: POST /stream (task_type="logo_design", session_id, message, image?)
+  activate Agent
+  Agent-->>FE: {type:"progress", stage:"analyzing"}
+  Agent->>Tools: analyze_logo_request(message, image?, session_id)
+  activate Tools
+  Tools->>DB: write(session_id, Overview, Brand, Style)
+  activate DB
+  DB-->>Tools: ok
+  deactivate DB
+  Tools-->>Agent: {brand, industry, is_sufficient}
+  deactivate Tools
+  Agent-->>FE: {type:"session", session_id}
 
-  alt required fields missing
-    OA-->>FE: clarification_needed + suggested_questions
-    FE->>ST: re-call with same session_id and updated input
-  else required fields passed
-    OA->>OB: handoff gate-passed context
-    OB-->>FE: web_research_started, web_research_completed, guideline_completed
-    T->>OC: run Stage C generation
-    OC-->>FE: generation_started + generation_option_ready chunks
-    OC-->>FE: completed chunk with final result
+  alt missing brand or industry
+    Agent-->>FE: stream clarify question
+    deactivate Agent
+    FE->>Agent: POST /stream (task_type="logo_design", session_id, user reply)
+    activate Agent
+    Agent-->>FE: {type:"progress", stage:"analyzing"}
+    Agent->>Tools: analyze_logo_request(reply, session_id)
+    activate Tools
+    Tools->>DB: update(session_id, Brand, Style)
+    activate DB
+    DB-->>Tools: ok
+    deactivate DB
+    Tools-->>Agent: {brand, industry, is_sufficient}
+    deactivate Tools
+  end
+
+  Agent-->>FE: {type:"progress", stage:"searching_references"}
+  Agent->>Tools: search_references(industry, session_id)
+  activate Tools
+  Tools-->>Agent: references[3]
+  deactivate Tools
+  Agent-->>FE: {type:"references", data:references[3]}
+
+  Agent-->>FE: {type:"progress", stage:"creating_guideline"}
+  Agent->>Tools: generate_design_guideline(session_id)
+  activate Tools
+  Tools->>DB: read(session_id)
+  activate DB
+  DB-->>Tools: Overview + Brand + Style
+  deactivate DB
+  Tools->>DB: write(session_id, Do's and Don'ts)
+  activate DB
+  DB-->>Tools: ok
+  deactivate DB
+  Tools-->>Agent: {prompt, negative_prompt, style_tags, palette}
+  deactivate Tools
+  Agent-->>FE: {type:"guideline", data:{prompt, style_tags, palette}}
+
+  Agent-->>FE: {type:"progress", stage:"generating_logos"}
+  Agent->>Tools: generate_logo(guideline, count=3, session_id)
+  activate Tools
+  Tools->>ImageAPI: generate(prompt)
+  activate ImageAPI
+  ImageAPI-->>Tools: image_urls[3]
+  deactivate ImageAPI
+  Tools-->>Agent: image_urls[3]
+  deactivate Tools
+  Agent-->>FE: {type:"result", data:image_urls[3]}
+  deactivate Agent
+
+  loop Edit Loop
+    FE->>Agent: POST /stream (task_type="logo_design", session_id, edit instruction, selected_url?)
+    activate Agent
+    Agent-->>FE: {type:"progress", stage:"editing_logo"}
+    Agent->>Tools: generate_design_guideline(session_id, instruction, selected_url?)
+    activate Tools
+    Tools->>DB: read(session_id)
+    activate DB
+    DB-->>Tools: full context
+    deactivate DB
+    Tools->>DB: update(session_id, STYLE/GUIDELINES)
+    activate DB
+    DB-->>Tools: ok
+    deactivate DB
+    Tools-->>Agent: {prompt, style_tags, updated_guidelines}
+    deactivate Tools
+    
+    Agent-->>FE: {type:"progress", stage:"generating_edit"}
+    Agent->>Tools: generate_logo(guideline, count=1, session_id, selected_url?)
+    activate Tools
+    Tools->>ImageAPI: generate OR edit(prompt, selected_url)
+    activate ImageAPI
+    ImageAPI-->>Tools: image_url
+    deactivate ImageAPI
+    Tools-->>Agent: image_url
+    deactivate Tools
+    Agent-->>FE: {type:"result", data:image_url}
+    deactivate Agent
   end
 ```
 
-#### 3.4.2 Stage A - Intake and clarification loop (Step 1-3)
+### 3.2 Architecture principles
 
-| Item | Detail |
-| :--- | :--- |
-| Input | `LogoGenerateInput` (`session_id`, query, optional explicit fields, references) |
-| Tools used | IntentDetectTool, InputExtractionTool, ReferenceImageAnalyzeTool, ClarificationLoopTool |
-| Output | Gate-passed merged context or clarification chunk |
-| Gate | `brand_name` AND `industry` must be present |
-| Ordering | Clarification happens before any Stage B web research |
-| Execution model | In current source, `InputExtractionTool` and `ReferenceImageAnalyzeTool` run in parallel with `asyncio.gather()` after intent detection passes |
+1. **Agent-Centric Coordination**: The Agent serves as the "brain" (OpenAI Agents SDK compatible), using conversation context and tool outputs to decide the next action. This simplifies the orchestration for the POC.
+2. **Tool Atomicity**: Logic is concentrated in 5 atomic tools. For example, `analyze_logo_request` is a multi-extraction tool that handles both text and visual inputs.
+3. **State as Markdown**: The "Design Context" is treated as a living Markdown document. This maximizes readability for both the Agent (LLM) and the User.
 
-#### 3.4.3 Stage B - Web research and guideline inference (Step 2.5 + Step 4)
+#### 3.2.1 Design Artifact Store (Design Context Manager)
 
-| Item | Detail |
-| :--- | :--- |
-| Input | Gate-passed merged context |
-| Tools used | WebResearchService, GeminiResearchAnalyzer, DesignInferenceTool |
-| Query policy | Fixed template set from normalizer |
-| Image policy | Dedupe candidate pool, keep fetchable images only |
-| Failure policy | If fetchable images < configured top count, fail Stage B explicitly |
-| Guideline policy | Requires exactly 3 strategic directions |
-| Output | `ResearchContext` + `DesignGuideline` checkpoint |
+The Design Context is the "living memory" of the logo's identity. In the POC, we implement a **Hybrid Sync Strategy** to balance machine-reliability with human-AI collaboration.
 
-#### 3.4.4 Stage C - Logo generation (Step 6)
+##### Storage Strategy (Hybrid)
 
-| Item | Detail |
-| :--- | :--- |
-| Input | Guideline + `variation_count` |
-| Tools used | OptionGenerationService + storage persistence |
-| Output | `LogoGenerateOutput` with `guideline`, `required_field_state`, `options` |
-| Concurrency | Parallel generation (`asyncio.as_completed`) |
+| Layer | Format | Role |
+|:---|:---|:---|
+| **Frontend (FE)** | **Markdown (.md)** | **Interactive Interface**: High readability, zero-latency rendering, allows user "Wiki-style" manual edits. |
+| **Backend (BE)** | **Structured JSON** | **Source of Truth**: Stored in DB for programmatic reliability, programmatic field access (`brand_name`, `color`), and schema validation. |
 
-Current option count behavior in source:
+##### Synchronization Flow (The Loop)
 
-- Schema allows `variation_count` in [3, 4] with default 4.
-- Guideline currently enforces exactly 3 `concept_variants`.
-- Stage C count formula is `min(max(variation_count, 3), len(concept_variants))`.
-- Effective full-flow output count is therefore currently 3 options.
+1.  **Sync-to-FE**: BE assembles the JSON state into a structured Markdown string using a template. This is what the user sees and edits.
+2.  **User Edit**: User can modify any section in the Markdown text area on the FE.
+3.  **Sync-to-BE**: On save/submit, FE sends the **entire Markdown string** to the BE.
+4.  **Parsing & Compaction**:
+    *   BE uses an LLM-assisted parser (part of `generate_design_guideline`) to map the Markdown sections back to the JSON schema.
+    *   **Auto-fill Policy**: If the user provides a query but leaves fields like `Symbol` or `Typography` empty, the Agent **auto-fills** these based on the brand tone.
+    *   **Mandatory Fields**: `Brand Name` and `Industry` are mandatory. If missing after parsing, the Agent re-enters the `Clarify` loop.
 
-### 3.5 Reuse and extensibility
+##### Versioning & Snapshot Strategy
 
-- Add fields in extraction/guideline:
-  - extend schemas and prompts; keep task contract stable.
-- Add Step 7 later:
-  - add `logo_edit` task and reuse session/memory contract.
-- Add providers:
-  - swap provider adapters while preserving output schema.
+-   **Snapshots**: Every time `generate_logo` is called, a snapshot of the current `DESIGN.md` (and its JSON metadata) is saved.
+-   **History**: Allows the user to "Revert to Version 2" if they don't like previous edits.
+-   **Compaction**: Older, non-selected snapshots are archived or deleted after the session expires to keep the context window clean.
 
----
+##### Design Context Template (Optimized)
 
-## 4. Data Schema and API Integration
+```markdown
+## Overview
+[General description of the design intent]
 
-### 4.1 Pydantic models by stage (as-built contract)
+## Brand Identity
+- **Name**: [Mandatory]
+- **Industry**: [Mandatory]
+- **Target Audience**: [e.g., Tech-savvy Gen Z, Corporate executives]
+- **Tone**: [Core vibes, e.g., Professional, Playful]
+- **Value Proposition**: [What makes the brand unique]
 
-```python
-class LogoGenerateInput(TaskInputBaseModel):
-    session_id: str
-    query: str
-    brand_name: Optional[str]
-    industry: Optional[str]
-    style_preference: List[str] = []
-    color_preference: List[str] = []
-    symbol_preference: List[str] = []
-    typography_direction: Optional[str]
-    references: List[ReferenceImage] = []
-    use_session_context: bool = True
-    variation_count: int = Field(4, ge=3, le=4)
+## Visual Style
+- **Direction**: [e.g., Minimalist, Retro, 3D]
+- **Logo Type**: [Icon only, Wordmark, Combination]
+- **Color Palette**: [Hex codes or names]
+- **Typography**: [Font family, weight, style]
 
-class RequiredFieldState(BaseModel):
-    required_keys: List[str] = ["brand_name", "industry"]
-    missing_keys: List[str] = []
-    passed: bool = False
+## Symbol & Concepts
+- **Core Symbol**: [Specific icon requirements, e.g., "A rising sun"]
+- **Positioning**: [Icon on top, Icon on left, etc.]
 
-class DesignGuideline(BaseModel):
-    concept_statement: str
-    concept_variants: List[str]
-    style_direction: List[str]
-    color_palette: List[str]
-    typography_direction: List[str]
-    icon_direction: List[str]
-    constraints: List[str]
-
-class LogoGenerateOutput(BaseModel):
-    guideline: DesignGuideline
-    required_field_state: RequiredFieldState
-    options: List[LogoOption]  # min 3, max 4 by schema
+## Do's and Don'ts
+- [Do include specific elements]
+- [Don't use specific styles]
 ```
 
-### 4.2 Validation rules and merge precedence
+#### 3.2.2 Handling Multi-Directional Design (Topics)
 
-- `query` must be non-empty after trim.
-- `variation_count` must be in [3, 4].
-- Required-field gate requires both `brand_name` and `industry`.
-- Merge precedence:
-  - explicit request > extracted > session fallback (clarification follow-up mode).
-- Empty string for optional scalar fields is normalized to `None`.
-- If gate fails, stream chunk includes `missing_fields` and `suggested_questions`.
+If the design project explores multiple directions (e.g., "Topic A: Geometric" and "Topic B: Organic"), the `DESIGN.md` artifact manages them within one file to maintain context.
 
-### 4.3 Endpoint mapping in current runtime path
+**Strategy:**
+- **Topic Sections**: Use headings like `## Direction A: Modernist` and `## Direction B: Hand-drawn` to separate concepts.
+- **Active Identifier**: The Agent marks the **Active Direction** using a specific tag (e.g., `[ACTIVE]`). Generation tools only read the active section.
+- **Why one file?** Keeping everything in `DESIGN.md` allows the LLM to perform "Cross-Topic Analysis" (e.g., "Combine the typography from Direction A with the symbol of Direction B").
+- **Limit**: To avoid context bloat, only the top 2-3 directions are kept. Older or rejected directions are moved to a `## History (Legacy)` section at the bottom of the file (Compaction).
 
-Current execution path in `LogoGenerateTask`:
+### 3.3 Component breakdown
 
-- `POST /internal/v1/tasks/stream`
-  - Runs Stage A + Stage B + Stage C in one stream task.
+#### 3.3.1 Agent Layer (The Brain)
 
-SDK routes exist but are not primary in current task execution path:
+The Agent is initialized using the **OpenAI Agents SDK**. Success depends on a robust **Instruction Strategy**.
 
-- `POST /internal/v1/tasks/submit`
-- `GET /internal/v1/tasks/{task_id}/status`
+##### Instruction Strategy (OpenAI Agents Standard)
 
-Typical stream status progression:
+| Principle | Implementation |
+|:---|:---|
+| **Persona** | Define the Agent as a "Senior Brand Identity Designer & Planner". |
+| **Goal-Oriented** | "Your primary goal is to maintain a high-quality `DESIGN.md` and produce logos that strictly adhere to it." |
+| **Step-by-Step Logic** | Explicitly define the priority: 1. Analyze -> 2. Clarify (if needed) -> 3. Research -> 4. Guideline Sync -> 5. Generate -> 6. Edit Loop. |
+| **State-Awareness** | Instruction: "Always read the tool output carefully to see if `DESIGN.md` is updated before calling the next tool." |
+| **Tool Constraint** | "Do not call `generate_logo` until `brand_name` and `industry` are confirmed and `generate_design_guideline` has been executed." |
+| **Semantic Tooling** | Use high-fidelity **Function Docstrings**. The Agent relies on these for discovery. Tool names must be action-oriented (e.g., `analyze_logo_request` vs. `analyzer`). |
+| **Turn Guardrails** | "After each tool call, summarize the progress to the user and wait for feedback before proceeding to visual generation." |
+2. **Tools Layer**:
+    - `analyze_logo_request`: Multi-extract text + images.
+    - `search_references`: Inspiration fetcher.
+    - `generate_design_guideline`: Context merger & instruction writer.
+    - `generate_logo`: Visual producer.
+    - `edit_logo`: Targeted modification loop.
 
-- `intake_started` / `intake_resumed`
-- `query_extracted`
-- `context_merged`
-- `required_field_gate_evaluated`
-- `clarification_needed` (if gate fails)
-- `guideline_inference_started`
-- `web_research_started`
-- `web_research_completed`
-- `guideline_completed`
-- `generation_started`
-- `generation_option_ready` (repeated)
-- `completed`
+### 3.4 Execution Pipeline
 
-### 4.4 Provider/runtime notes
+The execution follow a turn-based loop:
+1. **Analyze**: Initial extraction and image assessment.
+2. **Clarification (Optional)**: If mandatory fields are missing.
+3. **Research & Guidelines**: Fetching visual references and synthesizing the Design Context.
+4. **Generation**: Final visual output.
+5. **Editing**: Continuous loop based on user feedback, updating the Design Context to ensure style consistency.
+alled | Image Edit API | LLM (guideline) + Image Generation API |
+| DESIGN.md | Update Style section if changed | Update Do's and Don'ts section |
+| Output | Single edited image | Single regenerated image |
 
-- Text and multimodal inference depend on Gemini runtime availability and credentials.
-- Stage C generation currently depends on Gemini image generation path.
-- If provider prerequisites are missing, generation fails explicitly (`GEMINI_UNAVAILABLE`) without fabricated fallback images.
+#### 3.4.4 Stream status progression
+
+Generate flow:
+```
+analyzing → [clarification_needed → analyzing] → searching_references → creating_guideline → generating_logos → completed
+```
+
+Edit flow (image edit):
+```
+editing_logo → completed
+```
+
+Edit flow (style change / regeneration):
+```
+updating_guideline → generating_logos → completed
+```
+
 
 ---
 
-## 5. Risks and open issues
+## 4. Image Editing Phase (Step 7)
 
-### 5.1 Latency
+### 4.1 Phase objective
 
-Risk:
+- Enable controlled edits on generated logos.
+- Prioritize region accuracy, output consistency, and response speed.
+- Capture measurable metrics for latency, cost, quality, and user satisfaction.
 
-- Stage B network retrieval + multimodal analysis can increase p95 latency.
+### 4.2 Three editing cases
 
-Mitigation:
+| Case | Purpose | Frontend Input | Backend Handling | Output | Key Risks |
+|:---|:---|:---|:---|:---|:---|
+| Case 1: FE Mask + BE Inpainting | Precise local edit with clear protected area | Source image + Binary mask (white=edit, black=keep) + Prompt | Inpainting model edits white region, preserves black region, blends edges | Edited image + trace metadata | Wrong mask quality, boundary artifacts |
+| Case 2: Minimal Edit (No Mask) | Fast editing with lowest UI complexity | Source image + Prompt only | Edit/generation model receives image+prompt; no hard mask constraint | Edited image + trace metadata | Over-editing outside target area |
+| Case 3: Crop-guided Edit | Keep FE simple while still using mask constraints | Source image + Bounding-box crop image + Prompt | BE runs segmenter on source+crop to create mask, then inpainting | Edited image + generated mask + trace metadata | Crop too loose/tight, mask derivation errors |
 
+### 4.3 Case details
+
+#### 4.3.1 Case 1 — FE Mask + BE Inpainting
+
+**Step 1: Frontend (Data Initialization)**
+1. User clicks a detail on the generated logo.
+2. FE runs a segmentation model (e.g., SAM) in browser and creates `Mask_Image` (white = edit region, black = keep region).
+3. FE setup: load segmentation ONNX weights (lazy-load on first click), inference via WebAssembly/WebGPU.
+4. User enters edit instruction (e.g., "Turn this shape into a fire dragon").
+5. FE calls `POST /edit` with: `Original_Image`, `Mask_Image`, `Raw_Prompt`.
+
+**Step 2: Backend (Inpainting Execution)**
+1. BE calls an Image Edit / Inpainting API with `image`, `mask`, `prompt`.
+2. Model behavior: keep 100% of black-mask pixels, regenerate white-mask region, auto-blend boundaries.
+
+#### 4.3.2 Case 2 — Minimal Edit (1 image + 1 prompt)
+
+**Step 1: Frontend**
+1. FE sends only `Original_Image` and `Raw_Prompt`.
+
+**Step 2: Backend**
+1. BE calls Image Edit API with image+prompt.
+2. Model understands prompt semantically; internal attention acts as implicit mask.
+3. BE injects preservation instruction (keep layout/style where possible).
+4. Return edited image and trace metadata.
+
+#### 4.3.3 Case 3 — Source + Crop + Prompt (Mask generated in BE)
+
+**Step 1: Frontend**
+1. FE sends: `Original_Image`, `Crop_Image` (bounding-box crop of target region), `Raw_Prompt`.
+
+**Step 2: Backend**
+1. Locate crop region against original image.
+2. Run segmentation model (e.g., SAM or another segmenter) in backend to convert crop into binary mask.
+3. Run inpainting with `Original_Image` + generated mask + `Raw_Prompt`.
+4. Return edited image, optional debug mask, and trace metadata.
+
+### 4.4 Edit tool integration
+
+The `edit_logo` tool (see Section 3.3.2 and Section 6.1) handles all three cases via auto-detection:
+
+- `mask_image` present → Case 1 (FE mask + BE inpainting)
+- `crop_image` present → Case 3 (crop-guided edit with BE-generated mask)
+- Neither → Case 2 (prompt-only edit)
+
+For schema details, see `EditLogoInput` / `EditLogoOutput` in Section 6.1.
+
+---
+
+## 5. Models & API Benchmark
+
+This section lists **all configurable external providers** used across the pipeline. Specific provider selection is a PO decision based on benchmark results below. The backend is provider-agnostic — any listed option can be swapped via configuration.
+
+### 5.1 Text / Multimodal LLM (used in Step 1–3)
+
+Used by: `analyze_logo_request`, `generate_design_guideline`, Agent (OpenAI Agents SDK).
+
+| Name | Pricing | Avg Cost / 1K tokens | Avg Latency | Recommended Use Case | Note |
+|:---|:---|:---|:---|:---|:---|
+| google/gemini-2.5-flash | $0.15/1M input, $0.60/1M output | ~$0.0006 (output) | ~1–3s | Fast text reasoning, planning, extraction | Low cost, good for high-throughput |
+| google/gemini-2.5-pro | $1.25/1M input, $10/1M output | ~$0.01 (output) | ~3–8s | Complex reasoning, guideline generation | Higher quality, higher cost |
+| openai/gpt-4.1 | $2/1M input, $8/1M output | ~$0.008 (output) | ~2–6s | General-purpose text reasoning | Strong instruction following |
+| openai/gpt-4.1-mini | $0.40/1M input, $1.60/1M output | ~$0.0016 (output) | ~1–3s | Cost-effective text tasks | Good balance of quality and cost |
+| openai/gpt-4.1-nano | $0.10/1M input, $0.40/1M output | ~$0.0004 (output) | ~0.5–2s | Ultra-low-cost, simple extraction | Fastest, cheapest |
+| anthropic/claude-sonnet-4 | $3/1M input, $15/1M output | ~$0.015 (output) | ~3–8s | Complex analysis, nuanced reasoning | Strong at structured output |
+
+### 5.2 Image Search API (used in Step 2)
+
+Used by: `search_references`.
+
+| Name | Pricing | Avg Cost / request | Rate Limit | Coverage | Note |
+|:---|:---|:---|:---|:---|:---|
+| SerpAPI — Google Images | $50/5K searches (paid plan) | ~$0.01/search | 100/month (free), 5K/month (paid) | Google Image index | Most comprehensive coverage, structured metadata |
+| SerpAPI — Bing Images | $50/5K searches (paid plan) | ~$0.01/search | Same as above | Bing Image index | Alternative index, good for diversity |
+| Pinterest API | Free (with developer access) | Free | Rate-limited per app | Pinterest visual content | Strong for design/aesthetic references; limited to Pinterest content |
+
+### 5.3 Image Generation API (used in Step 4)
+
+Used by: `generate_logo`.
+
+| Name | Pricing | Avg Cost | Avg Latency | Recommended Use Case | Note |
+|:---|:---|:---|:---|:---|:---|
+| google/gemini-2.5-flash-image | $30/1M output tokens; ~1,290 tokens/1024px (~$0.039/image) | $0.039 (1024px) | ~6s | Low-cost bulk generation, rapid prototyping | Free tier exists with rate limits |
+| google/gemini-3.1-flash-image-preview | ~$0.045–$0.151/image; 1024px ~$0.067 | $0.067 (1024px) | 23–56s (avg ~37.6s) | High-quality premium generation | Preview-phase variability |
+| google/gemini-3-pro-image-preview | ~$0.02–$0.08/image | ~$0.05 | 3–12s | Professional-grade, stronger text rendering | Supports up to 4K-class outputs |
+| openai/gpt-image-1 | Low $0.011, Medium $0.042, High $0.167 | $0.042 (medium) | ~45–50s | General-purpose generation | Token-based billing in some modes |
+| openai/gpt-image-1.5 | Low $0.009–$0.052, Medium $0.034–$0.051, High $0.133–$0.200 | $0.034 (medium) | 15–45s | Premium generation, stronger prompt adherence | Faster than gpt-image-1 |
+
+### 5.4 Image Edit API (used in Step 5)
+
+Used by: `edit_logo`.
+
+| Name | Pricing | Avg Cost | Avg Latency | Latency vs Output Token | Recommended Use Case | Case Fit | Note |
+|:---|:---|:---|:---|:---|:---|:---|:---|
+| google/gemini-2.5-flash-image | $30/1M output tokens; ~$0.039/image | $0.039 (1024px) | ~6s | Positive — grows with token count | Low-cost prompt-only editing, rapid iteration | Case 2 | Free tier exists with rate limits |
+| google/gemini-3.1-flash-image-preview | ~$0.045–$0.151/image | $0.067 (1024px) | 23–56s (avg ~37.6s) | Weak/unclear correlation | High-quality premium editing | Case 2 | Preview-phase variability |
+| google/gemini-3-pro-image-preview | ~$0.02–$0.08/image | ~$0.05 | 3–12s | Increases with resolution | Professional-grade editing, text rendering | Case 2 | Supports up to 4K-class outputs |
+| openai/gpt-image-1 | Low $0.011, Medium $0.042, High $0.167 | $0.042 (medium) | ~45–50s | Higher quality tiers increase latency | General-purpose editing | Case 2 | Token-based billing in some modes |
+| openai/gpt-image-1.5 | Low $0.009–$0.052, Medium $0.034–$0.051, High $0.133–$0.200 | $0.034 (medium) | 15–45s | Increases with quality tier | Premium marketing edits, prompt adherence | Case 2 | Faster than gpt-image-1 |
+| black-forest-labs/flux-fill-pro | Fixed ~$0.05/exec | $0.05 | ~9s | Minimal — fixed-size inpainting | Inpainting, local replacement, content-aware fill | **Case 1, Case 3** | Good for production edit pipelines |
+| black-forest-labs/flux-kontext-pro | ~$0.04/image | $0.04 | ~7s | Low sensitivity | Fast iterative editing with content preservation | Case 2, Case 3 | Good trade-off for interactive tools |
+| black-forest-labs/flux-kontext-max | ~$0.08/image (premium) | $0.08 | N/A | N/A | Highest-fidelity editing, final-asset polishing | Case 2, Case 3 | Premium tier for quality |
+| black-forest-labs/flux-kontext-dev | ~$0.025/image | $0.025 | N/A | N/A | Development, experimentation, low-cost testing | Case 2 (R&D), Case 3 (R&D) | Often non-commercial license |
+| prunaai/flux-kontext-fast | ~$0.005/image | $0.005 | Sub-second to few seconds | Scales with resolution/steps | Real-time creative apps, low-latency web | Case 2 | Very cost-effective for prototyping |
+| black-forest-labs/flux-2-flex | ~$0.06/image | $0.06 | ~13s | Scales with diffusion steps | Balanced quality/speed for production | Case 2, Case 3 | Tunable quality-speed trade-off |
+| black-forest-labs/flux-2-dev | ~$0.025/image | $0.025 | N/A | N/A | Open-weight experimentation | Case 2 (R&D), Case 3 (R&D) | Self-host option possible |
+
+### 5.5 Recommended provider selection (for PO review)
+
+> These are starting-point recommendations. Final selection should be made by PO after benchmark validation.
+
+| Pipeline Stage | Recommended Primary | Recommended Fallback | Rationale |
+|:---|:---|:---|:---|
+| Text / Multimodal LLM (Step 1–5) | To be benchmarked | To be benchmarked | Depends on quality/cost/latency trade-off per step |
+| Image Search (Step 4) | To be benchmarked | To be benchmarked | Depends on coverage and rate limit requirements |
+| Image Generation (Step 6) | To be benchmarked | To be benchmarked | Depends on logo quality and cost budget |
+| Image Edit — Case 1 (FE Mask) | To be benchmarked | To be benchmarked | Must support mask-based inpainting |
+| Image Edit — Case 2 (Minimal) | To be benchmarked | To be benchmarked | Best cost/latency ratio for prompt-only editing |
+| Image Edit — Case 3 (Crop-guided) | To be benchmarked | To be benchmarked | Strong content preservation with backend mask generation |
+
+### 5.6 Benchmark template
+
+#### Dataset
+
+| ID | Benchmark Result |
+|:---|:---|
+| 1 |  |
+
+**Testcase:**
+
+**Testcase explanation**
+
+**Input**
+
+| Input |  |
+|:---|:---|
+| Model / API |  |
+| Output |  |
+
+**Result**
+
+| Result |  |
+|:---|:---|
+|  |  |
+
+| ID | Benchmark Result |
+|:---|:---|
+| 2 |  |
+
+**Testcase:**
+
+**Testcase explanation**
+
+**Input**
+
+| Text Input |  |
+|:---|:---|
+| Image Input |  |
+| Model / API |  |
+| Output |  |
+
+**Result**
+
+| Result |  |
+|:---|:---|
+|  |  |
+
+#### Benchmark notes
+- Use the same source image set across all models for Image Edit benchmarks.
+- Record prompt, resolution, latency, cost, and user feedback for each run.
+- For Case 1, validate black-region preservation and white-region edit fidelity.
+- For Case 3, store crop alignment diagnostics and backend-generated mask path.
+- For Case 2, track layout drift and over-edit frequency due to implicit masking behavior.
+- When a model is listed as Case 2 only, avoid using it for strict masked inpainting.
+- For Text/Multimodal LLM benchmarks, measure extraction accuracy, structured output compliance, and latency.
+- For Image Search API benchmarks, measure result relevance, fetchable image ratio, and rate limit headroom.
+
+---
+
+## 6. Data Schema and API Integration
+
+### 6.1 Pydantic models
+
+```python
+# --- Tool IO (5 tools) ---
+
+### 6.1 Pydantic models
+
+```python
+# --- Tool IO (5 tools) ---
+
+# analyze_logo_request (Step 1)
+class AnalyzeLogoRequestInput(BaseModel):
+    message: str
+    session_id: str
+    images: list[str] = []              # URLs or base64
+
+class AnalyzeLogoRequestOutput(BaseModel):
+    # Core (Mandatory for next phase)
+    brand_name: str | None = None
+    industry: str | None = None
+    
+    # Visuals (Optional - extracted from user input)
+    style_direction: str | None = None
+    color_preference: str | None = None
+    symbol_preference: str | None = None
+    typography_direction: str | None = None
+    concept_direction: str | None = None
+    tone: str | None = None
+    
+    # State
+    is_sufficient: bool
+    missing_fields: list[str] = []
+    clarification_question: str | None = None
+
+# search_references (Step 2)
+class SearchReferencesInput(BaseModel):
+    industry: str
+    session_id: str
+
+class SearchReferencesOutput(BaseModel):
+    references: list[dict] = []         # [{url, title, relevance_score}]
+
+# generate_design_guideline (Step 3)
+class GenerateGuidelineInput(BaseModel):
+    session_id: str
+    references: list[dict] = []         # Optional enrichment
+    user_markdown_edit: str | None = None # Full MD from FE if user manually edited
+
+class GenerateGuidelineOutput(BaseModel):
+    # Metadata for generation
+    prompt: str
+    negative_prompt: str
+    
+    # Visual state (Auto-filled by LLM if missing in input)
+    style_tags: list[str] = []
+    palette: list[str] = []
+    typography_details: str | None = None
+    symbol_concept: str | None = None
+    
+    # Documentation
+    dos_and_donts: list[str] = []
+    updated_markdown: str                # Full MD to be synced to FE
+
+# generate_logo (Step 4)
+class GenerateLogoInput(BaseModel):
+    session_id: str
+    guidelines: dict = {}               # From GenerateGuidelineOutput
+    count: int = 3                      # [1, 4]
+
+class GenerateLogoOutput(BaseModel):
+    image_urls: list[str] = []
+    generation_metadata: dict = {}
+
+# edit_logo (Step 5)
+class EditLogoInput(BaseModel):
+    image_url: str
+    instruction: str
+    session_id: str
+    mask_image: str | None = None       # Case 1: base64 or URL
+    crop_image: str | None = None       # Case 3: base64 or URL
+
+class EditLogoOutput(BaseModel):
+    edited_image_url: str
+    editing_case: str                   # "case_1", "case_2", "case_3"
+    updated_markdown: str | None = None # Updated MD if style changed
+    suggestions: list[str] = []
+```
+```
+
+### 6.2 Tool input/output schemas
+
+Tool functions use the OpenAI Agents SDK convention — Python functions with type-annotated parameters that are auto-converted to tool schemas.
+
+```python
+from agents import function_tool
+
+@function_tool
+async def analyze_logo_request(
+    message: str,
+    session_id: str,
+    images: list[str] | None = None,
+) -> AnalyzeLogoRequestOutput:
+    """Extract brand context from user message and optional reference images.
+    Validates required fields (brand_name, industry).
+    Writes Overview, Brand, Style sections to DESIGN.md."""
+    ...
+
+@function_tool
+async def search_references(
+    industry: str,
+    session_id: str,
+) -> SearchReferencesOutput:
+    """Search visual design references via Image Search API based on industry.
+    Returns top 3 results by relevance."""
+    ...
+
+@function_tool
+async def generate_design_guideline(
+    session_id: str,
+    references: list[dict] | None = None,
+) -> GenerateGuidelineOutput:
+    """Read DESIGN.md context, generate design guidelines.
+    Writes Do's and Don'ts section to DESIGN.md."""
+    ...
+
+@function_tool
+async def generate_logo(
+    session_id: str,
+    guidelines: dict | None = None,
+    count: int = 3,
+) -> GenerateLogoOutput:
+    """Generate logo images from design guidelines via Image Generation API."""
+    ...
+
+@function_tool
+async def edit_logo(
+    image_url: str,
+    instruction: str,
+    session_id: str,
+    mask_image: str | None = None,
+    crop_image: str | None = None,
+) -> EditLogoOutput:
+    """Edit an existing logo image. Auto-detects editing case:
+    mask → Case 1, crop → Case 3, neither → Case 2.
+    Updates DESIGN.md if style changed."""
+    ...
+```
+
+### 6.3 Validation and Sync Rules
+
+| Rule Category | Description |
+|:---|:---|
+| **Mandatory Fields** | `brand_name` and `industry` MUST be defined before moving to Guideline phase. |
+| **Optional Auto-Fill** | `Color`, `Symbol`, `Typography`, and `Concept` are optional. If the user does not provide them, the `generate_design_guideline` tool will **auto-fill** them based on the analyzed tone and industry. |
+| **FE-to-BE Sync** | If a user edits the Markdown on the FE, the `user_markdown_edit` field in `GenerateGuidelineInput` is populated. The BE takes this Markdown as the **new gold standard**, parsing it into the internal state. |
+| **LLM Precedence** | User-provided specific requirements (e.g., "I want blue") always override the LLM's auto-suggestions. |
+| **Compaction Rule** | The design state is "compacted" into a single Markdown block. Previous experimental branches are saved as snapshots for version recovery but are not part of the active context window. |
+| **Versioning** | Every success of `generate_logo` or `edit_logo` increments the version (e.g., V1, V2). User can revert to any prior V via the FE. |
+
+### 6.4 Endpoint mapping
+
+```
+POST /stream (task_type="logo_design")
+  → Generate flow: analyze → [clarification] → search → guideline → generate
+  → Edit flow (image edit): edit_logo (with selected_url + instruction + optional mask/crop)
+  → Edit flow (regeneration): guideline → generate (with updated style)
+```
+
+Stream status progression — see Section 3.4.4.
+
+### 6.5 Configuration
+
+```python
+class LogoDesignSettings(BaseSettings):
+    # Agent
+    agent_model: str = "gpt-4.1"              # OpenAI Agents SDK model
+    agent_api_key: str | None = None
+
+    # Text/Multimodal LLM (for tools)
+    text_llm_model: str = "gemini-2.5-flash"  # configurable text model
+    google_api_key: str | None = None
+
+    # Limits
+    max_clarification_rounds: int = 2
+    tool_timeout_seconds: float = 90.0
+    default_logo_count: int = 3
+
+    # Storage
+    assets_base_dir: str = "generated-assets"
+```
+
+---
+
+## 7. Risks and open issues
+
+### 7.1 Latency
+
+**Risk:** Web research + multimodal analysis can increase p95 latency for the generate flow.
+
+**Mitigation:**
 - Bounded query policy and fetchable-image filtering.
-- Parallel Stage C generation.
+- Parallel guideline inference (`asyncio.gather`) as future optimization.
+- Agent can skip search when user provides sufficient reference images.
 
-### 5.2 Provider reliability
+### 7.2 Provider reliability
 
-Risk:
+**Risk:** Provider internal errors, media fetch restrictions, or API unavailability.
 
-- Provider internal errors or media fetch restrictions.
+**Mitigation:**
+- Tool-level retry logic (configurable attempts).
+- Timeout per tool call (configurable `tool_timeout_seconds`).
+- Agent propagates explicit error messages to the user.
+- Model fallback strategy per editing case (see Section 5.5).
 
-Mitigation:
+### 7.3 Clarification loop quality
 
-- Keep fetchable-only research image path.
-- Use bytes-based upload for multimodal requests.
-- Return explicit failure chunk with error details.
+**Risk:** Ambiguous inputs can trigger repeated clarification turns.
 
-### 5.3 Clarification loop quality
+**Mitigation:**
+- Max clarification rounds enforced by agent instructions (`max_clarification_rounds = 2`).
+- Targeted clarification questions generated by `analyze_logo_request` tool.
+- DESIGN.md preserves context across clarification turns.
 
-Risk:
+### 7.4 Edit quality
 
-- Ambiguous inputs can trigger repeated clarification turns.
+**Risk:** Over-editing outside target area (Case 2), mask quality issues (Case 1), crop-to-mask conversion errors (Case 3).
 
-Mitigation:
+**Mitigation:**
+- Model selection strategy per case (see Section 5.5).
+- Preservation instruction injection for Case 2.
+- Segmentation-based mask validation for Case 3.
+- Trace metadata capture for quality diagnostics.
 
-- Targeted clarification questions from LLM with deterministic fallback set.
-- Session checkpoint reuse by `session_id`.
+### 7.5 Agent tool-calling reliability
 
-### 5.4 Open technical decisions
+**Risk:** LLM agent may call tools in wrong order, skip required tools, or misinterpret edit instructions as style changes (or vice versa).
 
+**Mitigation:**
+- Detailed system instructions with explicit workflow steps and decision criteria.
+- OpenAI Agents SDK `output_guardrail` for validating agent responses.
+- Tool-level input validation (Pydantic models reject invalid inputs).
+- Logging and tracing of all tool calls for debugging.
+- Future: Add explicit FE edit-mode selection to remove ambiguity.
+
+### 7.6 Design Artifact Store
+
+**Risk:** File-based `DESIGN.md` does not survive process restarts for conversation context; file parsing relies on section-header convention.
+
+**Mitigation:**
+- File artifacts persist on disk (survive restarts); conversation context is separate.
+- Clear section-header parsing contract (`## Heading` convention).
+- Validation of parsed sections before use.
+- Migration path to JSON/DB storage documented in Section 3.2.1.
+
+### 7.7 Open technical decisions
+
+- Segmentation model deployment strategy for Case 1 (FE ONNX) and Case 3 (BE inference).
+- Default provider selection for each pipeline stage (PO decision after benchmarks).
+- Multi-candidate ranking before edit output.
+- Acceptable cost/request threshold for editing.
+- Session conversation persistence strategy (current in-memory → Redis/DB).
+- DESIGN.md migration plan (current file-based → JSON/DB, see Section 3.2.1).
 - Production BFF transport controls and stream resilience policy.
-- Queue/service decoupling roadmap.
-- Query backfill strategy when fetchable image count is below threshold.
-- Cost tracking/reporting by task/session.
+- Queue/service decoupling roadmap for heavy generation nodes.
+- Cost tracking/reporting by task_id and session_id.
 - Asset URL TTL and retention policies.
-- Session store persistence strategy: current `SessionContextStore` is in-memory and does not survive process restarts.
+- Whether mask should be mandatory for small or dense typography edits.
+- Explicit FE edit-mode selection (image edit vs. style change) to reduce agent ambiguity.
+
+---
+
+## 8. Rollout recommendation
+
+- **Phase 1:** Ship generate flow + Case 2 (image+prompt) editing to collect fast feedback.
+- **Phase 2:** Add Case 1 mask-assisted inpainting for high-precision edits.
+- **Phase 3:** Add Case 3 crop-to-mask conversion and model auto-routing.
+- **Phase 4:** Optimize multi-candidate ranking, cost analytics, and production infrastructure.
+
+---
+
+## 9. References
+
+### 9.1 Source code
+
+| Module | Path |
+|:---|:---|
+| Package root | `source_v2/__init__.py` |
+| Configuration | `source_v2/config.py` |
+| README | `source_v2/README.md` |
+
+**Agent:**
+
+| File | Purpose |
+|:---|:---|
+| `source_v2/agents/logo_design_agent.py` | `LogoDesignAgent` — OpenAI Agents SDK agent with 5 tools |
+
+**Tools:**
+
+| File | Purpose |
+|:---|:---|
+| `source_v2/tools/analyze_logo_request.py` | Extract brand context + validate required fields (Step 1) |
+| `source_v2/tools/search_references.py` | Search visual references via Image Search API (Step 2) |
+| `source_v2/tools/generate_design_guideline.py` | Generate design guidelines, write DESIGN.md (Step 3) |
+| `source_v2/tools/generate_logo.py` | Generate logo images via Image Generation API (Step 4) |
+| `source_v2/tools/edit_logo.py` | Edit existing logo (Case 1/2/3), update DESIGN.md (Step 5) |
+
+**Schemas:**
+
+| File | Purpose |
+|:---|:---|
+| `source_v2/schemas/tool_io.py` | Tool input/output Pydantic models |
+| `source_v2/schemas/design_md.py` | DESIGN.md parsing and section management utilities |
+
+### 9.2 Design references
+
+- Image editing phase template: `image-editing-phase-template.en.md`
+- Root SDK overview: `README.md`
