@@ -3,69 +3,59 @@
 ## 1. Overview
 
 ### 1.1 Objective
-
-Build a simplified logo generation and editing backend for a **POC** using the **OpenAI Agents SDK**. The architecture moves away from complex DAG orchestration in favor of a lean **Agent + Tools** pattern. An LLM-based Agent acts as the coordinator, determining the execution path based on user input and conversation state.
-
-### 1.2 In-scope (5-tool pipeline)
-
-| Step | Tool | What the backend does |
-|:---|:---|:---|
-| Step 1 | `analyze_logo_request` | **Multi-extract**: Extracts brand context (name, industry, style) from query AND reference images. Validates required fields. |
-| Step 2 | `search_references` | **Web Search**: Finds visual inspirations based on the extracted context. |
-| Step 3 | `generate_design_guideline` | **Context Manager**: Merges research + brand context to create/update `DESIGN.md`. |
-| Step 4 | `generate_logo` | **Generation**: Produces 3 logo options from the guidelines. |
-| Step 5 | `Edit Loop` | **Iteration**: Refines the existing design by updating `DESIGN.md` guidelines and generating new logo candidates (count=1) based on user instructions and/or a selected image. |
-
-### 1.3 Out-of-scope
-
-- Multi-domain classification (non-logo tasks).
-- Production-grade queue/caching layers.
-- Complex multi-agent recursive critique.
-
-### 1.4 Success metrics
-
-| Metric | Target |
-|:---|:---|
-| Successful `brand_name` + `industry` extraction | >= 90% |
-| End-to-end completion (Generate flow) | <= 40s |
-| Valid image edit turnaround | <= 15s |
-
-### 1.5 Technical constraints
-
-- Runtime: **OpenAI Agents SDK** (`openai-agents` package).
-- Architecture: **Agent-Tool Loop** (LLM decides tool usage).
-- State Persistence: **DESIGN.md** (Markdown) per session.
-- Services: Configurable via providers (LLM, Search, Generation, Edit).
+Build a simplified logo generation and editing backend for a **POC** using the **Agents SDK**. The system uses a lean **Agent + Tools** pattern where an LLM-based Agent acts as the coordinator, determining the execution path based on user input and conversation state.
 
 ---
 
-## 2. Scope
+## 2. User Journey (The Pipeline)
 
-### 2.1 Build vs Defer
+The system follows a chronological journey from brand discovery to final asset delivery.
 
-| Area | Build (POC) | Defer |
-|:---|:---|:---|
-| Analysis | Consolidated `analyze_logo_request` | Domain-specific intent routing |
-| Research | `search_references` via Search API | Automated inspiration gallery |
-| Context | `DESIGN.md` (Markdown per session) | SQL/NoSQL Document store |
-| Orchestration | **OpenAI Agents (Loop)** | Complex DAG/Workflow engines |
-| Deployment | Local/Cloud Run sync | Async Job Queues |
-
-### 2.2 POC Focus
-
-- Minimal toolset (5 tools).
-- Natural language "Agent" coordinator instead of static DAG.
-- Direct UI-editable design context (`DESIGN.md`).
+| Phase | Journey Step | System Action | Output |
+|:---|:---|:---|:---|
+| **1. Briefing** | User defines brand (Text + Image) | **Analyze**: Extracts Name, Industry, and Tone. Asks clarification if essential info is missing. | Validated Brand Identity |
+| **2. Research** | AI looks for inspirations | **Search**: Visual reference lookup based on industry (skip if user provided images). | 3 Ref. Images |
+| **3. Logic** | AI analyzes research + intent | **Synthesize**: Writes `DESIGN.md` with a Core DNA and 3 "Directional Variants". | Design Artifact |
+| **4. Creative** | System renders initial concepts | **Generate**: Produces 3 high-quality logos (1 per direction). | 3 Initial Logos |
+| **5. Refine** | User picks one & iterates | **Iterate**: <br>- **Quick Visual Changes**: Direct image edit.<br>- **Style Direction Changes**: Updates guideline then regenerates. | Refined Final Logo |
 
 ---
 
-## 3. System Architecture
+## 3. Scope & Metrics
 
-### 3.1 Overview
+### 3.1 Scope (In vs. Out)
 
-The system uses the **OpenAI Agents SDK** for its coordinator role. Instead of a hard-coded DAG, the **Agent** (acting as a dynamic planner) evaluates inputs and conversation history to determine which of the 5 tools to execute in each turn.
+| Area | In-Scope (POC) | Out-of-Scope |
+|:---|:---|:---|
+| **Analysis** | Consolidated `analyze_logo_request` tool | Multi-domain intent routing |
+| **Research** | `search_references` via Search API | Automated inspiration gallery |
+| **Format** | `DESIGN.md` (Markdown per session) | DB-driven state management |
+| **Logic** | **Agents SDK (Turn-based logic)** | Complex Orchestration engines |
 
-#### 3.1.1 Diagram — Full flow (flowchart)
+### 3.2 Success Metrics
+- **Extraction Accuracy**: >= 90% success rate for `brand_name` + `industry`.
+- **Generation Speed**: End-to-end full flow (Steps 1-4) under 40s.
+- **Iteration Speed**: Quick visual tweak turnaround under 15s.
+
+### 3.3 Technical Constraints & Stack
+- **Framework**: Agents SDK (built on `openai-agents`).
+- **State**: Persistent Markdown-based artifact (`DESIGN.md`).
+- **Architecture**: Dynamic Agent-Tool Loop.
+
+---
+
+## 4. System Architecture
+
+### 4.1 Overview (The Big Picture)
+
+Logo design is inherently **iterative and non-linear**. Static pipelines often fail when a user wants to jump back to research or refine a concept based on new inspiration.
+
+**Why the Agents SDK?**
+- **Dynamic Planning**: Instead of a hard-coded path, the Agent (The Brain) evaluates every turn. It decides whether to search, synthesize, or edit based on the current context.
+- **Optimized Execution (Bifurcation)**: We can differentiate between **Quick Visual Changes** (Direct edit) and **Style Direction Changes** (Full regeneration). This significantly reduces latency and cost for 80% of common edits.
+- **Transparent Memory**: By using `DESIGN.md` as a living document, both the human and the AI align on the design's "soul" in real-time.
+
+#### 4.1.1 Diagram — Full flow (flowchart)
 
 ```mermaid
 flowchart TD
@@ -84,9 +74,13 @@ flowchart TD
     H --> J([User selects logo])
 
     subgraph edit[Edit loop]
-        J --> ELG["generate_design_guideline(session_id, instruction, selected_url?)"]
-        ELG --> ELP["generate_logo(guideline, count=1, selected_url?)"]
-        ELP --> DB3[("update DESIGN.md")]
+        J --> CH{Change Type?}
+        CH -- "Quick Visual Changes" --> EL["edit_logo(selected_url, instruction)"]
+        CH -- "Style Direction Changes" --> ELG["generate_design_guideline(selected_url, instruction)"]
+        ELG --> ELP["generate_logo(guideline, count=1, selected_url)"]
+        
+        EL --> DB3[("update DESIGN.md")]
+        ELP --> DB3
         DB3 --> M[Suggest follow-ups]
         M --> N{Edit again?}
         N -- Yes --> J
@@ -97,11 +91,13 @@ flowchart TD
     B:::tool
     F:::tool
     G:::tool
+    EL:::tool
     ELG:::tool
     ELP:::tool
     H:::tool
     C:::decision
     IMG:::decision
+    CH:::decision
     N:::decision
     DB1:::db
     DB2:::db
@@ -114,6 +110,7 @@ flowchart TD
     classDef db fill:#f3e5f5,stroke:#7b1fa2,color:#4a148c
     classDef done fill:#EAF3DE,stroke:#3B6D11,color:#173404
 ```
+
 
 #### 3.1.2 Diagram — Sequence diagram
 
@@ -188,32 +185,29 @@ sequenceDiagram
   Agent-->>FE: {type:"result", data:image_urls[3]}
   deactivate Agent
 
-  loop Edit Loop
-    FE->>Agent: POST /stream (task_type="logo_design", session_id, edit instruction, selected_url?)
+  loop Edit Loop (Quick vs. Directional)
+    FE->>Agent: POST /stream (instruction, selected_url?)
     activate Agent
-    Agent-->>FE: {type:"progress", stage:"editing_logo"}
-    Agent->>Tools: generate_design_guideline(session_id, instruction, selected_url?)
-    activate Tools
-    Tools->>DB: read(session_id)
-    activate DB
-    DB-->>Tools: full context
-    deactivate DB
-    Tools->>DB: update(session_id, STYLE/GUIDELINES)
-    activate DB
-    DB-->>Tools: ok
-    deactivate DB
-    Tools-->>Agent: {prompt, style_tags, updated_guidelines}
-    deactivate Tools
     
-    Agent-->>FE: {type:"progress", stage:"generating_edit"}
-    Agent->>Tools: generate_logo(guideline, count=1, session_id, selected_url?)
-    activate Tools
-    Tools->>ImageAPI: generate OR edit(prompt, selected_url)
-    activate ImageAPI
-    ImageAPI-->>Tools: image_url
-    deactivate ImageAPI
-    Tools-->>Agent: image_url
-    deactivate Tools
+    alt **Quick Visual Changes** (Simple tweaking)
+      Agent->>Tools: edit_logo(selected_url, instruction)
+      activate Tools
+      Tools->>ImageAPI: edit(prompt, selected_url)
+      Tools-->>Agent: edited_image_url
+      deactivate Tools
+    else **Style Direction Changes** (Conceptual shift)
+      Agent->>Tools: generate_design_guideline(instruction, selected_url)
+      activate Tools
+      Tools->>DB: update DESIGN.md (Promote Active Style)
+      Tools-->>Agent: {updated_guideline}
+      deactivate Tools
+      Agent->>Tools: generate_logo(updated_guideline, count=1)
+      activate Tools
+      Tools->>ImageAPI: generate(prompt)
+      Tools-->>Agent: new_image_url
+      deactivate Tools
+    end
+    
     Agent-->>FE: {type:"result", data:image_url}
     deactivate Agent
   end
@@ -221,36 +215,45 @@ sequenceDiagram
 
 ### 3.2 Architecture principles
 
-1. **Agent-Centric Coordination**: The Agent serves as the "brain" (OpenAI Agents SDK compatible), using conversation context and tool outputs to decide the next action. This simplifies the orchestration for the POC.
+1. **Agent-Centric Coordination**: The Agent serves as the "brain" (Agents SDK compatible), using conversation context and tool outputs to decide the next action. This simplifies the orchestration for the POC.
 2. **Tool Atomicity**: Logic is concentrated in 5 atomic tools. For example, `analyze_logo_request` is a multi-extraction tool that handles both text and visual inputs.
 3. **State as Markdown**: The "Design Context" is treated as a living Markdown document. This maximizes readability for both the Agent (LLM) and the User.
 
 #### 3.2.1 Design Artifact Store (Design Context Manager)
 
-The Design Context is the "living memory" of the logo's identity. In the POC, we implement a **Hybrid Sync Strategy** to balance machine-reliability with human-AI collaboration.
+The Design Context is the "living memory" of the logo's identity. For the POC, we must choose a storage strategy that balances **UI flexibility** (allowing users to edit the file directly) with **machine precision** (allowing tools to read/update specific fields).
 
-##### Storage Strategy (Hybrid)
+##### Selection Guide: Storage Strategy Benchmark
 
-| Layer | Format | Role |
-|:---|:---|:---|
-| **Frontend (FE)** | **Markdown (.md)** | **Interactive Interface**: High readability, zero-latency rendering, allows user "Wiki-style" manual edits. |
-| **Backend (BE)** | **Structured JSON** | **Source of Truth**: Stored in DB for programmatic reliability, programmatic field access (`brand_name`, `color`), and schema validation. |
+| Strategy | **FE UI** | BE Format | Mapping Logic | Pros | Cons | Recommendation |
+|:---|:---|:---|:---|:---|:---|:---|
+| **#1 Logic Driven**| **Markdown** | Markdown | Regex / Split | Simple code; Zero overhead; Fast. | Fragile for multi-step logic. | Good for R&D |
+| **#2 LLM-Sync** | **Markdown** | JSON | LLM-assisted | Smart; Understands user's intent even if headers change. | Higher cost/latency. | Good for alpha |
+| **#3 Hybrid (Locked)**| **Markdown** | **JSON** | **Static Logic** | **Deterministic**; UI stays as .md; Safe for production logic. | User must keep headers intact. | **POC Choice** |
 
-##### Synchronization Flow (The Loop)
+> [!NOTE]
+> **User Requirement**: Regardless of the BE strategy, the **UI must remain a DESIGN.md file** to allow users to edit brand context as a natural document.
 
-1.  **Sync-to-FE**: BE assembles the JSON state into a structured Markdown string using a template. This is what the user sees and edits.
-2.  **User Edit**: User can modify any section in the Markdown text area on the FE.
-3.  **Sync-to-BE**: On save/submit, FE sends the **entire Markdown string** to the BE.
-4.  **Parsing & Compaction**:
-    *   BE uses an LLM-assisted parser (part of `generate_design_guideline`) to map the Markdown sections back to the JSON schema.
-    *   **Auto-fill Policy**: If the user provides a query but leaves fields like `Symbol` or `Typography` empty, the Agent **auto-fills** these based on the brand tone.
-    *   **Mandatory Fields**: `Brand Name` and `Industry` are mandatory. If missing after parsing, the Agent re-enters the `Clarify` loop.
+##### Robust "No-LLM" Sync Logic (Strategy #4)
 
-##### Versioning & Snapshot Strategy
+To keep the system fast and deterministic without extra LLM calls for storage, we use **Section-Locked Logic**:
 
--   **Snapshots**: Every time `generate_logo` is called, a snapshot of the current `DESIGN.md` (and its JSON metadata) is saved.
--   **History**: Allows the user to "Revert to Version 2" if they don't like previous edits.
--   **Compaction**: Older, non-selected snapshots are archived or deleted after the session expires to keep the context window clean.
+1.  **Fixed Headers**: The system expects fixed headers (e.g., `## Brand Identity`, `## Visual Style`).
+2.  **Logic-based Extraction**:
+    -   BE splits the `.md` file by `##` markers.
+    -   Regex or String matching maps the text under `## Tone` to the `tone` field in the JSON database.
+3.  **UI Feedback**: If a user deletes a required header, the UI/BE can throw a validation error or auto-regenerate the missing section with a placeholder.
+4.  **Auto-Fill (LLM)**: An LLM is **only** used to suggest values for empty fields (e.g., suggesting a 1024-px symbol description if the user left it blank), not for the basic act of saving/reading.
+
+##### Summary of Logic Flow (Strategy #4)
+
+1.  **Update Trigger**: Every tool execution (Step 1-5) pushes a JSON update to the DB, which then triggers an auto-generation of the `DESIGN.md` for the FE.
+2.  **Manual Edit Sync**: When a user saves the `.md` file, the BE parses the content using section-locked headers. 
+3.  **Compaction & Promotion**:
+    -   While exploring, **Directional Variants** are preserved.
+    -   Upon selection of a logo, the chosen direction is **promoted** to the `## Visual Style` section, and others are moved to a `## Concept History` archive.
+
+---
 
 ##### Design Context Template (Optimized)
 
@@ -261,15 +264,19 @@ The Design Context is the "living memory" of the logo's identity. In the POC, we
 ## Brand Identity
 - **Name**: [Mandatory]
 - **Industry**: [Mandatory]
-- **Target Audience**: [e.g., Tech-savvy Gen Z, Corporate executives]
+- **Target Audience**: [Optional - AI will fill based on industry if blank]
 - **Tone**: [Core vibes, e.g., Professional, Playful]
-- **Value Proposition**: [What makes the brand unique]
 
-## Visual Style
+## Visual Style (Active)
 - **Direction**: [e.g., Minimalist, Retro, 3D]
 - **Logo Type**: [Icon only, Wordmark, Combination]
 - **Color Palette**: [Hex codes or names]
 - **Typography**: [Font family, weight, style]
+
+## Directional Variants (Initial Exploration)
+- **Direction 1 [Selected Variant Name]**: [Visual details for Concept 1]
+- **Direction 2 [Selected Variant Name]**: [Visual details for Concept 2]
+- **Direction 3 [Selected Variant Name]**: [Visual details for Concept 3]
 
 ## Symbol & Concepts
 - **Core Symbol**: [Specific icon requirements, e.g., "A rising sun"]
@@ -280,21 +287,27 @@ The Design Context is the "living memory" of the logo's identity. In the POC, we
 - [Don't use specific styles]
 ```
 
-#### 3.2.2 Handling Multi-Directional Design (Topics)
+#### 3.2.2 Concept Exploration & Selection
 
-If the design project explores multiple directions (e.g., "Topic A: Geometric" and "Topic B: Organic"), the `DESIGN.md` artifact manages them within one file to maintain context.
+To provide variety during the initial generation, the system explores multiple directions simultaneously while maintaining a single core brand identity.
 
-**Strategy:**
-- **Topic Sections**: Use headings like `## Direction A: Modernist` and `## Direction B: Hand-drawn` to separate concepts.
-- **Active Identifier**: The Agent marks the **Active Direction** using a specific tag (e.g., `[ACTIVE]`). Generation tools only read the active section.
-- **Why one file?** Keeping everything in `DESIGN.md` allows the LLM to perform "Cross-Topic Analysis" (e.g., "Combine the typography from Direction A with the symbol of Direction B").
-- **Limit**: To avoid context bloat, only the top 2-3 directions are kept. Older or rejected directions are moved to a `## History (Legacy)` section at the bottom of the file (Compaction).
+**The Selection Life Cycle:**
+
+1.  **Exploration Phase**:
+    -   `generate_design_guideline` analyzes references and writes 3 unique directions into the `## Directional Variants` section.
+    -   `generate_logo` creates 3 images, each linked to a specific Direction (stored in JSON metadata).
+2.  **Selection Phase**:
+    -   User selects a favorite logo to refine.
+    -   The Agent **Promotes** that logo's Direction context to the `## Visual Style (Active)` section.
+3.  **Compaction Phase**:
+    -   The rejected directions are moved to a `## Concept History` archive at the bottom of the file.
+    -   This prevents the Agent's context window from getting cluttered with irrelevant concepts, ensuring high-fidelity edits.
 
 ### 3.3 Component breakdown
 
 #### 3.3.1 Agent Layer (The Brain)
 
-The Agent is initialized using the **OpenAI Agents SDK**. Success depends on a robust **Instruction Strategy**.
+The Agent is initialized using the **Agents SDK**. Success depends on a robust **Instruction Strategy**.
 
 ##### Instruction Strategy (OpenAI Agents Standard)
 
@@ -417,7 +430,7 @@ This section lists **all configurable external providers** used across the pipel
 
 ### 5.1 Text / Multimodal LLM (used in Step 1–3)
 
-Used by: `analyze_logo_request`, `generate_design_guideline`, Agent (OpenAI Agents SDK).
+Used by: `analyze_logo_request`, `generate_design_guideline`, Agent (Agents SDK).
 
 | Name | Pricing | Avg Cost / 1K tokens | Avg Latency | Recommended Use Case | Note |
 |:---|:---|:---|:---|:---|:---|
@@ -596,20 +609,22 @@ class GenerateGuidelineOutput(BaseModel):
     prompt: str
     negative_prompt: str
     
-    # Visual state (Auto-filled by LLM if missing in input)
+    # 3 Distinct Concepts (Active during Exploration Phase)
+    concept_variants: list[dict] = []     # [{id: "dir_1", name: "Minimalist", details: "..."}]
+    
+    # Visual state (Promoted Active Direction)
     style_tags: list[str] = []
     palette: list[str] = []
     typography_details: str | None = None
-    symbol_concept: str | None = None
     
     # Documentation
-    dos_and_donts: list[str] = []
     updated_markdown: str                # Full MD to be synced to FE
 
 # generate_logo (Step 4)
 class GenerateLogoInput(BaseModel):
     session_id: str
     guidelines: dict = {}               # From GenerateGuidelineOutput
+    selected_direction_id: str | None = None # For count=1 edits
     count: int = 3                      # [1, 4]
 
 class GenerateLogoOutput(BaseModel):
@@ -634,7 +649,7 @@ class EditLogoOutput(BaseModel):
 
 ### 6.2 Tool input/output schemas
 
-Tool functions use the OpenAI Agents SDK convention — Python functions with type-annotated parameters that are auto-converted to tool schemas.
+Tool functions use the Agents SDK convention — Python functions with type-annotated parameters that are auto-converted to tool schemas.
 
 ```python
 from agents import function_tool
@@ -718,7 +733,7 @@ Stream status progression — see Section 3.4.4.
 ```python
 class LogoDesignSettings(BaseSettings):
     # Agent
-    agent_model: str = "gpt-4.1"              # OpenAI Agents SDK model
+    agent_model: str = "gpt-4.1"              # Agents SDK model
     agent_api_key: str | None = None
 
     # Text/Multimodal LLM (for tools)
@@ -782,7 +797,7 @@ class LogoDesignSettings(BaseSettings):
 
 **Mitigation:**
 - Detailed system instructions with explicit workflow steps and decision criteria.
-- OpenAI Agents SDK `output_guardrail` for validating agent responses.
+- Agents SDK `output_guardrail` for validating agent responses.
 - Tool-level input validation (Pydantic models reject invalid inputs).
 - Logging and tracing of all tool calls for debugging.
 - Future: Add explicit FE edit-mode selection to remove ambiguity.
@@ -837,7 +852,7 @@ class LogoDesignSettings(BaseSettings):
 
 | File | Purpose |
 |:---|:---|
-| `source_v2/agents/logo_design_agent.py` | `LogoDesignAgent` — OpenAI Agents SDK agent with 5 tools |
+| `source_v2/agents/logo_design_agent.py` | `LogoDesignAgent` — Agents SDK agent with 5 tools |
 
 **Tools:**
 
