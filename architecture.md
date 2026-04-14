@@ -302,6 +302,7 @@ This architecture has two core layers: one layer that **decides** and one layer 
 - Interprets user intent from the current turn + conversation state.
 - Chooses the next tool call based on tool outputs and guardrails.
 - Controls routing for the full pipeline:
+        
         - **Clarification routing** -> ask follow-up when `brand_name` / `industry` is missing.
         - **Reference routing** -> use user-provided references directly, or call `search_references` when needed.
         - **Generation routing** -> call `generate_design_guideline` before `generate_logo` for concept-consistent outputs.
